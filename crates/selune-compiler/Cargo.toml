@@ -1,0 +1,8 @@
+[package]
+name = "selune-compiler"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+selune-core.workspace = true
