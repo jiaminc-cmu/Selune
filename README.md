@@ -1,4 +1,4 @@
-# Sel-ne-A-modern-lua-JIT-in-rust-
+# A modern lua JIT in rust 
 Project: Selûne
 A modern Lua JIT in Rust
 🎯 Project Mission
