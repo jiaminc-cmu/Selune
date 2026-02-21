@@ -6,3 +6,8 @@ license.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "value_bench"
+harness = false
