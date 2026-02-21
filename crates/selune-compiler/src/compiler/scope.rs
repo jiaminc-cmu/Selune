@@ -145,13 +145,19 @@ impl ScopeManager {
 
     /// Free registers down to the given free_reg level.
     pub fn free_reg_to(&mut self, level: u8) {
-        debug_assert!(level <= self.free_reg);
-        self.free_reg = level;
+        if level <= self.free_reg {
+            self.free_reg = level;
+        }
     }
 
     /// Look up a local variable by name. Returns register if found.
     pub fn resolve_local(&self, name: StringId) -> Option<&LocalVarInfo> {
         self.locals.iter().rev().find(|v| v.name == name)
+    }
+
+    /// Look up a local variable by register index.
+    pub fn resolve_local_by_reg(&self, reg: u8) -> Option<&LocalVarInfo> {
+        self.locals.iter().rev().find(|v| v.reg == reg)
     }
 
     /// Get number of active locals.

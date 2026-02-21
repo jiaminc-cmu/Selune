@@ -37,6 +37,8 @@ pub enum ExprDesc {
     Call(usize),
     /// Vararg expression: instruction at PC.
     Vararg(usize),
+    /// Global variable: _ENV[name_constant], upvalue index + constant index.
+    Global { env_upval: u8, name_k: u32 },
 }
 
 /// Key type for table indexing.

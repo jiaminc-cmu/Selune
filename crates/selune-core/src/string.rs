@@ -107,6 +107,7 @@ pub fn lua_hash(bytes: &[u8]) -> u32 {
 }
 
 /// String interner: owns all strings and provides deduplication for short strings.
+#[derive(Debug)]
 pub struct StringInterner {
     /// All strings, indexed by StringId.
     strings: Vec<TString>,
