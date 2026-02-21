@@ -391,6 +391,33 @@ impl<'a> Compiler<'a> {
             // For short-circuit operators, handle specially
             if binop == BinOp::And || binop == BinOp::Or {
                 expr = self.code_short_circuit(binop, expr, right_prec, op_line)?;
+            } else if binop == BinOp::Concat {
+                // Concat needs all operands in consecutive registers.
+                // Collect all concat operands, discharge to consecutive regs,
+                // then emit a single Concat instruction.
+                let first_reg = self.fs_mut().scope.alloc_reg();
+                self.discharge_to_reg(&expr, first_reg, op_line);
+                let mut count: u8 = 1;
+                loop {
+                    // Parse the next operand at concat's left priority,
+                    // so higher-priority ops (+ * ^ unary) are absorbed
+                    // but further concats are NOT absorbed into this operand.
+                    let operand = self.sub_expression(left_prec)?;
+                    let reg = self.fs_mut().scope.alloc_reg();
+                    self.discharge_to_reg(&operand, reg, op_line);
+                    count += 1;
+                    // Check if next token is also concat
+                    if let Some(next_op) = self.check_binary_op()? {
+                        if next_op == BinOp::Concat {
+                            self.advance()?;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                self.emit_abc(OpCode::Concat, first_reg, count, 0, op_line);
+                self.fs_mut().scope.free_reg_to(first_reg + 1);
+                expr = ExprDesc::Register(first_reg);
             } else {
                 let left_reg = self.discharge_to_any_reg(&expr, op_line);
                 let right = self.sub_expression(right_prec)?;
@@ -1978,7 +2005,7 @@ pub fn compile(source: &[u8], name: &str) -> Result<(Proto, StringInterner), Com
 
     // Create the top-level function
     let mut top = FuncState::new(None);
-    let source_name = compiler.lexer.strings.intern(name.as_bytes());
+    let source_name = compiler.lexer.strings.intern_or_create(name.as_bytes());
     top.proto.source = Some(source_name);
     top.proto.is_vararg = true;
     top.scope.enter_block(false);
