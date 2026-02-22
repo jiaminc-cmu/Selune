@@ -2248,7 +2248,7 @@ mod tests {
     #[test]
     fn test_function_vararg() {
         let (proto, _) = compile_ok("function f(...) return ... end");
-        assert_eq!(proto.protos[0].is_vararg, true);
+        assert!(proto.protos[0].is_vararg);
     }
 
     #[test]
@@ -2391,7 +2391,7 @@ mod tests {
         assert!(ExprDesc::True.is_literal());
         assert!(ExprDesc::False.is_literal());
         assert!(ExprDesc::Integer(42).is_literal());
-        assert!(ExprDesc::Float(3.14).is_literal());
+        assert!(ExprDesc::Float(1.5).is_literal());
         assert!(!ExprDesc::Register(0).is_literal());
         assert!(!ExprDesc::Void.is_literal());
     }

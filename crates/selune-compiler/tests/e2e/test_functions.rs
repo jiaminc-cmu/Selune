@@ -41,7 +41,8 @@ fn e2e_closure_upvalue_capture() {
     let (proto, _) = compile_str("local x = 1\nfunction f() return x end");
     assert_eq!(proto.protos.len(), 1);
     assert!(!proto.protos[0].upvalues.is_empty());
-    assert!(proto.protos[0].upvalues[0].in_stack || !proto.protos[0].upvalues[0].in_stack);
+    // Upvalue should capture from enclosing stack
+    assert!(proto.protos[0].upvalues[0].in_stack);
 }
 
 #[test]

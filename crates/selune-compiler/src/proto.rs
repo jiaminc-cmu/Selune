@@ -238,8 +238,8 @@ mod tests {
     #[test]
     fn test_add_constant_float_dedup() {
         let mut p = Proto::new();
-        let i1 = p.add_constant(Constant::Float(3.14));
-        let i2 = p.add_constant(Constant::Float(3.14));
+        let i1 = p.add_constant(Constant::Float(1.5));
+        let i2 = p.add_constant(Constant::Float(1.5));
         assert_eq!(i1, i2);
     }
 

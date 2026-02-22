@@ -1,11 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use selune_compiler::lexer::Lexer;
 use selune_compiler::token::Token;
-use selune_core::string::StringInterner;
 
 fn lex_all(source: &[u8]) {
-    let mut strings = StringInterner::new();
-    let mut lexer = Lexer::new(source, &mut strings);
+    let mut lexer = Lexer::new(source);
     loop {
         match lexer.advance() {
             Ok(tok) if tok.token == Token::Eof => break,
