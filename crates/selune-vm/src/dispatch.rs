@@ -413,7 +413,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             OpCode::MMBin => {
                 // A = left operand reg, B = right operand reg, C = metamethod index
                 let b_reg = inst.b() as usize;
-                let mm_idx = inst.c() as u8;
+                let mm_idx = inst.c();
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b_reg];
                 let mm_name = vm.mm_names.as_ref().unwrap().from_mm_index(mm_idx);
@@ -437,7 +437,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             OpCode::MMBinI => {
                 // A = left operand reg, sB = immediate, C = metamethod index, k = flip
                 let sb = inst.b() as i8 as i64;
-                let mm_idx = inst.c() as u8;
+                let mm_idx = inst.c();
                 let k_flip = inst.k();
                 let va = vm.stack[base + a];
                 let vb = TValue::from_full_integer(sb, &mut vm.gc);
@@ -462,7 +462,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             OpCode::MMBinK => {
                 // A = left operand reg, B = constant index, C = metamethod index, k = flip
                 let b_k = inst.b() as usize;
-                let mm_idx = inst.c() as u8;
+                let mm_idx = inst.c();
                 let k_flip = inst.k();
                 let va = vm.stack[base + a];
                 let proto = proto!(vm, ci_idx);
@@ -978,7 +978,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             Err(e) => {
                                 // Place (false, error_value)
                                 let err_val = e.to_tvalue(&mut vm.strings);
-                                let all = vec![TValue::from_bool(false), err_val];
+                                let all = [TValue::from_bool(false), err_val];
                                 let result_count = if num_results < 0 {
                                     all.len()
                                 } else {
@@ -1051,7 +1051,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                         // Handler itself errored
                                         let handler_err_val =
                                             handler_err.to_tvalue(&mut vm.strings);
-                                        let all = vec![TValue::from_bool(false), handler_err_val];
+                                        let all = [TValue::from_bool(false), handler_err_val];
                                         let result_count = if num_results < 0 {
                                             all.len()
                                         } else {
@@ -1547,10 +1547,6 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             }
 
             OpCode::ExtraArg => {}
-
-            _ => {
-                return Err(LuaError::Runtime(format!("unimplemented opcode: {:?}", op)));
-            }
         }
     }
 }
