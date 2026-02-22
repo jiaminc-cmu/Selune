@@ -317,11 +317,21 @@ impl<'a> Compiler<'a> {
             ExprDesc::Relocatable(pc) => {
                 self.fs_mut().proto.code[*pc].set_a(reg);
             }
-            ExprDesc::Jump(_) => {
-                // For jump expressions (comparisons), we need to generate
-                // LOADTRUE/LOADFALSE based on the result
-                // This is handled by code_test_set in practice
+            ExprDesc::Jump(pc) => {
+                // Materialize a comparison result as a boolean value.
+                // The JMP at `pc` is taken when the condition is FALSE.
+                // Fall-through (skipped JMP) means the condition is TRUE.
+                let pc = *pc;
+                // Fall-through: condition is TRUE → load true, skip LOADFALSE
                 self.emit_abx(OpCode::LoadTrue, reg, 0, line);
+                let skip_jmp = self.emit_sj(OpCode::Jmp, 0, line);
+                // JMP target: condition is FALSE → load false
+                let false_pc = self.fs().current_pc();
+                self.emit_abx(OpCode::LoadFalse, reg, 0, line);
+                // Patch the comparison's JMP to the LOADFALSE
+                self.patch_jump_to(pc, false_pc);
+                // Patch the skip JMP to after LOADFALSE
+                self.patch_jump(skip_jmp);
             }
             ExprDesc::Call(pc) => {
                 // Set the call result count to 1 (in register C)
@@ -541,14 +551,14 @@ impl<'a> Compiler<'a> {
                     let line = self.line();
                     let table_reg = self.discharge_to_any_reg(&expr, line);
                     let k = self.fs_mut().add_string_constant(method_name);
-                    let self_reg = self.fs_mut().scope.alloc_reg();
+                    // Place method at func_reg, self at func_reg+1
+                    let func_reg = self.fs_mut().scope.alloc_reg();
+                    let _self_slot = self.fs_mut().scope.alloc_reg();
                     self.emit(
-                        Instruction::abc(OpCode::Self_, self_reg, table_reg, k as u8, true),
+                        Instruction::abc(OpCode::Self_, func_reg, table_reg, k as u8, true),
                         line,
                     );
-                    let _obj_reg = self.fs_mut().scope.alloc_reg();
-                    expr = ExprDesc::Register(self_reg);
-                    expr = self.function_call(expr, line)?;
+                    expr = self.method_call(func_reg, line)?;
                 }
                 Token::LParen | Token::LBrace | Token::String(_) => {
                     let line = self.line();
@@ -589,7 +599,22 @@ impl<'a> Compiler<'a> {
 
     /// Parse a function call.
     fn function_call(&mut self, func_expr: ExprDesc, line: u32) -> Result<ExprDesc, CompileError> {
-        let func_reg = self.discharge_to_any_reg(&func_expr, line);
+        // Discharge function to a safe register. If the function is already
+        // in a register at or above any active locals (i.e., it was just loaded
+        // to free_reg by Self, Closure, etc.), reuse it directly.
+        // Otherwise, allocate a fresh register to avoid clobbering locals.
+        let num_locals = self.fs().scope.locals.len() as u8;
+        let func_reg = match &func_expr {
+            ExprDesc::Register(r) if *r >= num_locals => {
+                // Already above all locals — safe to use directly
+                *r
+            }
+            _ => {
+                let reg = self.fs_mut().scope.alloc_reg();
+                self.discharge_to_reg(&func_expr, reg, line);
+                reg
+            }
+        };
         let base = func_reg;
 
         let nargs = match self.current_token()?.clone() {
@@ -629,6 +654,48 @@ impl<'a> Compiler<'a> {
         Ok(ExprDesc::Call(pc))
     }
 
+    /// Compile a method call: R[func_reg] = method, R[func_reg+1] = self (from SELF opcode).
+    /// Parses arguments and emits CALL with self counted as first arg.
+    fn method_call(&mut self, func_reg: u8, line: u32) -> Result<ExprDesc, CompileError> {
+        let base = func_reg;
+        // self is already at R[base + 1], explicit args start at R[base + 2]
+        let explicit_nargs = match self.current_token()?.clone() {
+            Token::LParen => {
+                self.advance()?;
+                if self.check(&Token::RParen) {
+                    self.advance()?;
+                    0u8
+                } else {
+                    let n = self.expression_list(base + 2)?;
+                    self.expect(&Token::RParen)?;
+                    n
+                }
+            }
+            Token::LBrace => {
+                let table = self.table_constructor()?;
+                self.discharge_to_reg(&table, base + 2, line);
+                1u8
+            }
+            Token::String(id) => {
+                self.advance()?;
+                self.discharge_to_reg(&ExprDesc::Str(id), base + 2, line);
+                1u8
+            }
+            _ => {
+                return Err(self.error("function arguments expected"));
+            }
+        };
+
+        // nargs includes the implicit self argument
+        let total_nargs = explicit_nargs + 1;
+        let pc = self.emit(
+            Instruction::abc(OpCode::Call, base, total_nargs + 1, 0, false),
+            line,
+        );
+        self.fs_mut().scope.free_reg_to(base + 1);
+        Ok(ExprDesc::Call(pc))
+    }
+
     /// Parse an expression list, discharging each to consecutive registers.
     /// Returns the number of expressions parsed. The last expression may be multi-value.
     fn expression_list(&mut self, base_reg: u8) -> Result<u8, CompileError> {
@@ -655,7 +722,77 @@ impl<'a> Compiler<'a> {
 
             // Not the last expression: force single value
             self.discharge_to_reg(&expr, base_reg + count, line);
-            self.fs_mut().scope.free_reg_to(base_reg + count + 1);
+            // Ensure free_reg is past the discharged value so subsequent
+            // expressions don't clobber it.
+            let target = base_reg + count + 1;
+            if self.fs().scope.free_reg < target {
+                self.fs_mut().scope.free_reg = target;
+            }
+            count += 1;
+            self.advance()?; // consume comma
+        }
+        Ok(count)
+    }
+
+    /// Like expression_list, but if the last expression is a Call/Vararg and
+    /// fewer expressions were parsed than `num_wanted`, patch the last expression
+    /// to deliver multiple results to fill the gap.
+    /// Returns `num_wanted` if multi-return was used, otherwise the actual count.
+    fn expression_list_adjust(&mut self, base_reg: u8, num_wanted: u8) -> Result<u8, CompileError> {
+        let mut count = 0u8;
+        loop {
+            let expr = self.expression()?;
+            let line = self.line();
+
+            if !self.check(&Token::Comma) {
+                // Last expression
+                let remaining = if (count + 1) < num_wanted {
+                    num_wanted - count
+                } else {
+                    1
+                };
+
+                match &expr {
+                    ExprDesc::Call(pc) if remaining > 1 => {
+                        // Patch call to return `remaining` results
+                        let pc = *pc;
+                        let inst = self.fs().proto.code[pc];
+                        let a = inst.a();
+                        self.fs_mut().proto.code[pc] = Instruction::abc(
+                            inst.opcode(), a, inst.b(), remaining + 1, inst.k(),
+                        );
+                        // Move results to correct position if needed
+                        if a != base_reg + count {
+                            for i in 0..remaining {
+                                self.emit_abc(OpCode::Move, base_reg + count + i, a + i, 0, line);
+                            }
+                        }
+                        return Ok(num_wanted);
+                    }
+                    ExprDesc::Vararg(pc) if remaining > 1 => {
+                        // Patch vararg to return `remaining` results
+                        let pc = *pc;
+                        self.fs_mut().proto.code[pc] = Instruction::abc(
+                            OpCode::VarArg, base_reg + count, remaining + 1, 0, false,
+                        );
+                        return Ok(num_wanted);
+                    }
+                    _ => {
+                        self.discharge_to_reg(&expr, base_reg + count, line);
+                        count += 1;
+                    }
+                }
+                break;
+            }
+
+            // Not the last expression: force single value
+            self.discharge_to_reg(&expr, base_reg + count, line);
+            // Ensure free_reg is past the discharged value so subsequent
+            // expressions don't clobber it.
+            let target = base_reg + count + 1;
+            if self.fs().scope.free_reg < target {
+                self.fs_mut().scope.free_reg = target;
+            }
             count += 1;
             self.advance()?; // consume comma
         }
@@ -686,8 +823,11 @@ impl<'a> Compiler<'a> {
         let mut array_count = 0u32;
         let mut hash_count = 0u32;
         let mut total_array = 0u32;
+        // Track whether the last array element is a multi-return expression
+        let mut last_array_is_multi = false;
 
         while !self.check(&Token::RBrace) {
+            last_array_is_multi = false;
             match self.current_token()?.clone() {
                 Token::LBracket => {
                     // [expr] = expr
@@ -728,10 +868,12 @@ impl<'a> Compiler<'a> {
                         // Check for binary operators
                         let expr = self.finish_expression(expr)?;
                         let eline = self.line();
+                        last_array_is_multi = matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
                         let _val_reg = self.discharge_to_any_reg(&expr, eline);
                         array_count += 1;
                         total_array += 1;
                         if array_count >= 50 {
+                            last_array_is_multi = false;
                             let batch = (total_array - 1) / 50 + 1;
                             self.emit(
                                 Instruction::abc(
@@ -752,12 +894,14 @@ impl<'a> Compiler<'a> {
                     // Array element
                     let expr = self.expression()?;
                     let eline = self.line();
+                    last_array_is_multi = matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
                     let val_reg = self.discharge_to_any_reg(&expr, eline);
                     array_count += 1;
                     total_array += 1;
 
                     // Flush in batches of 50 (LFIELDS_PER_FLUSH in PUC)
                     if array_count >= 50 {
+                        last_array_is_multi = false;
                         let batch = (total_array - 1) / 50 + 1;
                         self.emit(
                             Instruction::abc(
@@ -784,20 +928,51 @@ impl<'a> Compiler<'a> {
 
         self.expect(&Token::RBrace)?;
 
-        // Flush remaining array elements
+        // Flush remaining array elements.
         if array_count > 0 {
             let batch = (total_array - 1) / 50 + 1;
             let eline = self.line();
-            self.emit(
-                Instruction::abc(
-                    OpCode::SetList,
-                    table_reg,
-                    array_count as u8,
-                    batch as u8,
-                    false,
-                ),
-                eline,
-            );
+
+            if last_array_is_multi {
+                // The last array element is a Call or Vararg that was discharged
+                // with single-result mode. Find and patch it to multi-return (C=0).
+                // discharge_to_any_reg may have added a MOVE after the Call/VarArg,
+                // so scan backwards to find the actual Call/VarArg instruction.
+                let code = &self.fs().proto.code;
+                let mut patch_pc = code.len() - 1;
+                while patch_pc > 0 {
+                    let op = code[patch_pc].opcode();
+                    if op == OpCode::Call || op == OpCode::VarArg {
+                        break;
+                    }
+                    patch_pc -= 1;
+                }
+                let inst = self.fs().proto.code[patch_pc];
+                let a = inst.a();
+                let b = inst.b();
+                self.fs_mut().proto.code[patch_pc] =
+                    Instruction::abc(inst.opcode(), a, b, 0, inst.k());
+                // Remove any MOVE instructions that were added after the Call/VarArg
+                // (they're no longer needed since we're using multi-return)
+                self.fs_mut().proto.code.truncate(patch_pc + 1);
+                self.fs_mut().proto.line_info.truncate(patch_pc + 1);
+                // SETLIST with B=0 means "from table_reg+1 to stack_top"
+                self.emit(
+                    Instruction::abc(OpCode::SetList, table_reg, 0, batch as u8, false),
+                    eline,
+                );
+            } else {
+                self.emit(
+                    Instruction::abc(
+                        OpCode::SetList,
+                        table_reg,
+                        array_count as u8,
+                        batch as u8,
+                        false,
+                    ),
+                    eline,
+                );
+            }
         }
 
         // Patch NewTable with size hints
@@ -1025,6 +1200,9 @@ impl<'a> Compiler<'a> {
         right: ExprDesc,
         line: u32,
     ) -> Result<ExprDesc, CompileError> {
+        // Save free_reg before evaluating right operand so we only free temps
+        // allocated for the comparison, not local variables like parameters.
+        let save_free_reg = self.fs().scope.free_reg;
         let right_reg = self.discharge_to_any_reg(&right, line);
 
         let (opcode, a, b, k) = match op {
@@ -1039,7 +1217,10 @@ impl<'a> Compiler<'a> {
 
         self.emit(Instruction::abc(opcode, a, b, 0, k), line);
         let pc = self.emit_sj(OpCode::Jmp, 0, line);
-        self.fs_mut().scope.free_reg_to(left_reg);
+        // Free only temps allocated for the comparison, not locals/params.
+        // save_free_reg preserves the level including any local that left_reg
+        // might refer to.
+        self.fs_mut().scope.free_reg_to(save_free_reg);
         Ok(ExprDesc::Jump(pc))
     }
 
@@ -1316,12 +1497,12 @@ impl<'a> Compiler<'a> {
 
         let num_vars = names.len();
 
+        let base_reg = self.fs().scope.free_reg;
         if self.test_next(&Token::Assign)? {
-            // Parse initializers
-            let base_reg = self.fs().scope.free_reg;
-            let num_exprs = self.expression_list(base_reg)?;
+            // Parse initializers, telling expression_list how many vars need filling
+            let num_exprs = self.expression_list_adjust(base_reg, num_vars as u8)?;
 
-            // Pad with nils if fewer expressions than variables
+            // Pad with nils if fewer expressions than variables and last wasn't multi-return
             if (num_exprs as usize) < num_vars {
                 for i in num_exprs..num_vars as u8 {
                     self.emit_abx(OpCode::LoadNil, base_reg + i, 0, line);
@@ -1329,11 +1510,14 @@ impl<'a> Compiler<'a> {
             }
         } else {
             // No initializer: all nil
-            let base_reg = self.fs().scope.free_reg;
             for i in 0..num_vars as u8 {
                 self.emit_abx(OpCode::LoadNil, base_reg + i, 0, line);
             }
         }
+
+        // Reset free_reg so add_local assigns locals to the same
+        // registers where expression values were discharged.
+        self.fs_mut().scope.free_reg_to(base_reg);
 
         // Register all local variables
         let start_pc = self.fs().current_pc() as u32;
@@ -1356,62 +1540,52 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'if'
         let mut escape_jumps = Vec::new();
 
-        // First condition
+        // Compile the first condition
         let cond = self.expression()?;
         self.expect(&Token::Then)?;
         let line = self.line();
-        let false_jump = self.code_test_jump(&cond, false, line)?;
+        let mut false_jump = self.code_test_jump(&cond, false, line)?;
 
         self.fs_mut().scope.enter_block(false);
         self.block()?;
         self.fs_mut().scope.leave_block();
 
+        // Handle elseif chain
         while self.check(&Token::ElseIf) {
-            let esc = self.emit_jump(self.line());
-            escape_jumps.push(esc);
+            // Escape jump from the end of the previous then-block
+            escape_jumps.push(self.emit_jump(self.line()));
+            // Patch the previous false_jump to here (start of the elseif condition)
             self.patch_jump(false_jump);
+
             self.advance()?; // consume 'elseif'
             let cond = self.expression()?;
             self.expect(&Token::Then)?;
             let cond_line = self.line();
-            let false_jump_inner = self.code_test_jump(&cond, false, cond_line)?;
+            false_jump = self.code_test_jump(&cond, false, cond_line)?;
 
             self.fs_mut().scope.enter_block(false);
             self.block()?;
             self.fs_mut().scope.leave_block();
-
-            // The last false_jump from elseif chain
-            escape_jumps.push(self.emit_jump(self.line()));
-            self.patch_jump(false_jump_inner);
-            // Need to handle the chain properly. Let me restructure.
         }
 
-        // Actually the above loop logic is getting messy. Let me redo with a cleaner approach.
-        // The issue is that we need to track the false_jump across iterations.
-        // Let me just use a simpler recursive approach.
-
-        // Actually, wait — the code above has a bug because false_jump from the initial
-        // 'if' isn't being patched properly when there are elseifs.
-        // Let me just redo this method cleanly:
-
-        // ...the method is getting complex. Let me just patch the initial false_jump
-        // before checking for else/end.
-
         if self.check(&Token::Else) {
-            let esc = self.emit_jump(self.line());
-            escape_jumps.push(esc);
+            // Escape jump from the end of the last then/elseif block
+            escape_jumps.push(self.emit_jump(self.line()));
+            // Patch false_jump to the else block
             self.patch_jump(false_jump);
 
             self.advance()?; // consume 'else'
             self.fs_mut().scope.enter_block(false);
             self.block()?;
             self.fs_mut().scope.leave_block();
-        } else if !self.check(&Token::ElseIf) {
+        } else {
+            // No else: patch false_jump to after the if statement
             self.patch_jump(false_jump);
         }
 
         self.expect(&Token::End)?;
 
+        // Patch all escape jumps to after 'end'
         for esc in escape_jumps {
             self.patch_jump(esc);
         }
@@ -1477,16 +1651,19 @@ impl<'a> Compiler<'a> {
         // Allocate 4 internal registers: (internal) init, limit, step, var
         let base = self.fs().scope.free_reg;
 
+        // Reserve 3 internal registers upfront: init, limit, step
+        self.fs_mut().scope.alloc_regs(3);
+
         // Parse init
         let init = self.expression()?;
         self.discharge_to_reg(&init, base, line);
-        self.fs_mut().scope.alloc_reg(); // for init
+        self.fs_mut().scope.free_reg_to(base + 3);
 
         // Parse limit
         self.expect(&Token::Comma)?;
         let limit = self.expression()?;
         self.discharge_to_reg(&limit, base + 1, line);
-        self.fs_mut().scope.alloc_reg(); // for limit
+        self.fs_mut().scope.free_reg_to(base + 3);
 
         // Parse optional step
         if self.test_next(&Token::Comma)? {
@@ -1495,7 +1672,7 @@ impl<'a> Compiler<'a> {
         } else {
             self.discharge_to_reg(&ExprDesc::Integer(1), base + 2, line);
         }
-        self.fs_mut().scope.alloc_reg(); // for step
+        self.fs_mut().scope.free_reg_to(base + 3);
 
         self.expect(&Token::Do)?;
 
@@ -1504,7 +1681,7 @@ impl<'a> Compiler<'a> {
 
         // Enter loop block
         self.fs_mut().scope.enter_block(true);
-        // The loop variable
+        // The loop variable is at R[base+3] (set by ForPrep/ForLoop)
         let pc = self.fs().current_pc() as u32;
         self.fs_mut().scope.add_local(var_name, false, false, pc);
 
@@ -1713,6 +1890,13 @@ impl<'a> Compiler<'a> {
                         Instruction::abc(OpCode::TailCall, a, b, 0, inst.k());
                     self.emit_abc(OpCode::Return, a, 0, 0, line);
                 }
+                ExprDesc::Vararg(pc) => {
+                    // Multi-return vararg: return all varargs
+                    let pc = *pc;
+                    self.fs_mut().proto.code[pc] =
+                        Instruction::abc(OpCode::VarArg, base, 0, 0, false);
+                    self.emit_abc(OpCode::Return, base, 0, 0, line);
+                }
                 _ => {
                     self.discharge_to_reg(&first_expr, base, line);
                     self.emit(Instruction::abc(OpCode::Return1, base, 0, 0, false), line);
@@ -1843,14 +2027,18 @@ impl<'a> Compiler<'a> {
             let base = self.fs().scope.free_reg;
             let count = targets.len();
 
-            // Parse right-hand side
+            // Parse right-hand side.
+            // After discharging each RHS value, advance free_reg so the next
+            // expression's temporaries don't clobber previously discharged values.
             let first = self.expression()?;
             self.discharge_to_reg(&first, base, line);
+            self.fs_mut().scope.free_reg = base + 1;
             let mut num_rhs = 1;
             while self.test_next(&Token::Comma)? {
                 let e = self.expression()?;
                 self.discharge_to_reg(&e, base + num_rhs, line);
                 num_rhs += 1;
+                self.fs_mut().scope.free_reg = base + num_rhs;
             }
 
             // Pad with nils

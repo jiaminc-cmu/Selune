@@ -11,7 +11,10 @@
 ///   011 = small integer (47-bit signed)
 ///   100 = GC pointer
 ///   101 = light userdata
+use crate::gc::*;
+use crate::string::StringId;
 use std::fmt;
+use std::marker::PhantomData;
 
 /// Quiet NaN prefix: exponent all 1s + quiet bit set
 const QNAN: u64 = 0x7FF8_0000_0000_0000;
@@ -216,6 +219,162 @@ impl TValue {
         }
     }
 
+    // ---- GC sub-tag helpers ----
+
+    /// Create a GC value with a sub-tag and index.
+    #[inline]
+    pub fn from_gc_sub(sub_tag: u64, index: u32) -> Self {
+        let payload = (sub_tag << GC_SUB_SHIFT) | (index as u64);
+        debug_assert!(payload & !PAYLOAD_MASK == 0);
+        TValue(QNAN | TAG_GC | payload)
+    }
+
+    /// Extract the GC sub-tag (bits 44-46 of payload).
+    #[inline]
+    pub fn gc_sub_tag(&self) -> Option<u64> {
+        if self.is_gc() {
+            let payload = self.0 & PAYLOAD_MASK;
+            Some((payload >> GC_SUB_SHIFT) & GC_SUB_MASK)
+        } else {
+            None
+        }
+    }
+
+    /// Extract the GC index (bits 0-43 of payload).
+    #[inline]
+    pub fn gc_index(&self) -> Option<u32> {
+        if self.is_gc() {
+            let payload = self.0 & PAYLOAD_MASK;
+            Some((payload & GC_INDEX_MASK) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Create a TValue from a StringId (stores as GC with string sub-tag).
+    #[inline]
+    pub fn from_string_id(id: StringId) -> Self {
+        Self::from_gc_sub(GC_SUB_STRING, id.0)
+    }
+
+    /// Extract StringId if this is a string.
+    #[inline]
+    pub fn as_string_id(&self) -> Option<StringId> {
+        if self.gc_sub_tag() == Some(GC_SUB_STRING) {
+            Some(StringId(self.gc_index().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this is a string value.
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        self.gc_sub_tag() == Some(GC_SUB_STRING)
+    }
+
+    /// Create a TValue from a table GC index.
+    #[inline]
+    pub fn from_table(idx: GcIdx<crate::table::Table>) -> Self {
+        Self::from_gc_sub(GC_SUB_TABLE, idx.0)
+    }
+
+    /// Extract table index if this is a table.
+    #[inline]
+    pub fn as_table_idx(&self) -> Option<GcIdx<crate::table::Table>> {
+        if self.gc_sub_tag() == Some(GC_SUB_TABLE) {
+            Some(GcIdx(self.gc_index().unwrap(), PhantomData))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this is a table value.
+    #[inline]
+    pub fn is_table(&self) -> bool {
+        self.gc_sub_tag() == Some(GC_SUB_TABLE)
+    }
+
+    /// Create a TValue from a closure GC index.
+    #[inline]
+    pub fn from_closure(idx: GcIdx<crate::gc::LuaClosure>) -> Self {
+        Self::from_gc_sub(GC_SUB_CLOSURE, idx.0)
+    }
+
+    /// Extract closure index if this is a closure.
+    #[inline]
+    pub fn as_closure_idx(&self) -> Option<GcIdx<crate::gc::LuaClosure>> {
+        if self.gc_sub_tag() == Some(GC_SUB_CLOSURE) {
+            Some(GcIdx(self.gc_index().unwrap(), PhantomData))
+        } else {
+            None
+        }
+    }
+
+    /// Create a TValue from a native function GC index.
+    #[inline]
+    pub fn from_native(idx: GcIdx<crate::gc::NativeFunction>) -> Self {
+        Self::from_gc_sub(GC_SUB_NATIVE, idx.0)
+    }
+
+    /// Extract native function index if this is a native function.
+    #[inline]
+    pub fn as_native_idx(&self) -> Option<GcIdx<crate::gc::NativeFunction>> {
+        if self.gc_sub_tag() == Some(GC_SUB_NATIVE) {
+            Some(GcIdx(self.gc_index().unwrap(), PhantomData))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this is any kind of function (closure or native).
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        matches!(self.gc_sub_tag(), Some(GC_SUB_CLOSURE) | Some(GC_SUB_NATIVE))
+    }
+
+    /// Create a TValue from a full i64, boxing if necessary.
+    #[inline]
+    pub fn from_full_integer(i: i64, gc: &mut GcHeap) -> Self {
+        if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&i) {
+            Self::from_integer(i)
+        } else {
+            let idx = gc.alloc_boxed_int(i);
+            Self::from_gc_sub(GC_SUB_BOXED_INT, idx.0)
+        }
+    }
+
+    /// Extract a full i64, checking both inline and boxed.
+    #[inline]
+    pub fn as_full_integer(&self, gc: &GcHeap) -> Option<i64> {
+        if let Some(i) = self.as_integer() {
+            Some(i)
+        } else if self.gc_sub_tag() == Some(GC_SUB_BOXED_INT) {
+            let idx = GcIdx::<i64>(self.gc_index().unwrap(), PhantomData);
+            Some(gc.get_boxed_int(idx))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this is any kind of integer (inline or boxed).
+    #[inline]
+    pub fn is_any_integer(&self, gc: &GcHeap) -> bool {
+        self.is_integer() || (self.gc_sub_tag() == Some(GC_SUB_BOXED_INT) && gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData)) == gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData)))
+    }
+
+    /// Attempt to extract as number (f64). Integers convert to float.
+    #[inline]
+    pub fn as_number(&self, gc: &GcHeap) -> Option<f64> {
+        if let Some(f) = self.as_float() {
+            Some(f)
+        } else if let Some(i) = self.as_full_integer(gc) {
+            Some(i as f64)
+        } else {
+            None
+        }
+    }
+
     // ---- Lua semantics ----
 
     /// Lua falsy: only nil and false are falsy.
@@ -235,6 +394,12 @@ impl TValue {
     pub fn raw_bits(&self) -> u64 {
         self.0
     }
+
+    /// Create a TValue from raw bits (for reconstructing from stored bits).
+    #[inline]
+    pub fn from_raw_bits(bits: u64) -> Self {
+        TValue(bits)
+    }
 }
 
 impl fmt::Debug for TValue {
@@ -248,7 +413,15 @@ impl fmt::Debug for TValue {
         } else if let Some(fl) = self.as_float() {
             write!(f, "{fl}")
         } else if self.is_gc() {
-            write!(f, "gc({:#x})", self.0 & PAYLOAD_MASK)
+            match self.gc_sub_tag() {
+                Some(GC_SUB_STRING) => write!(f, "string(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_TABLE) => write!(f, "table(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_CLOSURE) => write!(f, "closure(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_NATIVE) => write!(f, "native(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_UPVAL) => write!(f, "upval(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_BOXED_INT) => write!(f, "boxedint(#{})", self.gc_index().unwrap()),
+                _ => write!(f, "gc({:#x})", self.0 & PAYLOAD_MASK),
+            }
         } else if self.is_light_userdata() {
             write!(f, "lightuserdata({:#x})", self.0 & PAYLOAD_MASK)
         } else {
