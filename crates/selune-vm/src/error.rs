@@ -13,6 +13,8 @@ pub enum LuaError {
     StackOverflow,
     /// Lua error() with an arbitrary TValue (string, number, table, etc.).
     LuaValue(TValue),
+    /// Coroutine yield — carries the yielded values up to the resume point.
+    Yield(Vec<TValue>),
 }
 
 impl LuaError {
@@ -28,6 +30,10 @@ impl LuaError {
                 TValue::from_string_id(sid)
             }
             LuaError::LuaValue(v) => *v,
+            LuaError::Yield(_) => {
+                let sid = strings.intern(b"cannot yield from main thread");
+                TValue::from_string_id(sid)
+            }
         }
     }
 }
@@ -38,6 +44,7 @@ impl fmt::Display for LuaError {
             LuaError::Runtime(msg) => write!(f, "{msg}"),
             LuaError::StackOverflow => write!(f, "stack overflow"),
             LuaError::LuaValue(v) => write!(f, "{:?}", v),
+            LuaError::Yield(_) => write!(f, "cannot yield from main thread"),
         }
     }
 }

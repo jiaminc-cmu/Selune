@@ -11,21 +11,49 @@ use selune_core::gc::{
 use selune_core::string::StringInterner;
 use selune_core::value::TValue;
 
-/// The Lua virtual machine.
-pub struct Vm {
-    /// Value stack (registers).
+/// Per-coroutine state (stack, call stack, upvalues).
+#[derive(Clone)]
+pub struct LuaThread {
     pub stack: Vec<TValue>,
-    /// Call stack (frames).
+    pub call_stack: Vec<CallInfo>,
+    pub stack_top: usize,
+    pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
+    pub status: CoroutineStatus,
+}
+
+/// Coroutine lifecycle states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroutineStatus {
+    /// Created or yielded — ready to be resumed.
+    Suspended,
+    /// Currently executing.
+    Running,
+    /// Resumed another coroutine (waiting for it to yield/finish).
+    Normal,
+    /// Finished execution or errored out.
+    Dead,
+}
+
+/// The Lua virtual machine.
+///
+/// The `stack`, `call_stack`, `stack_top`, and `open_upvals` fields always
+/// refer to the **currently running** thread. When a coroutine is resumed,
+/// the caller's state is saved into a `LuaThread` and the coroutine's
+/// state is swapped in. On yield or return, the reverse swap happens.
+pub struct Vm {
+    /// Value stack (registers) — belongs to the running thread.
+    pub stack: Vec<TValue>,
+    /// Call stack (frames) — belongs to the running thread.
     pub call_stack: Vec<CallInfo>,
     /// GC heap.
     pub gc: GcHeap,
     /// String interner (shared with compiler output).
     pub strings: StringInterner,
-    /// Top of stack (index of first free slot).
+    /// Top of stack (index of first free slot) — belongs to the running thread.
     pub stack_top: usize,
     /// All prototypes (flattened from nested tree).
     pub protos: Vec<Proto>,
-    /// Open upvalues sorted by stack index (descending).
+    /// Open upvalues sorted by stack index (descending) — belongs to the running thread.
     pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
     /// Max call depth before stack overflow.
     pub max_call_depth: usize,
@@ -34,6 +62,27 @@ pub struct Vm {
     /// Native indices for pcall/xpcall (set during register_natives).
     pub pcall_idx: Option<GcIdx<NativeFunction>>,
     pub xpcall_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.sort (needs special VM dispatch for Lua comparator).
+    pub table_sort_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for string.gsub (needs special VM dispatch for function replacement).
+    pub string_gsub_idx: Option<GcIdx<NativeFunction>>,
+    /// Coroutine storage: suspended thread states, indexed by coroutine ID.
+    pub coroutines: Vec<LuaThread>,
+    /// Index of the currently running coroutine (None = main thread).
+    pub running_coro: Option<usize>,
+    /// Stack of caller thread states for nested coroutine resumes.
+    /// When coroutine A resumes B, A's state is pushed here.
+    pub coro_caller_stack: Vec<LuaThread>,
+    /// Native index for coroutine.resume (needs special VM dispatch).
+    pub coro_resume_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for coroutine.yield (needs special VM dispatch).
+    pub coro_yield_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for coroutine.wrap (needs special VM dispatch to set __call).
+    pub coro_wrap_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for coroutine.wrap's internal resume function.
+    pub coro_wrap_resume_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for collectgarbage (needs full VM access for gc_collect).
+    pub collectgarbage_idx: Option<GcIdx<NativeFunction>>,
 }
 
 impl Vm {
@@ -52,6 +101,16 @@ impl Vm {
             mm_names: None,
             pcall_idx: None,
             xpcall_idx: None,
+            table_sort_idx: None,
+            string_gsub_idx: None,
+            coroutines: Vec::new(),
+            running_coro: None,
+            coro_caller_stack: Vec::new(),
+            coro_resume_idx: None,
+            coro_yield_idx: None,
+            coro_wrap_idx: None,
+            coro_wrap_resume_idx: None,
+            collectgarbage_idx: None,
         }
     }
 
@@ -91,6 +150,15 @@ impl Vm {
 
         // Register native functions
         self.register_natives(env_idx);
+
+        // Register standard library modules
+        let stdlib_indices = selune_stdlib::register_all(env_idx, &mut self.gc, &mut self.strings);
+        self.table_sort_idx = Some(stdlib_indices.table_sort_idx);
+        self.string_gsub_idx = Some(stdlib_indices.string_gsub_idx);
+        self.coro_resume_idx = Some(stdlib_indices.coro_resume_idx);
+        self.coro_yield_idx = Some(stdlib_indices.coro_yield_idx);
+        self.coro_wrap_idx = Some(stdlib_indices.coro_wrap_idx);
+        self.coro_wrap_resume_idx = Some(stdlib_indices.coro_wrap_resume_idx);
 
         // Create a top-level closure with _ENV as upvalue[0]
         let env_upval_idx = self.gc.alloc_upval(UpValLocation::Closed(env_val));
@@ -250,6 +318,13 @@ impl Vm {
         let name = self.strings.intern(b"xpcall");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
         self.xpcall_idx = Some(idx);
+
+        // collectgarbage - stub; actual dispatch via call_function for full VM access
+        let idx = self.gc.alloc_native(native_collectgarbage_stub, "collectgarbage");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"collectgarbage");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.collectgarbage_idx = Some(idx);
     }
 
     /// Get an upvalue's current value.
@@ -288,6 +363,176 @@ impl Vm {
         // Keep sorted by stack index descending
         self.open_upvals.sort_by(|a, b| b.0.cmp(&a.0));
         uv_idx
+    }
+
+    /// Create a new coroutine from a function value. Returns its ID (index into coroutines).
+    pub fn create_coroutine(&mut self, func: TValue) -> usize {
+        let id = self.coroutines.len();
+        let mut thread = LuaThread {
+            stack: vec![TValue::nil(); 256],
+            call_stack: Vec::new(),
+            stack_top: 0,
+            open_upvals: Vec::new(),
+            status: CoroutineStatus::Suspended,
+        };
+        // Place the function at R[0]
+        thread.stack[0] = func;
+        self.coroutines.push(thread);
+        id
+    }
+
+    /// Save the current running state into a LuaThread snapshot.
+    pub fn save_running_state(&self) -> LuaThread {
+        LuaThread {
+            stack: self.stack.clone(),
+            call_stack: self.call_stack.clone(),
+            stack_top: self.stack_top,
+            open_upvals: self.open_upvals.clone(),
+            status: CoroutineStatus::Normal, // caller becomes Normal while waiting
+        }
+    }
+
+    /// Restore a LuaThread snapshot into the running state.
+    pub fn restore_running_state(&mut self, thread: LuaThread) {
+        self.stack = thread.stack;
+        self.call_stack = thread.call_stack;
+        self.stack_top = thread.stack_top;
+        self.open_upvals = thread.open_upvals;
+    }
+
+    /// Save the current running state back into the coroutine slot.
+    pub fn save_coro_state(&mut self, coro_id: usize) {
+        self.coroutines[coro_id].stack = self.stack.clone();
+        self.coroutines[coro_id].call_stack = self.call_stack.clone();
+        self.coroutines[coro_id].stack_top = self.stack_top;
+        self.coroutines[coro_id].open_upvals = self.open_upvals.clone();
+    }
+
+    // ---- Garbage Collection ----
+
+    /// Run a full mark-sweep GC cycle. Returns approximate bytes freed.
+    pub fn gc_collect(&mut self) -> usize {
+        // Phase 1: Prepare mark bits
+        self.gc.gc_prepare_marks();
+
+        // Phase 2: Mark roots
+        self.gc_mark_roots();
+
+        // Phase 3: Propagate (traverse gray objects until none remain)
+        loop {
+            let work = self.gc.gc_propagate();
+            if work == 0 {
+                break;
+            }
+        }
+
+        // Phase 4: Sweep
+        self.gc.gc_sweep()
+    }
+
+    /// Mark all GC roots: stack values, call frame closures, _ENV, open upvalues,
+    /// coroutine stacks, and registered native indices.
+    fn gc_mark_roots(&mut self) {
+        // Mark running thread's stack
+        let top = self.stack_top.max(
+            self.call_stack
+                .last()
+                .map_or(0, |ci| ci.base + 256 /* max_stack approx */),
+        );
+        for i in 0..top.min(self.stack.len()) {
+            let val = self.stack[i];
+            self.gc.gc_mark_value(val);
+        }
+
+        // Mark closures in call frames
+        for ci in &self.call_stack {
+            if let Some(closure_idx) = ci.closure_idx {
+                let val = TValue::from_closure(closure_idx);
+                self.gc.gc_mark_value(val);
+            }
+        }
+
+        // Mark open upvalues (running thread)
+        for &(_stack_idx, uv_idx) in &self.open_upvals {
+            let val = TValue::from_gc_sub(
+                selune_core::gc::GC_SUB_UPVAL,
+                uv_idx.0,
+            );
+            self.gc.gc_mark_value(val);
+        }
+
+        // Mark coroutine states
+        for coro in &self.coroutines {
+            for &val in &coro.stack {
+                self.gc.gc_mark_value(val);
+            }
+            for ci in &coro.call_stack {
+                if let Some(closure_idx) = ci.closure_idx {
+                    let v = TValue::from_closure(closure_idx);
+                    self.gc.gc_mark_value(v);
+                }
+            }
+            for &(_stack_idx, uv_idx) in &coro.open_upvals {
+                let v = TValue::from_gc_sub(
+                    selune_core::gc::GC_SUB_UPVAL,
+                    uv_idx.0,
+                );
+                self.gc.gc_mark_value(v);
+            }
+        }
+
+        // Mark caller stack (nested coroutine resumes)
+        for caller in &self.coro_caller_stack {
+            for &val in &caller.stack {
+                self.gc.gc_mark_value(val);
+            }
+            for ci in &caller.call_stack {
+                if let Some(closure_idx) = ci.closure_idx {
+                    let v = TValue::from_closure(closure_idx);
+                    self.gc.gc_mark_value(v);
+                }
+            }
+            for &(_stack_idx, uv_idx) in &caller.open_upvals {
+                let v = TValue::from_gc_sub(
+                    selune_core::gc::GC_SUB_UPVAL,
+                    uv_idx.0,
+                );
+                self.gc.gc_mark_value(v);
+            }
+        }
+
+        // Mark registered native function indices (these are always roots)
+        if let Some(idx) = self.pcall_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.xpcall_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_sort_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.string_gsub_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_resume_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_yield_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_wrap_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_wrap_resume_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+    }
+
+    /// Check if GC should run and perform a cycle if needed.
+    pub fn gc_check(&mut self) {
+        if self.gc.gc_should_step() {
+            self.gc_collect();
+        }
     }
 
     /// Close all open upvalues at or above the given level.
@@ -590,6 +835,12 @@ fn native_pcall_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
 fn native_xpcall_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     Err(NativeError::String(
         "xpcall stub should not be called directly".to_string(),
+    ))
+}
+
+fn native_collectgarbage_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "collectgarbage stub should not be called directly".to_string(),
     ))
 }
 

@@ -9,7 +9,7 @@ use crate::metamethod;
 use crate::vm::Vm;
 use selune_compiler::opcode::OpCode;
 use selune_compiler::proto::{Constant, Proto};
-use selune_core::gc::{NativeContext, NativeError};
+use selune_core::gc::{GcIdx, NativeContext, NativeError};
 use selune_core::value::TValue;
 
 /// Helper macro to get current proto without borrowing all of vm.
@@ -975,6 +975,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                     vm.stack_top = result_base + all.len();
                                 }
                             }
+                            Err(LuaError::Yield(vals)) => {
+                                // Yield must propagate through pcall
+                                return Err(LuaError::Yield(vals));
+                            }
                             Err(e) => {
                                 // Place (false, error_value)
                                 let err_val = e.to_tvalue(&mut vm.strings);
@@ -1026,6 +1030,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                     vm.stack_top = result_base + all.len();
                                 }
                             }
+                            Err(LuaError::Yield(vals)) => {
+                                // Yield must propagate through xpcall
+                                return Err(LuaError::Yield(vals));
+                            }
                             Err(e) => {
                                 // Call handler with error value
                                 let err_val = e.to_tvalue(&mut vm.strings);
@@ -1067,6 +1075,31 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                     }
                                 }
                             }
+                        }
+                    } else if vm.table_sort_idx == Some(native_idx)
+                        || vm.string_gsub_idx == Some(native_idx)
+                        || vm.coro_resume_idx == Some(native_idx)
+                        || vm.coro_yield_idx == Some(native_idx)
+                        || vm.coro_wrap_idx == Some(native_idx)
+                        || vm.coro_wrap_resume_idx == Some(native_idx)
+                        || vm.collectgarbage_idx == Some(native_idx)
+                    {
+                        // Redirect through call_function for full VM access
+                        let args: Vec<TValue> =
+                            (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
+                        let results = call_function(vm, func_val, &args)?;
+                        let result_base = base + a;
+                        let result_count = if num_results < 0 {
+                            results.len()
+                        } else {
+                            num_results as usize
+                        };
+                        for i in 0..result_count {
+                            vm.stack[result_base + i] =
+                                results.get(i).copied().unwrap_or(TValue::nil());
+                        }
+                        if num_results < 0 {
+                            vm.stack_top = result_base + results.len();
                         }
                     } else {
                         // Normal native function call
@@ -1210,13 +1243,26 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     let args: Vec<TValue> =
                         (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
-                    let native_fn = vm.gc.get_native(native_idx).func;
-                    let mut ctx = NativeContext {
-                        args: &args,
-                        gc: &mut vm.gc,
-                        strings: &mut vm.strings,
+                    let results = if vm.table_sort_idx == Some(native_idx)
+                        || vm.string_gsub_idx == Some(native_idx)
+                        || vm.pcall_idx == Some(native_idx)
+                        || vm.xpcall_idx == Some(native_idx)
+                        || vm.coro_resume_idx == Some(native_idx)
+                        || vm.coro_yield_idx == Some(native_idx)
+                        || vm.coro_wrap_idx == Some(native_idx)
+                        || vm.coro_wrap_resume_idx == Some(native_idx)
+                        || vm.collectgarbage_idx == Some(native_idx)
+                    {
+                        call_function(vm, func_val, &args)?
+                    } else {
+                        let native_fn = vm.gc.get_native(native_idx).func;
+                        let mut ctx = NativeContext {
+                            args: &args,
+                            gc: &mut vm.gc,
+                            strings: &mut vm.strings,
+                        };
+                        native_fn(&mut ctx).map_err(map_native_error)?
                     };
-                    let results = native_fn(&mut ctx).map_err(map_native_error)?;
 
                     vm.close_upvalues(base);
                     if vm.call_stack.len() <= entry_depth {
@@ -1734,6 +1780,574 @@ fn mm_op_description(mm_idx: u8) -> &'static str {
 
 /// Call a Lua function (closure, native, or __call metamethod) with given args.
 /// This is used by metamethod dispatch, pcall, xpcall, and TFORCALL.
+/// Perform table.sort with full VM access for Lua comparator callbacks.
+fn do_table_sort(
+    vm: &mut Vm,
+    table_idx: GcIdx<selune_core::table::Table>,
+    comp: Option<TValue>,
+) -> Result<(), LuaError> {
+    let len = vm.gc.get_table(table_idx).length() as usize;
+    if len <= 1 {
+        return Ok(());
+    }
+
+    // Read all values into a Vec
+    let mut values: Vec<TValue> = (1..=len)
+        .map(|i| vm.gc.get_table(table_idx).raw_geti(i as i64))
+        .collect();
+
+    // Insertion sort (stable, allows Lua callbacks between comparisons)
+    for i in 1..values.len() {
+        let key = values[i];
+        let mut j = i;
+        while j > 0 {
+            let should_swap = if let Some(comp_fn) = comp {
+                let results = call_function(vm, comp_fn, &[key, values[j - 1]])?;
+                results.first().map(|v| v.is_truthy()).unwrap_or(false)
+            } else {
+                default_sort_lt(key, values[j - 1], &vm.gc, &vm.strings)
+                    .map_err(LuaError::Runtime)?
+            };
+
+            if should_swap {
+                values[j] = values[j - 1];
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        values[j] = key;
+    }
+
+    // Write sorted values back
+    for (i, &v) in values.iter().enumerate() {
+        vm.gc.get_table_mut(table_idx).raw_seti((i + 1) as i64, v);
+    }
+
+    Ok(())
+}
+
+fn default_sort_lt(
+    a: TValue,
+    b: TValue,
+    gc: &selune_core::gc::GcHeap,
+    strings: &selune_core::string::StringInterner,
+) -> Result<bool, String> {
+    if let (Some(ai), Some(bi)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
+        return Ok(ai < bi);
+    }
+    if let (Some(af), Some(bf)) = (a.as_number(gc), b.as_number(gc)) {
+        return Ok(af < bf);
+    }
+    if let (Some(sa), Some(sb)) = (a.as_string_id(), b.as_string_id()) {
+        let ba = strings.get_bytes(sa);
+        let bb = strings.get_bytes(sb);
+        return Ok(ba < bb);
+    }
+    Err("attempt to compare mixed types".to_string())
+}
+
+/// string.gsub implementation — needs full VM access for function replacement.
+fn do_string_gsub(
+    vm: &mut Vm,
+    subject: &[u8],
+    pat: &[u8],
+    repl: TValue,
+    max_n: Option<i64>,
+) -> Result<(Vec<u8>, i64), LuaError> {
+    use selune_stdlib::pattern::{self, CAP_POSITION};
+
+    let max_replacements = max_n.unwrap_or(i64::MAX);
+    let mut result = Vec::new();
+    let mut count = 0i64;
+    let mut pos = 0usize;
+
+    while count < max_replacements {
+        let ms = match pattern::pattern_find(subject, pat, pos) {
+            Some(ms) => ms,
+            None => break,
+        };
+
+        let (match_start, match_end) = ms.captures[0];
+
+        // Append text before match
+        result.extend_from_slice(&subject[pos..match_start]);
+
+        // Compute replacement
+        let replacement = if let Some(repl_sid) = repl.as_string_id() {
+            // String replacement with %n references
+            let repl_bytes = vm.strings.get_bytes(repl_sid).to_vec();
+            pattern::expand_replacement(&repl_bytes, &ms, subject)
+        } else if let Some(repl_table_idx) = repl.as_table_idx() {
+            // Table replacement: look up first capture (or full match)
+            let key = if ms.captures.len() > 1 {
+                let (cs, ce) = ms.captures[1];
+                if ce == CAP_POSITION {
+                    TValue::from_full_integer((cs + 1) as i64, &mut vm.gc)
+                } else {
+                    let slice = &subject[cs..ce];
+                    let sid = vm.strings.intern_or_create(slice);
+                    TValue::from_string_id(sid)
+                }
+            } else {
+                let slice = &subject[match_start..match_end];
+                let sid = vm.strings.intern_or_create(slice);
+                TValue::from_string_id(sid)
+            };
+            let val = vm.gc.get_table(repl_table_idx).raw_get(key);
+            if val.is_falsy() {
+                subject[match_start..match_end].to_vec()
+            } else {
+                gsub_value_to_string(val, &vm.gc, &vm.strings)
+            }
+        } else if repl.is_function() {
+            // Function replacement: call with captures or full match
+            let args: Vec<TValue> = if ms.captures.len() > 1 {
+                (1..ms.captures.len())
+                    .map(|i| {
+                        let (cs, ce) = ms.captures[i];
+                        if ce == CAP_POSITION {
+                            TValue::from_full_integer((cs + 1) as i64, &mut vm.gc)
+                        } else {
+                            let slice = &subject[cs..ce];
+                            let sid = vm.strings.intern_or_create(slice);
+                            TValue::from_string_id(sid)
+                        }
+                    })
+                    .collect()
+            } else {
+                let slice = &subject[match_start..match_end];
+                let sid = vm.strings.intern_or_create(slice);
+                vec![TValue::from_string_id(sid)]
+            };
+            let results = call_function(vm, repl, &args)?;
+            let val = results.first().copied().unwrap_or(TValue::nil());
+            if val.is_falsy() {
+                subject[match_start..match_end].to_vec()
+            } else {
+                gsub_value_to_string(val, &vm.gc, &vm.strings)
+            }
+        } else {
+            return Err(LuaError::Runtime(
+                "bad argument #3 to 'gsub' (string/function/table expected)".to_string(),
+            ));
+        };
+
+        result.extend_from_slice(&replacement);
+        count += 1;
+
+        if match_end == match_start {
+            if match_end < subject.len() {
+                result.push(subject[match_end]);
+                pos = match_end + 1;
+            } else {
+                break;
+            }
+        } else {
+            pos = match_end;
+        }
+    }
+
+    // Append remaining text
+    result.extend_from_slice(&subject[pos..]);
+
+    Ok((result, count))
+}
+
+fn gsub_value_to_string(
+    val: TValue,
+    gc: &selune_core::gc::GcHeap,
+    strings: &selune_core::string::StringInterner,
+) -> Vec<u8> {
+    if let Some(sid) = val.as_string_id() {
+        strings.get_bytes(sid).to_vec()
+    } else if let Some(i) = val.as_full_integer(gc) {
+        format!("{}", i).into_bytes()
+    } else if let Some(f) = val.as_float() {
+        format!("{}", f).into_bytes()
+    } else if val.is_nil() {
+        b"nil".to_vec()
+    } else if let Some(b) = val.as_bool() {
+        if b {
+            b"true".to_vec()
+        } else {
+            b"false".to_vec()
+        }
+    } else {
+        b"?".to_vec()
+    }
+}
+
+/// coroutine.resume(co, ...) — resume a suspended coroutine.
+fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    use crate::vm::CoroutineStatus;
+
+    let co_val = args.first().copied().unwrap_or(TValue::nil());
+    let resume_args = if args.len() > 1 { &args[1..] } else { &[] };
+
+    let co_table_idx = co_val.as_table_idx().ok_or_else(|| {
+        LuaError::Runtime("bad argument #1 to 'resume' (coroutine expected)".to_string())
+    })?;
+
+    // Get or allocate coroutine ID
+    let coro_id_val = vm.gc.get_table(co_table_idx).raw_geti(1);
+    let mut coro_id = coro_id_val.as_integer().unwrap_or(-1);
+
+    if coro_id == -1 {
+        // First resume: allocate coroutine from the function
+        let func = vm.gc.get_table(co_table_idx).raw_geti(2);
+        if !func.is_function() {
+            return Err(LuaError::Runtime(
+                "cannot resume dead coroutine".to_string(),
+            ));
+        }
+        coro_id = vm.create_coroutine(func) as i64;
+        vm.gc
+            .get_table_mut(co_table_idx)
+            .raw_seti(1, TValue::from_integer(coro_id));
+    }
+
+    let coro_idx = coro_id as usize;
+    if coro_idx >= vm.coroutines.len() {
+        return Err(LuaError::Runtime(
+            "cannot resume dead coroutine".to_string(),
+        ));
+    }
+
+    // Check status
+    let status = vm.coroutines[coro_idx].status;
+    if status != CoroutineStatus::Suspended {
+        let msg = format!(
+            "cannot resume {} coroutine",
+            match status {
+                CoroutineStatus::Running => "running",
+                CoroutineStatus::Normal => "normal",
+                CoroutineStatus::Dead => "dead",
+                _ => "unknown",
+            }
+        );
+        let msg_sid = vm.strings.intern_or_create(msg.as_bytes());
+        return Ok(vec![TValue::from_bool(false), TValue::from_string_id(msg_sid)]);
+    }
+
+    // Save current (caller) state
+    let caller_state = vm.save_running_state();
+    let prev_running_coro = vm.running_coro;
+
+    // Swap coroutine state into VM
+    let coro_state = std::mem::replace(
+        &mut vm.coroutines[coro_idx],
+        crate::vm::LuaThread {
+            stack: Vec::new(),
+            call_stack: Vec::new(),
+            stack_top: 0,
+            open_upvals: Vec::new(),
+            status: CoroutineStatus::Running,
+        },
+    );
+    vm.restore_running_state(coro_state);
+    vm.running_coro = Some(coro_idx);
+    vm.coroutines[coro_idx].status = CoroutineStatus::Running;
+
+    // Update handle table status
+    let running_sid = vm.strings.intern(b"running");
+    vm.gc
+        .get_table_mut(co_table_idx)
+        .raw_seti(3, TValue::from_string_id(running_sid));
+
+    // Update caller handle status to "normal" if it's a coroutine
+    // (only matters for nested coroutines)
+
+    // Push caller state
+    vm.coro_caller_stack.push(caller_state);
+
+    // If the coroutine has never run (call_stack is empty), set up the initial call
+    let result = if vm.call_stack.is_empty() {
+        // First resume: set up call frame for the function
+        let func_val = vm.stack[0]; // function is at R[0]
+
+        // Place resume args starting at R[1]
+        let base = 1;
+        vm.ensure_stack(base, resume_args.len() + 64);
+        for (i, &arg) in resume_args.iter().enumerate() {
+            vm.stack[base + i] = arg;
+        }
+
+        // Call the function
+        call_function(vm, func_val, resume_args)
+    } else {
+        // Subsequent resume: return the resume args as yield results
+        // The yielded coroutine is waiting for call_function to return,
+        // so we return the resume args as the "result" of yield.
+        // But wait — we need to re-enter the dispatch loop.
+        // The coroutine was suspended inside execute_from which returned Err(Yield).
+        // The call_stack is still set up. We need to restart execute_from.
+        //
+        // Actually, the yield was propagated as Err(Yield) through call_function,
+        // which was called from the dispatch loop. The dispatch loop returned
+        // the error up to execute_from, which returned it to do_coroutine_resume.
+        //
+        // On subsequent resume, we need to simulate call_function returning
+        // Ok(resume_args). The call_stack still has the frame where yield was called.
+        //
+        // The simplest approach: the entry_depth for execute_from should be 0
+        // (resume until coroutine finishes). But the coroutine was mid-execution
+        // when it yielded. The Yield error unwound through execute_from.
+        //
+        // So the coroutine's call_stack has the frames UP TO the function that
+        // called yield. When we resume, we need to re-enter execute_from with
+        // the correct entry_depth and first provide the resume args as the
+        // "return values" of the yield call.
+        //
+        // Let me think about this differently:
+        // When yield is called, it returns Err(Yield(values)) from call_function.
+        // This error propagates up through the dispatch loop (execute_from) and
+        // back to do_coroutine_resume, which catches it.
+        //
+        // The coroutine's state at that point: the dispatch loop was in the
+        // middle of processing a Call opcode that invoked yield. The call_stack
+        // and pc are saved. But the Call opcode handler already returned an error
+        // and didn't place results on the stack.
+        //
+        // On resume, we need to:
+        // 1. Place the resume_args where the yield call's results would go
+        // 2. Continue execution from where we left off
+        //
+        // The issue is that the Call opcode that called yield has already been
+        // "processed" (the error unwound out of the opcode handler). The pc
+        // was incremented past the Call opcode. So we can just put the resume
+        // args on the stack at the right place and re-enter execute_from.
+        //
+        // But where do the results go? The Call opcode that invoked yield
+        // would have placed results at (base + a) where a was the Call's A field.
+        // Since the error unwound, those results were never placed.
+        //
+        // We need a different approach. Instead of having yield return an error
+        // that unwinds out of execute_from, we should have yield set a flag
+        // and return "results" that get placed by the Call opcode handler.
+        //
+        // Actually, the simplest approach that works with our architecture:
+        // When yield is called from within the coroutine, the Err(Yield) propagates
+        // up and unwinds the call stack. But we save the coroutine state BEFORE
+        // the unwind happens.
+        //
+        // No wait — Err(Yield) is returned from call_function, which is called
+        // from the Call opcode handler in execute_from. That error propagates up
+        // through execute_from to here in do_coroutine_resume. But by that time,
+        // the coroutine's state (stack, call_stack) has already been modified by
+        // the error propagation.
+        //
+        // The key insight: Yield should NOT unwind. It should be caught at the
+        // dispatch loop level (in execute_from) and cause a clean return without
+        // unwinding. But that's what it does — `?` returns the error immediately
+        // from the match arm in the dispatch loop.
+        //
+        // Let me check: when `call_function` returns `Err(Yield(values))`,
+        // the `?` in the dispatch loop causes execute_from to return `Err(Yield(values))`.
+        // The call_stack is NOT unwound (no truncation happens since the error
+        // propagates through the normal control flow).
+        //
+        // But wait — the Call opcode handler does: `call_function(vm, ...)? ;`
+        // With `?`, if the result is Err, it returns immediately from execute_from.
+        // The current call frame's pc has already been incremented to point AFTER
+        // the Call instruction. So when we resume, we need to place the resume
+        // args at the Call result position and continue from there.
+        //
+        // Actually the Call opcode handler in the redirect-to-call_function branch:
+        // ```
+        // let results = call_function(vm, func_val, &args)?;
+        // let result_base = base + a;
+        // ```
+        // If call_function returns Err(Yield), the `?` means we skip placing results.
+        // On resume, we need to re-enter execute_from. The pc already points past
+        // the Call opcode. We just need to place resume args at (base + a).
+        //
+        // But we don't know what (base + a) was! We lost that information when
+        // the error propagated out.
+        //
+        // Solution: Save the result placement info when yield occurs.
+        // We can store it in the coroutine's state.
+        //
+        // OR: simpler solution — don't use `?` for Yield. Instead, catch Yield
+        // in the dispatch loop's Call handler and handle it specially.
+        //
+        // Let me take the simplest approach: on yield, we save the coroutine
+        // state (including current pc, which is already past the Call).
+        // On resume, we place resume args at the top of the coroutine's stack
+        // and let execute_from continue. The trick is knowing WHERE to place them.
+        //
+        // For simplicity: resume args are placed at stack_top, and we mark
+        // num_results for the yielded call frame. But this is getting complex.
+        //
+        // SIMPLEST APPROACH: Use a different strategy entirely.
+        // Instead of having yield unwind via Err, have the coroutine's execute_from
+        // return normally with the yield values. The resume handler catches this
+        // and saves state.
+        //
+        // Actually, the simplest working approach:
+        // 1. First resume: call the function via call_function
+        // 2. On yield: Err(Yield) propagates up to here
+        //    - Save coroutine state (call_stack is still intact because ? just returns)
+        //    - Swap back to caller
+        // 3. Subsequent resume: use execute_from directly to continue execution
+        //    - Place resume args on stack as if yield returned them
+        //    - Call execute_from with the current entry depth
+        //
+        // But for step 3, we need to know WHERE yield was called from.
+        // The Call opcode handler that called yield is the last thing that ran.
+        // After the `?`, the pc is already past that Call opcode.
+        //
+        // Actually wait — let me look at the redirect path more carefully.
+        // For the redirect path (coro_yield_idx goes through call_function):
+        //
+        // In the inline Call handler:
+        //   let results = call_function(vm, func_val, &args)?;
+        //   let result_base = base + a;
+        //   // place results at result_base
+        //
+        // If call_function returns Err(Yield), the `?` makes execute_from return
+        // Err(Yield). The call_stack is intact. The current frame's pc is already
+        // past the Call instruction (it was incremented when we decoded the instruction).
+        //
+        // On resume, we need to:
+        //   1. Place resume args at result_base (base + a)
+        //   2. Continue with execute_from
+        //
+        // But we don't know what `a` was. We need to look at the previous instruction.
+        //
+        // Alternative: save `result_base` and `num_results` in the coroutine state
+        // when yield occurs. Let me add fields to LuaThread for this.
+
+        // For now: look at the instruction BEFORE current pc to find the Call that yielded
+        let ci = vm.call_stack.last().unwrap();
+        let proto_idx = ci.proto_idx;
+        let base = ci.base;
+        let pc = ci.pc; // already incremented past the Call
+
+        // The previous instruction should be the Call that triggered yield
+        let prev_pc = pc.saturating_sub(1);
+        let prev_inst = vm.protos[proto_idx].code[prev_pc];
+        let prev_op = prev_inst.opcode();
+        let prev_a = prev_inst.a() as usize;
+        let num_results = if matches!(prev_op, OpCode::Call) {
+            let c = prev_inst.c() as i32;
+            if c == 0 { -1 } else { c - 1 }
+        } else {
+            -1
+        };
+
+        let result_base = base + prev_a;
+        let resume_result: Vec<TValue> = resume_args.to_vec();
+
+        // Place resume args as if they were the yield's return values
+        let result_count = if num_results < 0 {
+            resume_result.len()
+        } else {
+            num_results as usize
+        };
+        vm.ensure_stack(result_base, result_count + 1);
+        for i in 0..result_count {
+            vm.stack[result_base + i] = resume_result.get(i).copied().unwrap_or(TValue::nil());
+        }
+        if num_results < 0 {
+            vm.stack_top = result_base + resume_result.len();
+        }
+
+        // Continue execution
+        let entry_depth = 0; // run until coroutine call_stack empties
+        execute(vm, entry_depth)
+    };
+
+    // Execution finished (either returned or errored or yielded again)
+    // Restore caller state
+    let caller_state = vm.coro_caller_stack.pop().unwrap();
+
+    match &result {
+        Ok(values) => {
+            // Coroutine finished normally
+            vm.save_coro_state(coro_idx);
+            vm.coroutines[coro_idx].status = CoroutineStatus::Dead;
+            let dead_sid = vm.strings.intern(b"dead");
+            vm.gc
+                .get_table_mut(co_table_idx)
+                .raw_seti(3, TValue::from_string_id(dead_sid));
+
+            vm.restore_running_state(caller_state);
+            vm.running_coro = prev_running_coro;
+
+            let mut all = vec![TValue::from_bool(true)];
+            all.extend(values.iter().copied());
+            Ok(all)
+        }
+        Err(LuaError::Yield(yield_values)) => {
+            // Coroutine yielded
+            let yield_values = yield_values.clone();
+            vm.save_coro_state(coro_idx);
+            vm.coroutines[coro_idx].status = CoroutineStatus::Suspended;
+            let suspended_sid = vm.strings.intern(b"suspended");
+            vm.gc
+                .get_table_mut(co_table_idx)
+                .raw_seti(3, TValue::from_string_id(suspended_sid));
+
+            vm.restore_running_state(caller_state);
+            vm.running_coro = prev_running_coro;
+
+            let mut all = vec![TValue::from_bool(true)];
+            all.extend(yield_values);
+            Ok(all)
+        }
+        Err(e) => {
+            // Coroutine errored
+            let err_val = e.to_tvalue(&mut vm.strings);
+            vm.save_coro_state(coro_idx);
+            vm.coroutines[coro_idx].status = CoroutineStatus::Dead;
+            let dead_sid = vm.strings.intern(b"dead");
+            vm.gc
+                .get_table_mut(co_table_idx)
+                .raw_seti(3, TValue::from_string_id(dead_sid));
+
+            vm.restore_running_state(caller_state);
+            vm.running_coro = prev_running_coro;
+
+            Ok(vec![TValue::from_bool(false), err_val])
+        }
+    }
+}
+
+/// Internal resume for coroutine.wrap'd function.
+/// Args: (wrapper_table, ...) where wrapper_table[1] = coroutine handle.
+fn do_coroutine_wrap_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    // First arg is the wrapper table (passed as __call self)
+    let wrapper_val = args.first().copied().unwrap_or(TValue::nil());
+    let wrapper_idx = wrapper_val.as_table_idx().ok_or_else(|| {
+        LuaError::Runtime("cannot resume dead coroutine".to_string())
+    })?;
+
+    // Get coroutine handle from wrapper[1]
+    let co_handle = vm.gc.get_table(wrapper_idx).raw_geti(1);
+    let mut resume_args = vec![co_handle];
+    if args.len() > 1 {
+        resume_args.extend_from_slice(&args[1..]);
+    }
+
+    // Call resume and unwrap the result (wrap raises errors instead of returning false)
+    let result = do_coroutine_resume(vm, &resume_args)?;
+
+    // result[0] = true/false, result[1..] = values or error
+    let success = result.first().and_then(|v| v.as_bool()).unwrap_or(false);
+    if success {
+        Ok(result[1..].to_vec())
+    } else {
+        let err = result.get(1).copied().unwrap_or(TValue::nil());
+        if let Some(sid) = err.as_string_id() {
+            let msg = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+            Err(LuaError::Runtime(msg))
+        } else {
+            Err(LuaError::LuaValue(err))
+        }
+    }
+}
+
 pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
     if let Some(closure_idx) = func.as_closure_idx() {
         // Lua closure call
@@ -1785,6 +2399,10 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             vm.call_stack.push(ci);
 
             let result = execute_from(vm, entry_depth);
+            // For Yield: do NOT clean up — coroutine state must be preserved
+            if matches!(&result, Err(LuaError::Yield(_))) {
+                return result;
+            }
             if result.is_err() {
                 // Close TBC variables in all unwinding frames
                 let err_val = result.as_ref().err().map(|e| e.to_tvalue(&mut vm.strings));
@@ -1810,6 +2428,10 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             vm.call_stack.push(ci);
 
             let result = execute_from(vm, entry_depth);
+            // For Yield: do NOT clean up — coroutine state must be preserved
+            if matches!(&result, Err(LuaError::Yield(_))) {
+                return result;
+            }
             if result.is_err() {
                 // Close TBC variables in all unwinding frames
                 let err_val = result.as_ref().err().map(|e| e.to_tvalue(&mut vm.strings));
@@ -1833,6 +2455,7 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
                     all.extend(results);
                     Ok(all)
                 }
+                Err(LuaError::Yield(vals)) => Err(LuaError::Yield(vals)),
                 Err(e) => {
                     let err_val = e.to_tvalue(&mut vm.strings);
                     Ok(vec![TValue::from_bool(false), err_val])
@@ -1848,6 +2471,7 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
                     all.extend(results);
                     Ok(all)
                 }
+                Err(LuaError::Yield(vals)) => Err(LuaError::Yield(vals)),
                 Err(e) => {
                     let err_val = e.to_tvalue(&mut vm.strings);
                     match call_function(vm, handler, &[err_val]) {
@@ -1863,6 +2487,68 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
                     }
                 }
             }
+        } else if vm.table_sort_idx == Some(native_idx) {
+            // table.sort(t [,comp]) — needs full VM access for Lua comparator
+            let table_val = args.first().copied().unwrap_or(TValue::nil());
+            let table_idx = table_val.as_table_idx().ok_or_else(|| {
+                LuaError::Runtime("bad argument #1 to 'sort' (table expected)".to_string())
+            })?;
+            let comp = args.get(1).copied().filter(|v| !v.is_nil());
+            do_table_sort(vm, table_idx, comp)?;
+            Ok(vec![])
+        } else if vm.string_gsub_idx == Some(native_idx) {
+            // string.gsub(s, pattern, repl [, n])
+            let s_val = args.first().copied().unwrap_or(TValue::nil());
+            let s_sid = s_val.as_string_id().ok_or_else(|| {
+                LuaError::Runtime("bad argument #1 to 'gsub' (string expected)".to_string())
+            })?;
+            let subject = vm.strings.get_bytes(s_sid).to_vec();
+            let p_val = args.get(1).copied().unwrap_or(TValue::nil());
+            let p_sid = p_val.as_string_id().ok_or_else(|| {
+                LuaError::Runtime("bad argument #2 to 'gsub' (string expected)".to_string())
+            })?;
+            let pat = vm.strings.get_bytes(p_sid).to_vec();
+            let repl = args.get(2).copied().unwrap_or(TValue::nil());
+            let max_n = args.get(3).and_then(|v| v.as_full_integer(&vm.gc));
+            let (result_bytes, count) = do_string_gsub(vm, &subject, &pat, repl, max_n)?;
+            let result_sid = vm.strings.intern_or_create(&result_bytes);
+            Ok(vec![
+                TValue::from_string_id(result_sid),
+                TValue::from_full_integer(count, &mut vm.gc),
+            ])
+        } else if vm.coro_resume_idx == Some(native_idx) {
+            do_coroutine_resume(vm, args)
+        } else if vm.coro_yield_idx == Some(native_idx) {
+            Err(LuaError::Yield(args.to_vec()))
+        } else if vm.coro_wrap_idx == Some(native_idx) {
+            // coroutine.wrap(f): create handle + wrapper with __call
+            let func = args.first().copied().unwrap_or(TValue::nil());
+            if !func.is_function() {
+                return Err(LuaError::Runtime(
+                    "bad argument #1 to 'wrap' (function expected)".to_string(),
+                ));
+            }
+            // Create coroutine handle
+            let handle = vm.gc.alloc_table(4, 0);
+            vm.gc.get_table_mut(handle).raw_seti(1, TValue::from_integer(-1));
+            vm.gc.get_table_mut(handle).raw_seti(2, func);
+            let suspended_sid = vm.strings.intern(b"suspended");
+            vm.gc.get_table_mut(handle).raw_seti(3, TValue::from_string_id(suspended_sid));
+            // Create wrapper table with __call metamethod
+            let wrapper = vm.gc.alloc_table(4, 4);
+            vm.gc.get_table_mut(wrapper).raw_seti(1, TValue::from_table(handle));
+            // Set metatable with __call = wrap_resume
+            let mt = vm.gc.alloc_table(0, 4);
+            let call_name = vm.strings.intern(b"__call");
+            let wrap_resume_idx = vm.coro_wrap_resume_idx.unwrap();
+            let wrap_resume_val = TValue::from_native(wrap_resume_idx);
+            vm.gc.get_table_mut(mt).raw_set_str(call_name, wrap_resume_val);
+            vm.gc.get_table_mut(wrapper).metatable = Some(mt);
+            Ok(vec![TValue::from_table(wrapper)])
+        } else if vm.coro_wrap_resume_idx == Some(native_idx) {
+            do_coroutine_wrap_resume(vm, args)
+        } else if vm.collectgarbage_idx == Some(native_idx) {
+            do_collectgarbage(vm, args)
         } else {
             // Normal native function call
             let native_fn = vm.gc.get_native(native_idx).func;
@@ -1888,6 +2574,84 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
                 selune_core::object::lua_type_name(func, &vm.gc)
             )))
         }
+    }
+}
+
+/// Handle `collectgarbage(opt [, arg])` with full VM access.
+fn do_collectgarbage(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    // Default option is "collect"
+    let opt = if let Some(val) = args.first() {
+        if let Some(sid) = val.as_string_id() {
+            String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+        } else if val.is_nil() {
+            "collect".to_string()
+        } else {
+            return Err(LuaError::Runtime(
+                "bad argument #1 to 'collectgarbage' (string expected)".to_string(),
+            ));
+        }
+    } else {
+        "collect".to_string()
+    };
+
+    match opt.as_str() {
+        "collect" => {
+            vm.gc_collect();
+            Ok(vec![TValue::from_integer(0)])
+        }
+        "count" => {
+            let kb = vm.gc.gc_memory_kb();
+            let bytes_frac = (vm.gc.gc_memory_bytes() % 1024) as f64;
+            Ok(vec![TValue::from_float(kb), TValue::from_float(bytes_frac)])
+        }
+        "stop" => {
+            vm.gc.gc_state.enabled = false;
+            Ok(vec![TValue::from_integer(0)])
+        }
+        "restart" => {
+            vm.gc.gc_state.enabled = true;
+            Ok(vec![TValue::from_integer(0)])
+        }
+        "step" => {
+            vm.gc_collect();
+            Ok(vec![TValue::from_bool(true)])
+        }
+        "isrunning" => {
+            Ok(vec![TValue::from_bool(vm.gc.gc_state.enabled)])
+        }
+        "setpause" => {
+            let old = vm.gc.gc_state.pause;
+            if let Some(arg) = args.get(1) {
+                if let Some(n) = arg.as_integer() {
+                    vm.gc.gc_state.pause = n as u32;
+                } else if let Some(f) = arg.as_float() {
+                    vm.gc.gc_state.pause = f as u32;
+                }
+            }
+            Ok(vec![TValue::from_integer(old as i64)])
+        }
+        "setstepmul" => {
+            let old = vm.gc.gc_state.step_mul;
+            if let Some(arg) = args.get(1) {
+                if let Some(n) = arg.as_integer() {
+                    vm.gc.gc_state.step_mul = n as u32;
+                } else if let Some(f) = arg.as_float() {
+                    vm.gc.gc_state.step_mul = f as u32;
+                }
+            }
+            Ok(vec![TValue::from_integer(old as i64)])
+        }
+        "incremental" => {
+            // Already incremental; ignore args
+            Ok(vec![TValue::from_integer(0)])
+        }
+        "generational" => {
+            // Not supported; silently accept
+            Ok(vec![TValue::from_integer(0)])
+        }
+        _ => Err(LuaError::Runtime(format!(
+            "bad argument #1 to 'collectgarbage' (invalid option '{opt}')"
+        ))),
     }
 }
 

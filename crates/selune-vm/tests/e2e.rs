@@ -12,4 +12,9 @@ mod e2e {
     mod test_stdlib;
     mod test_tables;
     mod test_tbc;
+    mod test_math_lib;
+    mod test_table_lib;
+    mod test_string_lib;
+    mod test_coroutines;
+    mod test_gc;
 }
