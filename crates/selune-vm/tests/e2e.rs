@@ -7,8 +7,8 @@ mod e2e {
     mod test_functions;
     mod test_generic_for;
     mod test_literals;
-    mod test_qa_comprehensive;
     mod test_metamethods;
+    mod test_qa_comprehensive;
     mod test_stdlib;
     mod test_tables;
     mod test_tbc;

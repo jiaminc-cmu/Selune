@@ -347,13 +347,21 @@ fn test_index_function_with_rawset() {
     // Check child proto has upvalues
     assert!(!proto.protos.is_empty(), "should have child proto");
     let child = &proto.protos[0];
-    eprintln!("Child proto: {} upvalues, {} params", child.upvalues.len(), child.num_params);
+    eprintln!(
+        "Child proto: {} upvalues, {} params",
+        child.upvalues.len(),
+        child.num_params
+    );
 
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     let closure_idx = results[0].as_closure_idx().expect("should be closure");
     let closure = vm.gc.get_closure(closure_idx);
-    eprintln!("Closure: {} upvalues, proto_idx={}", closure.upvalues.len(), closure.proto_idx);
+    eprintln!(
+        "Closure: {} upvalues, proto_idx={}",
+        closure.upvalues.len(),
+        closure.proto_idx
+    );
 
     // Now test the actual __index usage
     run_check_ints(

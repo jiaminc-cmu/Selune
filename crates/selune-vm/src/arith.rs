@@ -194,11 +194,7 @@ pub fn str_len(v: TValue, strings: &StringInterner) -> Option<i64> {
 
 /// Concatenate a slice of TValues into a single string.
 /// Returns NeedMetamethod if any value can't be converted to string.
-pub fn lua_concat(
-    values: &[TValue],
-    gc: &GcHeap,
-    strings: &mut StringInterner,
-) -> ArithResult {
+pub fn lua_concat(values: &[TValue], gc: &GcHeap, strings: &mut StringInterner) -> ArithResult {
     let mut result = Vec::new();
     for &v in values.iter() {
         if let Some(sid) = coerce::to_string_for_concat(v, gc, strings) {
