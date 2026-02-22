@@ -72,7 +72,7 @@ impl TValue {
     #[inline]
     pub fn from_integer(i: i64) -> Self {
         assert!(
-            i >= SMALL_INT_MIN && i <= SMALL_INT_MAX,
+            (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&i),
             "integer {i} outside 47-bit range [{SMALL_INT_MIN}, {SMALL_INT_MAX}]"
         );
         // Store as 47-bit two's complement
@@ -465,8 +465,7 @@ mod tests {
         ];
 
         for v in &values {
-            let type_count =
-                v.is_nil() as u8 + v.is_bool() as u8 + v.is_integer() as u8;
+            let type_count = v.is_nil() as u8 + v.is_bool() as u8 + v.is_integer() as u8;
             // Float detection is separate since canonical NaN is "float"
             if !v.is_nil() && !v.is_bool() && !v.is_integer() {
                 assert!(v.is_float());

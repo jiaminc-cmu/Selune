@@ -156,8 +156,6 @@ fn e2e_local_const() {
 
 #[test]
 fn e2e_nested_blocks() {
-    let (proto, _) = compile_str(
-        "do\n  do\n    local x = 1\n  end\n  local y = 2\nend",
-    );
+    let (proto, _) = compile_str("do\n  do\n    local x = 1\n  end\n  local y = 2\nend");
     assert!(count_opcode(&proto, OpCode::LoadI) >= 2);
 }
