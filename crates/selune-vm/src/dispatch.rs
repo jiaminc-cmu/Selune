@@ -678,6 +678,13 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     b - 1
                 };
 
+                // Detect infinite tail recursion
+                const MAX_TAIL_CALLS: u32 = 1_000_000;
+                vm.call_stack[ci_idx].tail_count += 1;
+                if vm.call_stack[ci_idx].tail_count > MAX_TAIL_CALLS {
+                    return Err(LuaError::StackOverflow);
+                }
+
                 if let Some(closure_idx) = func_val.as_closure_idx() {
                     let closure = vm.gc.get_closure(closure_idx);
                     let child_proto_idx = closure.proto_idx;

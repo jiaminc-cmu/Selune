@@ -21,6 +21,8 @@ pub struct CallInfo {
     pub func_stack_idx: usize,
     /// Base of vararg storage (if vararg function).
     pub vararg_base: Option<usize>,
+    /// Counter for tail calls to detect infinite tail recursion.
+    pub tail_count: u32,
 }
 
 impl CallInfo {
@@ -34,6 +36,7 @@ impl CallInfo {
             closure_idx: None,
             func_stack_idx: 0,
             vararg_base: None,
+            tail_count: 0,
         }
     }
 }

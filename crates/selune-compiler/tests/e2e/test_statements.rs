@@ -49,7 +49,12 @@ fn e2e_global_read() {
 
 #[test]
 fn e2e_if_simple() {
+    // Constant true: no Test/Jmp needed, body always runs
     let (proto, _) = compile_str("if true then local x = 1 end");
+    assert!(!has_opcode(&proto, OpCode::Test));
+    // Non-constant condition uses Test + Jmp
+    let (proto, _) = compile_str("local y\nif y then local x = 1 end");
+    assert!(has_opcode(&proto, OpCode::Test));
     assert!(has_opcode(&proto, OpCode::Jmp));
 }
 
@@ -68,8 +73,12 @@ fn e2e_while_loop() {
 
 #[test]
 fn e2e_repeat_until() {
+    // Constant true: no Test/Jmp, loop runs once
     let (proto, _) = compile_str("repeat local x = 1 until true");
-    assert!(has_opcode(&proto, OpCode::Test) || has_opcode(&proto, OpCode::LoadTrue));
+    assert!(!has_opcode(&proto, OpCode::Test));
+    // Non-constant condition uses Test + Jmp
+    let (proto, _) = compile_str("local y\nrepeat local x = 1 until y");
+    assert!(has_opcode(&proto, OpCode::Test));
 }
 
 #[test]

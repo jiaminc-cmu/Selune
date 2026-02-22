@@ -1559,7 +1559,9 @@ impl<'a> Compiler<'a> {
             // Escape jump from the end of the previous then-block
             escape_jumps.push(self.emit_jump(self.line()));
             // Patch the previous false_jump to here (start of the elseif condition)
-            self.patch_jump(false_jump);
+            if let Some(fj) = false_jump {
+                self.patch_jump(fj);
+            }
 
             self.advance()?; // consume 'elseif'
             let cond = self.expression()?;
@@ -1576,7 +1578,9 @@ impl<'a> Compiler<'a> {
             // Escape jump from the end of the last then/elseif block
             escape_jumps.push(self.emit_jump(self.line()));
             // Patch false_jump to the else block
-            self.patch_jump(false_jump);
+            if let Some(fj) = false_jump {
+                self.patch_jump(fj);
+            }
 
             self.advance()?; // consume 'else'
             self.fs_mut().scope.enter_block(false);
@@ -1584,7 +1588,9 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.leave_block();
         } else {
             // No else: patch false_jump to after the if statement
-            self.patch_jump(false_jump);
+            if let Some(fj) = false_jump {
+                self.patch_jump(fj);
+            }
         }
 
         self.expect(&Token::End)?;
@@ -1615,7 +1621,9 @@ impl<'a> Compiler<'a> {
 
         self.expect(&Token::End)?;
 
-        self.patch_jump(exit_jump);
+        if let Some(ej) = exit_jump {
+            self.patch_jump(ej);
+        }
         // Patch break jumps
         for brk in block.break_jumps {
             self.patch_jump(brk);
@@ -1805,12 +1813,14 @@ impl<'a> Compiler<'a> {
 
         let cond = self.expression()?;
         let line = self.line();
-        let exit_jump = self.code_test_jump(&cond, true, line)?;
+        let loop_back_jump = self.code_test_jump(&cond, false, line)?;
 
         let block = self.fs_mut().scope.leave_block();
 
-        // Jump back if condition is false
-        self.patch_jump_to(exit_jump, loop_start);
+        // Jump back if condition is false (None means condition is always true, never loop back)
+        if let Some(jmp) = loop_back_jump {
+            self.patch_jump_to(jmp, loop_start);
+        }
 
         // Patch breaks to after the loop
         for brk in block.break_jumps {
@@ -2086,19 +2096,39 @@ impl<'a> Compiler<'a> {
         cond: &ExprDesc,
         jump_if: bool,
         line: u32,
-    ) -> Result<usize, CompileError> {
+    ) -> Result<Option<usize>, CompileError> {
         match cond {
             ExprDesc::Jump(pc) => {
                 // The comparison already emitted a conditional + JMP
                 // We just need to return the jump PC
-                Ok(*pc)
+                Ok(Some(*pc))
+            }
+            ExprDesc::True => {
+                if jump_if {
+                    // Always jump
+                    let jump = self.emit_sj(OpCode::Jmp, 0, line);
+                    Ok(Some(jump))
+                } else {
+                    // Never jump — constant true, condition wants falsy
+                    Ok(None)
+                }
+            }
+            ExprDesc::False | ExprDesc::Nil => {
+                if jump_if {
+                    // Never jump — falsy value, condition wants truthy
+                    Ok(None)
+                } else {
+                    // Always jump — falsy value, condition wants falsy
+                    let jump = self.emit_sj(OpCode::Jmp, 0, line);
+                    Ok(Some(jump))
+                }
             }
             _ => {
                 let reg = self.discharge_to_any_reg(cond, line);
                 // TEST: skip next if R(A) is truthy/falsy
                 self.emit(Instruction::abc(OpCode::Test, reg, 0, 0, !jump_if), line);
                 let jump = self.emit_sj(OpCode::Jmp, 0, line);
-                Ok(jump)
+                Ok(Some(jump))
             }
         }
     }
@@ -2361,8 +2391,12 @@ mod tests {
 
     #[test]
     fn test_if_then_end() {
+        // Constant true: no Test/Jmp emitted, body always runs
         let (proto, _) = compile_ok("if true then local x = 1 end");
-        assert!(has_opcode(&proto, OpCode::Test) || has_opcode(&proto, OpCode::LoadTrue));
+        assert!(!has_opcode(&proto, OpCode::Test));
+        // Non-constant condition: Test is emitted
+        let (proto, _) = compile_ok("local y\nif y then local x = 1 end");
+        assert!(has_opcode(&proto, OpCode::Test));
     }
 
     #[test]
@@ -2380,8 +2414,12 @@ mod tests {
 
     #[test]
     fn test_repeat_until() {
+        // Constant true: no Test/Jmp emitted, loop runs once
         let (proto, _) = compile_ok("repeat local x = 1 until true");
-        assert!(has_opcode(&proto, OpCode::Test) || has_opcode(&proto, OpCode::LoadTrue));
+        assert!(!has_opcode(&proto, OpCode::Test));
+        // Non-constant condition: Test is emitted
+        let (proto, _) = compile_ok("local y\nrepeat local x = 1 until y");
+        assert!(has_opcode(&proto, OpCode::Test));
     }
 
     #[test]

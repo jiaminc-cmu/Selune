@@ -401,7 +401,6 @@ fn qa_while_never_enters() {
 }
 
 #[test]
-#[ignore] // BUG: `until true` (constant) causes infinite loop — compiler doesn't emit correct jump
 fn qa_repeat_until_true_once() {
     run_check_ints(
         "local x = 0

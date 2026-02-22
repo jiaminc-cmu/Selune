@@ -300,9 +300,8 @@ fn test_tostring_bool() {
 
 #[test]
 fn test_stack_overflow() {
-    // Use f() + 0 to prevent tail-call optimization, forcing actual stack growth
     let err = run_lua_err(
-        "local function f() return f() + 0 end
+        "local function f() return f() end
          return f()",
     );
     assert!(
