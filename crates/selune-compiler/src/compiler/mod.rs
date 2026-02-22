@@ -11,6 +11,10 @@ use scope::{LabelInfo, PendingGoto, ScopeManager};
 use selune_core::string::{StringId, StringInterner};
 use std::fmt;
 
+/// Sentinel returned by expression_list when the last expression is a multi-return
+/// Call or Vararg, signaling the caller to use B=0 (stack-top mode).
+const MULTRET_SENTINEL: u8 = u8::MAX;
+
 /// Compiler error.
 #[derive(Clone, Debug)]
 pub struct CompileError {
@@ -227,7 +231,7 @@ impl<'a> Compiler<'a> {
 
     /// Emit a Close instruction if the current block has to-be-closed variables.
     fn emit_close_if_needed(&mut self, line: u32) {
-        if let Some(close_reg) = self.fs().scope.block_has_close_var() {
+        if let Some(close_reg) = self.fs().scope.block_needs_close() {
             self.emit_abc(OpCode::Close, close_reg, 0, 0, line);
         }
     }
@@ -652,8 +656,10 @@ impl<'a> Compiler<'a> {
         };
 
         // CALL A B C: call func at R(A), B-1 args, C-1 results (0 = multi)
+        // MULTRET_SENTINEL from expression_list means multi-return last arg → B=0
+        let b = if nargs == MULTRET_SENTINEL { 0 } else { nargs + 1 };
         let pc = self.emit(
-            Instruction::abc(OpCode::Call, base, nargs + 1, 0, false),
+            Instruction::abc(OpCode::Call, base, b, 0, false),
             line,
         );
         // Free all arg registers, leave result in base
@@ -694,9 +700,10 @@ impl<'a> Compiler<'a> {
         };
 
         // nargs includes the implicit self argument
-        let total_nargs = explicit_nargs + 1;
+        // MULTRET_SENTINEL means last explicit arg was multi-return → B=0
+        let b = if explicit_nargs == MULTRET_SENTINEL { 0 } else { explicit_nargs + 1 + 1 };
         let pc = self.emit(
-            Instruction::abc(OpCode::Call, base, total_nargs + 1, 0, false),
+            Instruction::abc(OpCode::Call, base, b, 0, false),
             line,
         );
         self.fs_mut().scope.free_reg_to(base + 1);
@@ -705,6 +712,10 @@ impl<'a> Compiler<'a> {
 
     /// Parse an expression list, discharging each to consecutive registers.
     /// Returns the number of expressions parsed. The last expression may be multi-value.
+    /// Parse an expression list, discharging each to consecutive registers.
+    /// Returns the number of expressions parsed.
+    /// If the last expression is a Call or Vararg, it is set to multi-return
+    /// and `MULTRET_SENTINEL` is returned to signal the caller to use B=0 (stack-top mode).
     fn expression_list(&mut self, base_reg: u8) -> Result<u8, CompileError> {
         let mut count = 0u8;
         loop {
@@ -714,10 +725,61 @@ impl<'a> Compiler<'a> {
             if !self.check(&Token::Comma) {
                 // Last expression: might be multi-value
                 match &expr {
-                    ExprDesc::Call(_) | ExprDesc::Vararg(_) => {
-                        // Leave multi-value as-is — caller handles
-                        self.discharge_to_reg(&expr, base_reg + count, line);
-                        count += 1;
+                    ExprDesc::Call(pc) => {
+                        let pc = *pc;
+                        let inst = self.fs().proto.code[pc];
+                        let call_a = inst.a();
+                        let target = base_reg + count;
+                        if call_a == target {
+                            // Call's result register matches expected arg position.
+                            // Set C=0 (multi-return) — results go from A to stack top.
+                            self.fs_mut().proto.code[pc] =
+                                Instruction::abc(inst.opcode(), call_a, inst.b(), 0, inst.k());
+                            return Ok(MULTRET_SENTINEL);
+                        }
+                        // Call is at a different position. We need to relocate the
+                        // function and args to start at `target`. Insert Move
+                        // instructions BEFORE the Call by:
+                        // 1. Remove the Call from position `pc`
+                        // 2. Emit Moves to relocate func+args
+                        // 3. Re-emit the Call with new A
+                        let num_args_b = inst.b();
+                        if num_args_b == 0 {
+                            // Vararg args — fall back to single result
+                            self.discharge_to_reg(&expr, target, line);
+                            count += 1;
+                            break;
+                        }
+                        let k_flag = inst.k();
+                        // Remove the Call instruction (and any trailing code)
+                        let trailing = self.fs_mut().proto.code.split_off(pc);
+                        let trailing_lines = self.fs_mut().proto.line_info.split_off(pc);
+                        // Emit Moves to relocate func and args from call_a..call_a+B-1 to target..target+B-1
+                        for i in 0..num_args_b {
+                            self.emit_abc(OpCode::Move, target + i as u8, call_a + i as u8, 0, line);
+                        }
+                        // Re-emit the Call with new A, C=0 (multi-return)
+                        self.emit(
+                            Instruction::abc(OpCode::Call, target, num_args_b, 0, k_flag),
+                            line,
+                        );
+                        // Re-append any trailing instructions (shouldn't be any normally)
+                        for (i, inst) in trailing.into_iter().enumerate() {
+                            if i == 0 { continue; } // skip the original Call
+                            self.fs_mut().proto.code.push(inst);
+                        }
+                        for (i, ln) in trailing_lines.into_iter().enumerate() {
+                            if i == 0 { continue; }
+                            self.fs_mut().proto.line_info.push(ln);
+                        }
+                        return Ok(MULTRET_SENTINEL);
+                    }
+                    ExprDesc::Vararg(pc) => {
+                        // Set B=0 (all varargs) and position at correct register
+                        let pc = *pc;
+                        self.fs_mut().proto.code[pc] =
+                            Instruction::abc(OpCode::VarArg, base_reg + count, 0, 0, false);
+                        return Ok(MULTRET_SENTINEL);
                     }
                     _ => {
                         self.discharge_to_reg(&expr, base_reg + count, line);
@@ -850,7 +912,8 @@ impl<'a> Compiler<'a> {
                     let key_reg = self.discharge_to_any_reg(&key, kline);
                     let val_reg = self.discharge_to_any_reg(&val, kline);
                     self.emit_abc(OpCode::SetTable, table_reg, key_reg, val_reg, kline);
-                    self.fs_mut().scope.free_reg_to(table_reg + 1);
+                    // Free temp regs but preserve stacked array values
+                    self.fs_mut().scope.free_reg_to(table_reg + 1 + array_count as u8);
                     hash_count += 1;
                 }
                 Token::Name(name) => {
@@ -868,7 +931,8 @@ impl<'a> Compiler<'a> {
                             Instruction::abc(OpCode::SetField, table_reg, k as u8, val_reg, false),
                             kline,
                         );
-                        self.fs_mut().scope.free_reg_to(table_reg + 1);
+                        // Free temp regs but preserve stacked array values
+                        self.fs_mut().scope.free_reg_to(table_reg + 1 + array_count as u8);
                         hash_count += 1;
                     } else {
                         // It's an expression starting with a name — resolve as expression
@@ -880,7 +944,15 @@ impl<'a> Compiler<'a> {
                         let eline = self.line();
                         last_array_is_multi =
                             matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
-                        let _val_reg = self.discharge_to_any_reg(&expr, eline);
+                        // Ensure the array value goes to the right register
+                        let target_reg = table_reg + 1 + array_count as u8;
+                        if self.fs().scope.free_reg < target_reg {
+                            self.fs_mut().scope.free_reg = target_reg;
+                        }
+                        self.discharge_to_reg(&expr, target_reg, eline);
+                        if self.fs().scope.free_reg <= target_reg + 1 {
+                            self.fs_mut().scope.free_reg = target_reg + 1;
+                        }
                         array_count += 1;
                         total_array += 1;
                         if array_count >= 50 {
@@ -906,7 +978,15 @@ impl<'a> Compiler<'a> {
                     let expr = self.expression()?;
                     let eline = self.line();
                     last_array_is_multi = matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
-                    let val_reg = self.discharge_to_any_reg(&expr, eline);
+                    // Ensure the array value goes to the right register
+                    let target_reg = table_reg + 1 + array_count as u8;
+                    if self.fs().scope.free_reg < target_reg {
+                        self.fs_mut().scope.free_reg = target_reg;
+                    }
+                    self.discharge_to_reg(&expr, target_reg, eline);
+                    if self.fs().scope.free_reg <= target_reg + 1 {
+                        self.fs_mut().scope.free_reg = target_reg + 1;
+                    }
                     array_count += 1;
                     total_array += 1;
 
@@ -927,7 +1007,7 @@ impl<'a> Compiler<'a> {
                         self.fs_mut().scope.free_reg_to(table_reg + 1);
                         array_count = 0;
                     }
-                    let _ = val_reg; // used implicitly via register allocation
+                    let _ = target_reg; // used implicitly via register allocation
                 }
             }
 
@@ -1220,9 +1300,9 @@ impl<'a> Compiler<'a> {
             BinOp::Eq => (OpCode::Eq, left_reg, right_reg, false),
             BinOp::NotEq => (OpCode::Eq, left_reg, right_reg, true), // k=1 negates
             BinOp::Lt => (OpCode::Lt, left_reg, right_reg, false),
-            BinOp::GtEq => (OpCode::Lt, left_reg, right_reg, true),
+            BinOp::Gt => (OpCode::Lt, right_reg, left_reg, false),
             BinOp::LtEq => (OpCode::Le, left_reg, right_reg, false),
-            BinOp::Gt => (OpCode::Le, left_reg, right_reg, true),
+            BinOp::GtEq => (OpCode::Le, right_reg, left_reg, false),
             _ => unreachable!(),
         };
 
@@ -1299,6 +1379,8 @@ impl<'a> Compiler<'a> {
             // At the outermost function, check its locals
             if let Some(local) = self.func_stack[0].scope.resolve_local(name) {
                 let reg = local.reg;
+                // Mark the local as captured by a closure
+                self.func_stack[0].scope.mark_captured(reg);
                 return Some(self.add_upvalue(fs_idx, name, true, reg));
             }
             // Also check the outermost function's own upvalues (e.g., _ENV)
@@ -1314,6 +1396,8 @@ impl<'a> Compiler<'a> {
         let parent_idx = fs_idx - 1;
         if let Some(local) = self.func_stack[parent_idx].scope.resolve_local(name) {
             let reg = local.reg;
+            // Mark the local as captured by a closure
+            self.func_stack[parent_idx].scope.mark_captured(reg);
             return Some(self.add_upvalue(fs_idx, name, true, reg));
         }
 

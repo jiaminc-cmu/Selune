@@ -20,6 +20,11 @@ pub fn lua_eq(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> (b
         return (true, false);
     }
 
+    // int == int comparison (handles boxed ints with different GcIdx but same value)
+    if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
+        return (ia == ib, false);
+    }
+
     // int == float comparison
     if let (Some(i), Some(f)) = (a.as_full_integer(gc), b.as_float()) {
         return (i as f64 == f && (i as f64 as i64) == i, false);

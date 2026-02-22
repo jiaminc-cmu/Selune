@@ -1,7 +1,7 @@
 //! Main bytecode dispatch loop.
 
 use crate::arith::{self, ArithOp};
-use crate::callinfo::CallInfo;
+use crate::callinfo::{CallInfo, CallStatus};
 use crate::coerce;
 use crate::compare;
 use crate::error::LuaError;
@@ -957,6 +957,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (1..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
+                        let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, pcall_func, &pcall_args) {
                             Ok(results) => {
                                 // Place (true, results...)
@@ -976,7 +977,16 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 }
                             }
                             Err(LuaError::Yield(vals)) => {
-                                // Yield must propagate through pcall
+                                // Yield must propagate through pcall.
+                                // Mark the direct callee frame (not the top frame, which
+                                // may be deeper in nested pcall) so that when it returns
+                                // on resume, return_from_call wraps results as pcall (true, ...).
+                                if callee_frame_idx < vm.call_stack.len() {
+                                    vm.call_stack[callee_frame_idx].call_status = CallStatus::PcallYield {
+                                        result_base,
+                                        num_results,
+                                    };
+                                }
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
@@ -1013,6 +1023,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (2..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
+                        let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, xpcall_func, &xpcall_args) {
                             Ok(results) => {
                                 let mut all = vec![TValue::from_bool(true)];
@@ -1031,7 +1042,14 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 }
                             }
                             Err(LuaError::Yield(vals)) => {
-                                // Yield must propagate through xpcall
+                                // Yield must propagate through xpcall.
+                                // Mark the direct callee frame so resume wraps results correctly.
+                                if callee_frame_idx < vm.call_stack.len() {
+                                    vm.call_stack[callee_frame_idx].call_status = CallStatus::XpcallYield {
+                                        result_base,
+                                        num_results,
+                                    };
+                                }
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
@@ -1083,6 +1101,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.coro_wrap_idx == Some(native_idx)
                         || vm.coro_wrap_resume_idx == Some(native_idx)
                         || vm.collectgarbage_idx == Some(native_idx)
+                        || vm.tostring_idx == Some(native_idx)
                     {
                         // Redirect through call_function for full VM access
                         let args: Vec<TValue> =
@@ -1252,6 +1271,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.coro_wrap_idx == Some(native_idx)
                         || vm.coro_wrap_resume_idx == Some(native_idx)
                         || vm.collectgarbage_idx == Some(native_idx)
+                        || vm.tostring_idx == Some(native_idx)
                     {
                         call_function(vm, func_val, &args)?
                     } else {
@@ -1369,6 +1389,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
 
             OpCode::TForCall => {
                 let c = inst.c() as usize; // number of loop variables
+                // Close upvalues for loop body variables BEFORE calling iterator
+                // (so closures from previous iteration capture the old values,
+                //  not the new values that the iterator is about to produce)
+                vm.close_upvalues(base + a + 4);
                 let iter_func = vm.stack[base + a];
                 let state = vm.stack[base + a + 1];
                 let control = vm.stack[base + a + 2];
@@ -1735,25 +1759,49 @@ fn table_newindex(
 }
 
 /// Return from a function call, placing results in the caller's frame.
+/// If the frame has PcallYield/XpcallYield status (from yielding through pcall/xpcall),
+/// wraps results with (true, ...) and places at the pcall's result_base instead.
 fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
     let ci_idx = vm.call_stack.len() - 1;
+    let call_status = vm.call_stack[ci_idx].call_status.clone();
     let num_results = vm.call_stack[ci_idx].num_results;
     let func_stack_idx = vm.call_stack[ci_idx].func_stack_idx;
 
     vm.call_stack.pop();
 
-    // Place results starting at func_stack_idx
-    if num_results < 0 {
-        // Multi-return: place all results
-        for (i, &val) in results.iter().enumerate() {
-            vm.stack[func_stack_idx + i] = val;
+    match call_status {
+        CallStatus::PcallYield { result_base, num_results: pcall_num_results } |
+        CallStatus::XpcallYield { result_base, num_results: pcall_num_results } => {
+            // Wrap results as pcall success: (true, results...)
+            let mut all = vec![TValue::from_bool(true)];
+            all.extend(results.iter().copied());
+            let result_count = if pcall_num_results < 0 {
+                all.len()
+            } else {
+                pcall_num_results as usize
+            };
+            vm.ensure_stack(result_base, result_count + 1);
+            for i in 0..result_count {
+                vm.stack[result_base + i] = all.get(i).copied().unwrap_or(TValue::nil());
+            }
+            if pcall_num_results < 0 {
+                vm.stack_top = result_base + all.len();
+            }
         }
-        vm.stack_top = func_stack_idx + results.len();
-    } else {
-        let count = num_results as usize;
-        for i in 0..count {
-            let val = results.get(i).copied().unwrap_or(TValue::nil());
-            vm.stack[func_stack_idx + i] = val;
+        CallStatus::Normal => {
+            // Normal result placement at func_stack_idx
+            if num_results < 0 {
+                for (i, &val) in results.iter().enumerate() {
+                    vm.stack[func_stack_idx + i] = val;
+                }
+                vm.stack_top = func_stack_idx + results.len();
+            } else {
+                let count = num_results as usize;
+                for i in 0..count {
+                    let val = results.get(i).copied().unwrap_or(TValue::nil());
+                    vm.stack[func_stack_idx + i] = val;
+                }
+            }
         }
     }
 
@@ -2031,8 +2079,13 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
     }
 
     // Save current (caller) state
-    let caller_state = vm.save_running_state();
     let prev_running_coro = vm.running_coro;
+    // Determine the caller's thread ID for upvalue remapping
+    let caller_thread_id = prev_running_coro.unwrap_or(usize::MAX);
+    // Remap caller's open upvalues so they remain accessible from the coroutine
+    vm.remap_open_upvals_to_thread(caller_thread_id);
+
+    let caller_state = vm.save_running_state();
 
     // Swap coroutine state into VM
     let coro_state = std::mem::replace(
@@ -2048,6 +2101,9 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
     vm.restore_running_state(coro_state);
     vm.running_coro = Some(coro_idx);
     vm.coroutines[coro_idx].status = CoroutineStatus::Running;
+
+    // Restore coroutine's remapped upvalues back to Open
+    vm.restore_open_upvals_from_thread(coro_idx);
 
     // Update handle table status
     let running_sid = vm.strings.intern(b"running");
@@ -2449,13 +2505,26 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
         if is_pcall {
             let pcall_func = args.first().copied().unwrap_or(TValue::nil());
             let pcall_args = if args.len() > 1 { &args[1..] } else { &[] };
+            let callee_frame_idx = vm.call_stack.len();
             match call_function(vm, pcall_func, pcall_args) {
                 Ok(results) => {
                     let mut all = vec![TValue::from_bool(true)];
                     all.extend(results);
                     Ok(all)
                 }
-                Err(LuaError::Yield(vals)) => Err(LuaError::Yield(vals)),
+                Err(LuaError::Yield(vals)) => {
+                    // Mark the direct callee frame with PcallYield so resume
+                    // knows to wrap results. The func_stack_idx of the callee
+                    // frame serves as the result_base for the pcall.
+                    if callee_frame_idx < vm.call_stack.len() {
+                        let fsi = vm.call_stack[callee_frame_idx].func_stack_idx;
+                        vm.call_stack[callee_frame_idx].call_status = CallStatus::PcallYield {
+                            result_base: fsi,
+                            num_results: -1,
+                        };
+                    }
+                    Err(LuaError::Yield(vals))
+                }
                 Err(e) => {
                     let err_val = e.to_tvalue(&mut vm.strings);
                     Ok(vec![TValue::from_bool(false), err_val])
@@ -2465,13 +2534,23 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             let xpcall_func = args.first().copied().unwrap_or(TValue::nil());
             let handler = args.get(1).copied().unwrap_or(TValue::nil());
             let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
+            let callee_frame_idx = vm.call_stack.len();
             match call_function(vm, xpcall_func, xpcall_args) {
                 Ok(results) => {
                     let mut all = vec![TValue::from_bool(true)];
                     all.extend(results);
                     Ok(all)
                 }
-                Err(LuaError::Yield(vals)) => Err(LuaError::Yield(vals)),
+                Err(LuaError::Yield(vals)) => {
+                    if callee_frame_idx < vm.call_stack.len() {
+                        let fsi = vm.call_stack[callee_frame_idx].func_stack_idx;
+                        vm.call_stack[callee_frame_idx].call_status = CallStatus::XpcallYield {
+                            result_base: fsi,
+                            num_results: -1,
+                        };
+                    }
+                    Err(LuaError::Yield(vals))
+                }
                 Err(e) => {
                     let err_val = e.to_tvalue(&mut vm.strings);
                     match call_function(vm, handler, &[err_val]) {
@@ -2549,6 +2628,8 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             do_coroutine_wrap_resume(vm, args)
         } else if vm.collectgarbage_idx == Some(native_idx) {
             do_collectgarbage(vm, args)
+        } else if vm.tostring_idx == Some(native_idx) {
+            do_tostring(vm, args)
         } else {
             // Normal native function call
             let native_fn = vm.gc.get_native(native_idx).func;
@@ -2652,6 +2733,22 @@ fn do_collectgarbage(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
         _ => Err(LuaError::Runtime(format!(
             "bad argument #1 to 'collectgarbage' (invalid option '{opt}')"
         ))),
+    }
+}
+
+/// Handle `tostring(val)` with full VM access for __tostring metamethod.
+fn do_tostring(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let val = args.first().copied().unwrap_or(TValue::nil());
+    // Check for __tostring metamethod
+    let mm_name = vm.mm_names.as_ref().unwrap().tostring;
+    if let Some(mm) = crate::metamethod::get_metamethod(val, mm_name, &vm.gc) {
+        let results = call_function(vm, mm, &[val])?;
+        Ok(vec![results.first().copied().unwrap_or(TValue::nil())])
+    } else {
+        // Default tostring behavior
+        let s = crate::vm::format_value(val, &vm.gc, &vm.strings);
+        let sid = vm.strings.intern_or_create(s.as_bytes());
+        Ok(vec![TValue::from_string_id(sid)])
     }
 }
 

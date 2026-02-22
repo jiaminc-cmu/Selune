@@ -96,8 +96,11 @@ pub struct UpVal {
 /// Where an upvalue's value lives.
 #[derive(Debug)]
 pub enum UpValLocation {
-    /// Points to a stack index (still on the stack).
+    /// Points to a stack index on the current thread's stack.
     Open(usize),
+    /// Points to a stack index on a specific coroutine's saved stack.
+    /// The usize is the stack index, the second usize is the coroutine ID.
+    OpenInThread(usize, usize),
     /// Value has been captured (function returned).
     Closed(TValue),
 }
@@ -473,7 +476,7 @@ impl GcHeap {
                         let v = *val;
                         self.gc_mark_value(v);
                     }
-                    UpValLocation::Open(_) => {
+                    UpValLocation::Open(_) | UpValLocation::OpenInThread(_, _) => {
                         // Open upvalues point to stack slots; the stack is a root
                     }
                 }

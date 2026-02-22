@@ -83,6 +83,8 @@ pub struct Vm {
     pub coro_wrap_resume_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for collectgarbage (needs full VM access for gc_collect).
     pub collectgarbage_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for tostring (needs full VM access for __tostring metamethod).
+    pub tostring_idx: Option<GcIdx<NativeFunction>>,
 }
 
 impl Vm {
@@ -111,6 +113,7 @@ impl Vm {
             coro_wrap_idx: None,
             coro_wrap_resume_idx: None,
             collectgarbage_idx: None,
+            tostring_idx: None,
         }
     }
 
@@ -211,13 +214,14 @@ impl Vm {
             .get_table_mut(env_idx)
             .raw_set_str(type_name, type_val);
 
-        // tostring
-        let tostring_idx = self.gc.alloc_native(native_tostring, "tostring");
+        // tostring - stub; actual dispatch via call_function for __tostring metamethod
+        let tostring_idx = self.gc.alloc_native(native_tostring_stub, "tostring");
         let tostring_val = TValue::from_native(tostring_idx);
         let tostring_name = self.strings.intern(b"tostring");
         self.gc
             .get_table_mut(env_idx)
             .raw_set_str(tostring_name, tostring_val);
+        self.tostring_idx = Some(tostring_idx);
 
         // tonumber
         let tonumber_idx = self.gc.alloc_native(native_tonumber, "tonumber");
@@ -332,6 +336,10 @@ impl Vm {
         let uv = self.gc.get_upval(uv_idx);
         match uv.location {
             UpValLocation::Open(stack_idx) => self.stack[stack_idx],
+            UpValLocation::OpenInThread(stack_idx, thread_id) => {
+                // Access a saved coroutine/caller thread's stack
+                self.get_thread_stack_value(thread_id, stack_idx)
+            }
             UpValLocation::Closed(val) => val,
         }
     }
@@ -343,8 +351,43 @@ impl Vm {
             UpValLocation::Open(stack_idx) => {
                 self.stack[stack_idx] = val;
             }
+            UpValLocation::OpenInThread(stack_idx, thread_id) => {
+                self.set_thread_stack_value(thread_id, stack_idx, val);
+            }
             UpValLocation::Closed(_) => {
                 self.gc.get_upval_mut(uv_idx).location = UpValLocation::Closed(val);
+            }
+        }
+    }
+
+    /// Read a value from a saved thread's stack.
+    fn get_thread_stack_value(&self, thread_id: usize, stack_idx: usize) -> TValue {
+        // thread_id maps into coro_caller_stack (saved caller states)
+        // or coroutines (saved coroutine states)
+        // We use a convention: thread_id == usize::MAX means main thread saved in caller stack
+        // Otherwise it's a coroutine ID
+        if thread_id == usize::MAX {
+            // Main thread is saved in the caller stack (most recent entry)
+            if let Some(caller) = self.coro_caller_stack.last() {
+                return caller.stack.get(stack_idx).copied().unwrap_or(TValue::nil());
+            }
+        } else if thread_id < self.coroutines.len() {
+            return self.coroutines[thread_id].stack.get(stack_idx).copied().unwrap_or(TValue::nil());
+        }
+        TValue::nil()
+    }
+
+    /// Write a value to a saved thread's stack.
+    fn set_thread_stack_value(&mut self, thread_id: usize, stack_idx: usize, val: TValue) {
+        if thread_id == usize::MAX {
+            if let Some(caller) = self.coro_caller_stack.last_mut() {
+                if stack_idx < caller.stack.len() {
+                    caller.stack[stack_idx] = val;
+                }
+            }
+        } else if thread_id < self.coroutines.len() {
+            if stack_idx < self.coroutines[thread_id].stack.len() {
+                self.coroutines[thread_id].stack[stack_idx] = val;
             }
         }
     }
@@ -379,6 +422,36 @@ impl Vm {
         thread.stack[0] = func;
         self.coroutines.push(thread);
         id
+    }
+
+    /// Remap open upvalues when switching threads.
+    /// Converts Open(idx) upvalues belonging to the current thread to
+    /// OpenInThread(idx, save_thread_id), so they remain accessible
+    /// when a different thread's stack is active.
+    pub fn remap_open_upvals_to_thread(&mut self, save_thread_id: usize) {
+        // Iterate all open upvals on the current thread and remap them
+        for &(_stack_idx, uv_idx) in &self.open_upvals {
+            let uv = self.gc.get_upval(uv_idx);
+            if let UpValLocation::Open(si) = uv.location {
+                self.gc.get_upval_mut(uv_idx).location = UpValLocation::OpenInThread(si, save_thread_id);
+            }
+        }
+    }
+
+    /// Restore open upvalues for the current thread.
+    /// Converts OpenInThread(idx, thread_id) back to Open(idx) for upvalues
+    /// that belong to the newly active thread.
+    pub fn restore_open_upvals_from_thread(&mut self, restore_thread_id: usize) {
+        // Search all upvalues in the GC and convert back matching OpenInThread
+        for i in 0..self.gc.upvals.len() {
+            if let Some(uv) = &self.gc.upvals[i] {
+                if let UpValLocation::OpenInThread(si, tid) = uv.location {
+                    if tid == restore_thread_id {
+                        self.gc.upvals[i].as_mut().unwrap().location = UpValLocation::Open(si);
+                    }
+                }
+            }
+        }
     }
 
     /// Save the current running state into a LuaThread snapshot.
@@ -526,6 +599,9 @@ impl Vm {
         if let Some(idx) = self.coro_wrap_resume_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
         }
+        if let Some(idx) = self.tostring_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
     }
 
     /// Check if GC should run and perform a cycle if needed.
@@ -579,17 +655,55 @@ fn native_type(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     Ok(vec![TValue::from_string_id(sid)])
 }
 
-fn native_tostring(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
-    let s = format_value(val, ctx.gc, ctx.strings);
-    let sid = ctx.strings.intern_or_create(s.as_bytes());
-    Ok(vec![TValue::from_string_id(sid)])
+fn native_tostring_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "tostring stub should not be called directly".to_string(),
+    ))
 }
 
 fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
-    if let Some(i) = val.as_integer() {
-        return Ok(vec![TValue::from_integer(i)]);
+    let base_arg = ctx.args.get(1).copied();
+
+    // tonumber(s, base) — base conversion
+    if let Some(base_val) = base_arg {
+        if !base_val.is_nil() {
+            let base = base_val
+                .as_full_integer(ctx.gc)
+                .ok_or_else(|| {
+                    NativeError::String(
+                        "bad argument #2 to 'tonumber' (number has no integer representation)"
+                            .to_string(),
+                    )
+                })?;
+            if !(2..=36).contains(&base) {
+                return Err(NativeError::String(
+                    "bad argument #2 to 'tonumber' (invalid base)".to_string(),
+                ));
+            }
+            // First arg must be a string
+            let sid = val.as_string_id().ok_or_else(|| {
+                NativeError::String(
+                    "bad argument #1 to 'tonumber' (string expected, got number)".to_string(),
+                )
+            })?;
+            let bytes = ctx.strings.get_bytes(sid);
+            let s = std::str::from_utf8(bytes).unwrap_or("");
+            let s = s.trim();
+            if s.is_empty() {
+                return Ok(vec![TValue::nil()]);
+            }
+            // Parse in given base
+            match i64::from_str_radix(s, base as u32) {
+                Ok(i) => return Ok(vec![TValue::from_full_integer(i, ctx.gc)]),
+                Err(_) => return Ok(vec![TValue::nil()]),
+            }
+        }
+    }
+
+    // tonumber(x) — no base
+    if let Some(i) = val.as_full_integer(ctx.gc) {
+        return Ok(vec![TValue::from_full_integer(i, ctx.gc)]);
     }
     if val.as_float().is_some() {
         return Ok(vec![val]);
@@ -597,9 +711,18 @@ fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     if let Some(sid) = val.as_string_id() {
         let bytes = ctx.strings.get_bytes(sid);
         let s = std::str::from_utf8(bytes).unwrap_or("");
+        let s = s.trim();
+        // Try hex integer
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            if let Ok(i) = i64::from_str_radix(hex, 16) {
+                return Ok(vec![TValue::from_full_integer(i, ctx.gc)]);
+            }
+        }
+        // Try decimal integer
         if let Ok(i) = s.parse::<i64>() {
             return Ok(vec![TValue::from_full_integer(i, ctx.gc)]);
         }
+        // Try float
         if let Ok(f) = s.parse::<f64>() {
             return Ok(vec![TValue::from_float(f)]);
         }
@@ -617,11 +740,13 @@ fn native_assert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     if val.is_falsy() {
         let msg = ctx.args.get(1).copied().unwrap_or(TValue::nil());
         if let Some(sid) = msg.as_string_id() {
+            // PUC Lua: assert(v, msg) raises msg directly (no prefix)
             let s = String::from_utf8_lossy(ctx.strings.get_bytes(sid)).into_owned();
-            Err(NativeError::String(format!("assertion failed! {s}")))
+            Err(NativeError::String(s))
         } else if msg.is_nil() {
             Err(NativeError::String("assertion failed!".to_string()))
         } else {
+            // Non-string error value (number, table, etc.)
             Err(NativeError::Value(msg))
         }
     } else {
@@ -645,15 +770,26 @@ fn native_select(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         }
     }
     if let Some(i) = index.as_full_integer(ctx.gc) {
-        if i < 1 {
+        let nargs = ctx.args.len() as i64 - 1; // exclude index itself
+        let start = if i < 0 {
+            // Negative index: count from end
+            let adjusted = nargs + 1 + i; // e.g., -1 → nargs
+            if adjusted < 1 {
+                return Err(NativeError::String(
+                    "bad argument #1 to 'select' (index out of range)".to_string(),
+                ));
+            }
+            adjusted as usize
+        } else if i == 0 {
             return Err(NativeError::String(
                 "bad argument #1 to 'select' (index out of range)".to_string(),
             ));
-        }
-        let start = i as usize;
-        if start > ctx.args.len() - 1 {
+        } else if i > nargs {
+            // Out of range positive index: return nothing
             return Ok(vec![]);
-        }
+        } else {
+            i as usize
+        };
         Ok(ctx.args[start..].to_vec())
     } else {
         Err(NativeError::String(
@@ -713,6 +849,16 @@ fn native_setmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     let table_idx = table_val.as_table_idx().ok_or_else(|| {
         NativeError::String("bad argument #1 to 'setmetatable' (table expected)".to_string())
     })?;
+    // Check for __metatable protection
+    if let Some(existing_mt) = ctx.gc.get_table(table_idx).metatable {
+        let mm_name = ctx.strings.intern(b"__metatable");
+        let mm_val = ctx.gc.get_table(existing_mt).raw_get_str(mm_name);
+        if !mm_val.is_nil() {
+            return Err(NativeError::String(
+                "cannot change a protected metatable".to_string(),
+            ));
+        }
+    }
     if mt_val.is_nil() {
         ctx.gc.get_table_mut(table_idx).metatable = None;
     } else {

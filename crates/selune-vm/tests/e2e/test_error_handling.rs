@@ -395,3 +395,210 @@ fn test_pcall_assert_success() {
         &[42],
     );
 }
+
+// ── Additional gap-fill tests (Tier 2D) ────────────────────────
+
+#[test]
+fn test_error_with_no_args() {
+    let err = run_lua_err("error()");
+    // error() with no args should throw nil
+    assert!(err.contains("nil") || err.contains("Nil"), "got: {err}");
+}
+
+#[test]
+fn test_error_with_level_0() {
+    // level 0 means no position info
+    run_check_strings(
+        r#"
+        local ok, msg = pcall(error, "raw message", 0)
+        return msg
+        "#,
+        &["raw message"],
+    );
+}
+
+#[test]
+fn test_pcall_nested_both_error() {
+    run_check_ints(
+        r#"
+        local ok1, result = pcall(function()
+            local ok2, msg = pcall(function()
+                error("inner error")
+            end)
+            if ok2 then return -1 end
+            error("outer error")
+        end)
+        if ok1 then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_xpcall_handler_receives_original() {
+    run_check_ints(
+        r#"
+        local handler_called = false
+        local ok, val = xpcall(
+            function() error(42) end,
+            function(e)
+                handler_called = true
+                return e * 2
+            end
+        )
+        if ok then return -1 end
+        if handler_called then return val else return -1 end
+        "#,
+        &[84],
+    );
+}
+
+#[test]
+fn test_pcall_error_nil_value() {
+    run_check_ints(
+        r#"
+        local ok, msg = pcall(error, nil)
+        if ok then return 1 end
+        if msg == nil then return 0 else return -1 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_assert_nil_errors() {
+    run_check_ints(
+        r#"
+        local ok = pcall(assert, nil)
+        if ok then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_assert_false_with_message() {
+    run_check_strings(
+        r#"
+        local ok, msg = pcall(assert, false, "custom error")
+        return msg
+        "#,
+        &["custom error"],
+    );
+}
+
+#[test]
+fn test_assert_false_default_message() {
+    run_check_strings(
+        r#"
+        local ok, msg = pcall(assert, false)
+        return msg
+        "#,
+        &["assertion failed!"],
+    );
+}
+
+#[test]
+fn test_assert_truthy_returns_value() {
+    run_check_ints(
+        r#"
+        local v = assert(42)
+        return v
+        "#,
+        &[42],
+    );
+}
+
+#[test]
+fn test_pcall_catches_concat_error() {
+    run_check_ints(
+        r#"
+        local ok = pcall(function()
+            return {} .. "hello"
+        end)
+        if ok then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_pcall_catches_comparison_error() {
+    run_check_ints(
+        r#"
+        local ok = pcall(function()
+            return {} < {}
+        end)
+        if ok then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_pcall_with_varargs() {
+    run_check_ints(
+        r#"
+        local function sum(...)
+            local s = 0
+            for i = 1, select('#', ...) do
+                s = s + select(i, ...)
+            end
+            return s
+        end
+        local ok, val = pcall(sum, 1, 2, 3, 4, 5)
+        if ok then return val else return -1 end
+        "#,
+        &[15],
+    );
+}
+
+#[test]
+fn test_error_in_metamethod_caught_by_pcall() {
+    run_check_ints(
+        r#"
+        local t = setmetatable({}, {
+            __index = function(t, k)
+                error("no such key: " .. k)
+            end
+        })
+        local ok, msg = pcall(function() return t.foo end)
+        if ok then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_deeply_nested_pcall_error() {
+    run_check_ints(
+        r#"
+        local result = 0
+        local ok = pcall(function()
+            pcall(function()
+                pcall(function()
+                    error("deep error")
+                end)
+                result = 1
+            end)
+            result = result + 10
+        end)
+        return result
+        "#,
+        &[11],
+    );
+}
+
+#[test]
+fn test_xpcall_success_returns_all_values() {
+    run_check_ints(
+        r#"
+        local ok, a, b, c = xpcall(
+            function() return 1, 2, 3 end,
+            function(e) return e end
+        )
+        if ok then return a, b, c else return -1 end
+        "#,
+        &[1, 2, 3],
+    );
+}

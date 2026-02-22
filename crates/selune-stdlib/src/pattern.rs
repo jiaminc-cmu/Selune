@@ -50,6 +50,51 @@ struct Matcher<'a> {
 /// Returns `None` if no match is found. On success, returns `Some(MatchState)`
 /// where `captures[0]` is always the full match range, and `captures[1..]`
 /// correspond to explicit `(...)` captures in the pattern.
+/// Validate a Lua pattern, returning an error message if invalid.
+pub fn validate_pattern(pattern: &[u8]) -> Result<(), String> {
+    let mut i = 0;
+    let pat = if !pattern.is_empty() && pattern[0] == b'^' { &pattern[1..] } else { pattern };
+    while i < pat.len() {
+        match pat[i] {
+            b'%' => {
+                i += 1;
+                if i >= pat.len() {
+                    return Err("malformed pattern (ends with '%%')".to_string());
+                }
+                i += 1;
+            }
+            b'[' => {
+                i += 1;
+                // skip optional '^'
+                if i < pat.len() && pat[i] == b'^' {
+                    i += 1;
+                }
+                // first ']' after '[' or '[^' is literal
+                if i < pat.len() && pat[i] == b']' {
+                    i += 1;
+                }
+                let mut found_close = false;
+                while i < pat.len() {
+                    if pat[i] == b']' {
+                        found_close = true;
+                        i += 1;
+                        break;
+                    } else if pat[i] == b'%' && i + 1 < pat.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if !found_close {
+                    return Err("malformed pattern (missing ']')".to_string());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Option<MatchState> {
     let anchor = !pattern.is_empty() && pattern[0] == b'^';
     let pat = if anchor { &pattern[1..] } else { pattern };

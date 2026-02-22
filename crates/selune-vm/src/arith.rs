@@ -33,6 +33,21 @@ pub fn arith_op(
                 Err(e) => ArithResult::Error(e),
             };
         }
+
+        // String→integer coercion path: if both operands can be coerced to integers,
+        // use integer arithmetic (Lua 5.4 semantics: "10" + 5 = 15 as integer)
+        let ia = coerce::to_integer(a, gc, strings);
+        let ib = coerce::to_integer(b, gc, strings);
+        if let (Some(ia), Some(ib)) = (ia, ib) {
+            // Only use integer path if at least one operand was a string
+            // (if both were already integers, the fast path above would have caught it)
+            if a.as_string_id().is_some() || b.as_string_id().is_some() {
+                return match int_arith(op, ia, ib, gc) {
+                    Ok(v) => ArithResult::Ok(v),
+                    Err(e) => ArithResult::Error(e),
+                };
+            }
+        }
     }
 
     // Float path: try to convert both to numbers

@@ -314,10 +314,23 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
 
             match spec {
                 b'd' | b'i' => {
-                    let n = val
-                        .as_full_integer(ctx.gc)
-                        .or_else(|| val.as_float().map(|f| f as i64))
-                        .unwrap_or(0);
+                    let n = if let Some(i) = val.as_full_integer(ctx.gc) {
+                        i
+                    } else if let Some(f) = val.as_float() {
+                        f as i64
+                    } else if let Some(sid) = val.as_string_id() {
+                        // Try string-to-number coercion
+                        let s = std::str::from_utf8(ctx.strings.get_bytes(sid)).unwrap_or("");
+                        let s = s.trim();
+                        s.parse::<i64>().or_else(|_| s.parse::<f64>().map(|f| f as i64))
+                            .map_err(|_| NativeError::String(
+                                format!("bad argument #{} to 'format' (number expected, got string)", arg_idx)
+                            ))?
+                    } else {
+                        return Err(NativeError::String(
+                            format!("bad argument #{} to 'format' (number has no integer representation)", arg_idx)
+                        ));
+                    };
                     let w: usize = width.parse().unwrap_or(0);
                     let formatted = if flags.contains(&b'-') {
                         format!("{:<width$}", n, width = w)
@@ -527,6 +540,10 @@ fn native_string_find(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         return Ok(vec![TValue::nil()]);
     }
 
+    // Validate pattern before matching
+    pattern::validate_pattern(&pat)
+        .map_err(|e| NativeError::String(format!("bad argument #2 to 'find' ({e})")))?;
+
     // Pattern search
     match pattern::pattern_find(&subject, &pat, start) {
         Some(ms) => {
@@ -585,6 +602,9 @@ fn native_string_match(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
         if back > subject.len() { 0 } else { subject.len() - back }
     };
 
+    pattern::validate_pattern(&pat)
+        .map_err(|e| NativeError::String(format!("bad argument #2 to 'match' ({e})")))?;
+
     match pattern::pattern_find(&subject, &pat, start) {
         Some(ms) => {
             if ms.captures.len() <= 1 {
@@ -616,8 +636,11 @@ fn native_string_match(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 /// string.gmatch: returns an iterator function.
 /// We store state in a table (subject, pattern, position) and return a native that reads it.
 fn native_string_gmatch(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let (pat_bytes, pat_sid) = get_string_arg(ctx, 1, "gmatch")?;
+    let pat_bytes = pat_bytes.to_vec();
+    pattern::validate_pattern(&pat_bytes)
+        .map_err(|e| NativeError::String(format!("bad argument #2 to 'gmatch' ({e})")))?;
     let (_, subj_sid) = get_string_arg(ctx, 0, "gmatch")?;
-    let (_, pat_sid) = get_string_arg(ctx, 1, "gmatch")?;
 
     // Create state table: {subject_sid, pattern_sid, position}
     let state_table = ctx.gc.alloc_table(4, 0);
