@@ -187,11 +187,8 @@ pub fn arith_bnot(
 
 /// String length (for # operator on strings).
 pub fn str_len(v: TValue, strings: &StringInterner) -> Option<i64> {
-    if let Some(sid) = v.as_string_id() {
-        Some(strings.get_bytes(sid).len() as i64)
-    } else {
-        None
-    }
+    v.as_string_id()
+        .map(|sid| strings.get_bytes(sid).len() as i64)
 }
 
 /// Concatenate a slice of TValues into a single string.

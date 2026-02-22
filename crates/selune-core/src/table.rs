@@ -284,7 +284,7 @@ fn tvalue_to_table_key(v: TValue) -> Option<TableKey> {
 fn table_key_to_tvalue(k: TableKey) -> TValue {
     match k {
         TableKey::Integer(i) => {
-            if i >= -70368744177664 && i <= 70368744177663 {
+            if (-70368744177664..=70368744177663).contains(&i) {
                 TValue::from_integer(i)
             } else {
                 // Would need boxed int, but for iteration keys this is fine

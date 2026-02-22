@@ -279,9 +279,7 @@ pub fn format_value(
         String::from_utf8_lossy(bytes).into_owned()
     } else if val.is_table() {
         format!("table: 0x{:x}", val.gc_index().unwrap_or(0))
-    } else if val.as_closure_idx().is_some() {
-        format!("function: 0x{:x}", val.gc_index().unwrap_or(0))
-    } else if val.as_native_idx().is_some() {
+    } else if val.as_closure_idx().is_some() || val.as_native_idx().is_some() {
         format!("function: 0x{:x}", val.gc_index().unwrap_or(0))
     } else {
         format!("{:?}", val)

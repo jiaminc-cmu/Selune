@@ -594,11 +594,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
                     if is_vararg {
                         // Move fixed params to the right, store varargs
-                        let _vararg_count = if num_args > num_params {
-                            num_args - num_params
-                        } else {
-                            0
-                        };
+                        let _vararg_count = num_args.saturating_sub(num_params);
                         let actual_base = new_base + num_args; // after all args
 
                         vm.ensure_stack(actual_base, max_stack + 1);
@@ -647,7 +643,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         gc: &mut vm.gc,
                         strings: &mut vm.strings,
                     };
-                    let results = native_fn(&mut ctx).map_err(|e| LuaError::Runtime(e))?;
+                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
 
                     // Place results
                     let result_base = base + a;
@@ -757,7 +753,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         gc: &mut vm.gc,
                         strings: &mut vm.strings,
                     };
-                    let results = native_fn(&mut ctx).map_err(|e| LuaError::Runtime(e))?;
+                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
 
                     vm.close_upvalues(base);
                     if vm.call_stack.len() <= 1 {
@@ -780,11 +776,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     let num_params = proto!(vm, ci_idx).num_params as usize;
                     // Varargs start after fixed params in the original arg area
                     let vararg_start = vararg_base + num_params;
-                    let vararg_count = if ci.base > vararg_start {
-                        ci.base - vararg_start
-                    } else {
-                        0
-                    };
+                    let vararg_count = ci.base.saturating_sub(vararg_start);
                     let wanted = if c == 0 { vararg_count } else { c - 1 };
 
                     vm.ensure_stack(base + a, wanted + 1);
@@ -1084,7 +1076,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
 /// Get the proto for the current call frame.
 #[allow(dead_code)]
-fn get_proto<'a>(vm: &'a Vm, ci_idx: usize) -> &'a Proto {
+fn get_proto(vm: &Vm, ci_idx: usize) -> &Proto {
     &vm.protos[vm.call_stack[ci_idx].proto_idx]
 }
 

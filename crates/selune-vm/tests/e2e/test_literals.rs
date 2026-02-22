@@ -24,9 +24,9 @@ fn test_return_zero() {
 
 #[test]
 fn test_return_float() {
-    let results = run_lua("return 3.14");
+    let results = run_lua("return 3.15");
     assert_eq!(results.len(), 1);
-    assert_float(&results, 0, 3.14);
+    assert_float(&results, 0, 3.15);
 }
 
 #[test]

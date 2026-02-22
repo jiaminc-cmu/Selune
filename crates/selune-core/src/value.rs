@@ -374,10 +374,8 @@ impl TValue {
     pub fn as_number(&self, gc: &GcHeap) -> Option<f64> {
         if let Some(f) = self.as_float() {
             Some(f)
-        } else if let Some(i) = self.as_full_integer(gc) {
-            Some(i as f64)
         } else {
-            None
+            self.as_full_integer(gc).map(|i| i as f64)
         }
     }
 

@@ -136,8 +136,8 @@ fn qa_bnot_minus_one() {
 
 #[test]
 fn qa_unary_minus_float() {
-    let results = run_lua("return -(3.14)");
-    assert_float(&results, 0, -3.14);
+    let results = run_lua("return -(3.15)");
+    assert_float(&results, 0, -3.15);
 }
 
 #[test]
@@ -1038,8 +1038,8 @@ fn qa_type_of_table() {
 
 #[test]
 fn qa_tonumber_float_string() {
-    let results = run_lua("return tonumber(\"3.14\")");
-    assert_float(&results, 0, 3.14);
+    let results = run_lua("return tonumber(\"3.15\")");
+    assert_float(&results, 0, 3.15);
 }
 
 #[test]
