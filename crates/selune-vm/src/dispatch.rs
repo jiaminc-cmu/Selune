@@ -5,10 +5,11 @@ use crate::callinfo::CallInfo;
 use crate::coerce;
 use crate::compare;
 use crate::error::LuaError;
+use crate::metamethod;
 use crate::vm::Vm;
 use selune_compiler::opcode::OpCode;
 use selune_compiler::proto::{Constant, Proto};
-use selune_core::gc::NativeContext;
+use selune_core::gc::{NativeContext, NativeError};
 use selune_core::value::TValue;
 
 /// Helper macro to get current proto without borrowing all of vm.
@@ -34,6 +35,11 @@ fn k_to_tvalue(vm: &mut Vm, ci_idx: usize, idx: usize) -> TValue {
 
 /// Execute starting from proto at the given index, returning results.
 pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaError> {
+    execute_from(vm, 1)
+}
+
+/// Execute the dispatch loop, returning when call_stack depth drops to entry_depth.
+pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaError> {
     loop {
         let ci_idx = vm.call_stack.len() - 1;
         let base = vm.call_stack[ci_idx].base;
@@ -41,7 +47,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
         let pc = vm.call_stack[ci_idx].pc;
         if pc >= proto!(vm, ci_idx).code.len() {
             // Fell off the end — return empty
-            if vm.call_stack.len() <= 1 {
+            if vm.call_stack.len() <= entry_depth {
                 return Ok(vec![]);
             }
             // Return from nested call
@@ -111,6 +117,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             }
 
             // ---- Arithmetic (register-register) ----
+            // On success: store result and skip next MMBIN instruction.
+            // On NeedMetamethod: don't skip, let MMBIN handle it.
             OpCode::Add
             | OpCode::Sub
             | OpCode::Mul
@@ -131,7 +139,14 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     OpCode::Div => ArithOp::Div,
                     _ => ArithOp::IDiv,
                 };
-                vm.stack[base + a] = arith::arith_op(aop, vb, vc, &mut vm.gc, &vm.strings)?;
+                match arith::arith_op(aop, vb, vc, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                        vm.call_stack[ci_idx].pc += 1; // skip MMBin
+                    }
+                    arith::ArithResult::NeedMetamethod => {} // fall through to MMBin
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::BAnd | OpCode::BOr | OpCode::BXor | OpCode::Shl | OpCode::Shr => {
                 let b = inst.b() as usize;
@@ -145,7 +160,14 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     OpCode::Shl => ArithOp::Shl,
                     _ => ArithOp::Shr,
                 };
-                vm.stack[base + a] = arith::bitwise_op(aop, vb, vc, &mut vm.gc, &vm.strings)?;
+                match arith::bitwise_op(aop, vb, vc, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                        vm.call_stack[ci_idx].pc += 1; // skip MMBin
+                    }
+                    arith::ArithResult::NeedMetamethod => {} // fall through to MMBin
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
 
             // ---- Arithmetic (register + constant) ----
@@ -170,7 +192,14 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     OpCode::DivK => ArithOp::Div,
                     _ => ArithOp::IDiv,
                 };
-                vm.stack[base + a] = arith::arith_op(aop, vb, vc, &mut vm.gc, &vm.strings)?;
+                match arith::arith_op(aop, vb, vc, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                        vm.call_stack[ci_idx].pc += 1; // skip MMBinK
+                    }
+                    arith::ArithResult::NeedMetamethod => {} // fall through to MMBinK
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::BAndK | OpCode::BOrK | OpCode::BXorK => {
                 let b = inst.b() as usize;
@@ -183,7 +212,14 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     OpCode::BOrK => ArithOp::BOr,
                     _ => ArithOp::BXor,
                 };
-                vm.stack[base + a] = arith::bitwise_op(aop, vb, vc, &mut vm.gc, &vm.strings)?;
+                match arith::bitwise_op(aop, vb, vc, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                        vm.call_stack[ci_idx].pc += 1; // skip MMBinK
+                    }
+                    arith::ArithResult::NeedMetamethod => {} // fall through to MMBinK
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
 
             // ---- Arithmetic (register + immediate) ----
@@ -192,36 +228,116 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] =
-                    arith::arith_op(ArithOp::Add, vb, imm, &mut vm.gc, &vm.strings)?;
+                match arith::arith_op(ArithOp::Add, vb, imm, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                        vm.call_stack[ci_idx].pc += 1; // skip MMBinI
+                    }
+                    arith::ArithResult::NeedMetamethod => {}
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::ShrI => {
+                // ShrI has no following MMBinI (compiler doesn't emit one)
                 let b = inst.b() as usize;
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] =
-                    arith::bitwise_op(ArithOp::Shr, vb, imm, &mut vm.gc, &vm.strings)?;
+                match arith::bitwise_op(ArithOp::Shr, vb, imm, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                    }
+                    arith::ArithResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().shr;
+                        let mm = metamethod::get_metamethod(vb, mm_name, &vm.gc);
+                        if let Some(mm_func) = mm {
+                            let result = call_function(vm, mm_func, &[vb, imm])?;
+                            vm.stack[base + a] =
+                                result.first().copied().unwrap_or(TValue::nil());
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to perform bitwise operation on a {} value",
+                                selune_core::object::lua_type_name(vb, &vm.gc)
+                            )));
+                        }
+                    }
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::ShlI => {
+                // ShlI has no following MMBinI (compiler doesn't emit one)
                 let b = inst.b() as usize;
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] =
-                    arith::bitwise_op(ArithOp::Shl, vb, imm, &mut vm.gc, &vm.strings)?;
+                match arith::bitwise_op(ArithOp::Shl, vb, imm, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                    }
+                    arith::ArithResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().shl;
+                        let mm = metamethod::get_metamethod(vb, mm_name, &vm.gc);
+                        if let Some(mm_func) = mm {
+                            let result = call_function(vm, mm_func, &[vb, imm])?;
+                            vm.stack[base + a] =
+                                result.first().copied().unwrap_or(TValue::nil());
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to perform bitwise operation on a {} value",
+                                selune_core::object::lua_type_name(vb, &vm.gc)
+                            )));
+                        }
+                    }
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
 
             // ---- Unary ----
             OpCode::Unm => {
                 let b = inst.b() as usize;
                 let vb = vm.stack[base + b];
-                vm.stack[base + a] = arith::arith_unm(vb, &mut vm.gc, &vm.strings)?;
+                match arith::arith_unm(vb, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                    }
+                    arith::ArithResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().unm;
+                        if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
+                            let result = call_function(vm, mm, &[vb])?;
+                            vm.stack[base + a] =
+                                result.first().copied().unwrap_or(TValue::nil());
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to perform arithmetic on a {} value",
+                                selune_core::object::lua_type_name(vb, &vm.gc)
+                            )));
+                        }
+                    }
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::BNot => {
                 let b = inst.b() as usize;
                 let vb = vm.stack[base + b];
-                vm.stack[base + a] = arith::arith_bnot(vb, &mut vm.gc, &vm.strings)?;
+                match arith::arith_bnot(vb, &mut vm.gc, &vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                    }
+                    arith::ArithResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().bnot;
+                        if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
+                            let result = call_function(vm, mm, &[vb])?;
+                            vm.stack[base + a] =
+                                result.first().copied().unwrap_or(TValue::nil());
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to perform bitwise operation on a {} value",
+                                selune_core::object::lua_type_name(vb, &vm.gc)
+                            )));
+                        }
+                    }
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
             OpCode::Not => {
                 let b = inst.b() as usize;
@@ -233,9 +349,17 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let vb = vm.stack[base + b];
                 if let Some(len) = arith::str_len(vb, &vm.strings) {
                     vm.stack[base + a] = TValue::from_full_integer(len, &mut vm.gc);
-                } else if let Some(table_idx) = vb.as_table_idx() {
-                    let len = vm.gc.get_table(table_idx).length();
-                    vm.stack[base + a] = TValue::from_full_integer(len, &mut vm.gc);
+                } else if vb.as_table_idx().is_some() {
+                    // Check for __len metamethod first
+                    let mm_name = vm.mm_names.as_ref().unwrap().len;
+                    if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
+                        let result = call_function(vm, mm, &[vb])?;
+                        vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
+                    } else {
+                        let table_idx = vb.as_table_idx().unwrap();
+                        let len = vm.gc.get_table(table_idx).length();
+                        vm.stack[base + a] = TValue::from_full_integer(len, &mut vm.gc);
+                    }
                 } else {
                     return Err(LuaError::Runtime(format!(
                         "attempt to get length of a {} value",
@@ -250,12 +374,132 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 for i in 0..count {
                     values.push(vm.stack[base + a + i]);
                 }
-                let result = arith::lua_concat(&values, &vm.gc, &mut vm.strings)?;
-                vm.stack[base + a] = result;
+                match arith::lua_concat(&values, &vm.gc, &mut vm.strings) {
+                    arith::ArithResult::Ok(result) => {
+                        vm.stack[base + a] = result;
+                    }
+                    arith::ArithResult::NeedMetamethod => {
+                        // Find first non-string/non-number value and try __concat
+                        let mm_name = vm.mm_names.as_ref().unwrap().concat;
+                        // Binary fold from left: ((a .. b) .. c) .. d
+                        let mut accum = values[0];
+                        for &val in &values[1..] {
+                            // Try raw concat of pair first
+                            match arith::lua_concat(&[accum, val], &vm.gc, &mut vm.strings) {
+                                arith::ArithResult::Ok(result) => {
+                                    accum = result;
+                                }
+                                _ => {
+                                    // Try metamethod on left operand, then right
+                                    let mm = metamethod::get_metamethod(accum, mm_name, &vm.gc)
+                                        .or_else(|| {
+                                            metamethod::get_metamethod(val, mm_name, &vm.gc)
+                                        });
+                                    if let Some(mm_func) = mm {
+                                        let result =
+                                            call_function(vm, mm_func, &[accum, val])?;
+                                        accum = result
+                                            .first()
+                                            .copied()
+                                            .unwrap_or(TValue::nil());
+                                    } else {
+                                        return Err(LuaError::Runtime(format!(
+                                            "attempt to concatenate a {} value",
+                                            selune_core::object::lua_type_name(
+                                                accum, &vm.gc
+                                            )
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        vm.stack[base + a] = accum;
+                    }
+                    arith::ArithResult::Error(e) => return Err(e),
+                }
             }
 
-            // ---- Metamethod stubs ----
-            OpCode::MMBin | OpCode::MMBinI | OpCode::MMBinK => {}
+            // ---- Metamethod dispatch (MMBin/MMBinI/MMBinK) ----
+            OpCode::MMBin => {
+                // A = left operand reg, B = right operand reg, C = metamethod index
+                let b_reg = inst.b() as usize;
+                let mm_idx = inst.c() as u8;
+                let va = vm.stack[base + a];
+                let vb = vm.stack[base + b_reg];
+                let mm_name = vm.mm_names.as_ref().unwrap().from_mm_index(mm_idx);
+                // Try left operand's metamethod, then right
+                let mm = metamethod::get_metamethod(va, mm_name, &vm.gc)
+                    .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc));
+                if let Some(mm_func) = mm {
+                    let result = call_function(vm, mm_func, &[va, vb])?;
+                    // Destination = previous instruction's A field
+                    let prev_inst =
+                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let dest = prev_inst.a() as usize;
+                    vm.stack[base + dest] =
+                        result.first().copied().unwrap_or(TValue::nil());
+                } else {
+                    return Err(LuaError::Runtime(format!(
+                        "attempt to perform {} on a {} value",
+                        mm_op_description(mm_idx),
+                        selune_core::object::lua_type_name(va, &vm.gc)
+                    )));
+                }
+            }
+            OpCode::MMBinI => {
+                // A = left operand reg, sB = immediate, C = metamethod index, k = flip
+                let sb = inst.b() as i8 as i64;
+                let mm_idx = inst.c() as u8;
+                let k_flip = inst.k();
+                let va = vm.stack[base + a];
+                let vb = TValue::from_full_integer(sb, &mut vm.gc);
+                let mm_name = vm.mm_names.as_ref().unwrap().from_mm_index(mm_idx);
+                // If k_flip, the original operation was `imm op reg` so swap
+                let (left, right) = if k_flip { (vb, va) } else { (va, vb) };
+                let mm = metamethod::get_metamethod(left, mm_name, &vm.gc)
+                    .or_else(|| metamethod::get_metamethod(right, mm_name, &vm.gc));
+                if let Some(mm_func) = mm {
+                    let result = call_function(vm, mm_func, &[left, right])?;
+                    let prev_inst =
+                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let dest = prev_inst.a() as usize;
+                    vm.stack[base + dest] =
+                        result.first().copied().unwrap_or(TValue::nil());
+                } else {
+                    return Err(LuaError::Runtime(format!(
+                        "attempt to perform {} on a {} value",
+                        mm_op_description(mm_idx),
+                        selune_core::object::lua_type_name(va, &vm.gc)
+                    )));
+                }
+            }
+            OpCode::MMBinK => {
+                // A = left operand reg, B = constant index, C = metamethod index, k = flip
+                let b_k = inst.b() as usize;
+                let mm_idx = inst.c() as u8;
+                let k_flip = inst.k();
+                let va = vm.stack[base + a];
+                let proto = proto!(vm, ci_idx);
+                let vb = constant_to_tvalue(&proto.constants[b_k], &mut vm.gc);
+                let mm_name = vm.mm_names.as_ref().unwrap().from_mm_index(mm_idx);
+                let (left, right) = if k_flip { (vb, va) } else { (va, vb) };
+                let mm = metamethod::get_metamethod(left, mm_name, &vm.gc)
+                    .or_else(|| metamethod::get_metamethod(right, mm_name, &vm.gc));
+                if let Some(mm_func) = mm {
+                    let result = call_function(vm, mm_func, &[left, right])?;
+                    let prev_inst =
+                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let dest = prev_inst.a() as usize;
+                    vm.stack[base + dest] =
+                        result.first().copied().unwrap_or(TValue::nil());
+                } else {
+                    return Err(LuaError::Runtime(format!(
+                        "attempt to perform {} on a {} value",
+                        mm_op_description(mm_idx),
+                        selune_core::object::lua_type_name(va, &vm.gc)
+                    )));
+                }
+            }
 
             // ---- Comparisons ----
             OpCode::Eq => {
@@ -263,8 +507,23 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
-                let eq = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
-                if eq != k {
+                let (eq, needs_mm) = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
+                let result = if needs_mm && !eq {
+                    // Try __eq metamethod
+                    let mm_name = vm.mm_names.as_ref().unwrap().eq;
+                    if let Some(mm) =
+                        metamethod::get_metamethod(va, mm_name, &vm.gc)
+                            .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                    {
+                        let res = call_function(vm, mm, &[va, vb])?;
+                        !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
+                    } else {
+                        eq
+                    }
+                } else {
+                    eq
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -273,8 +532,25 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
-                let lt = compare::lua_lt(va, vb, &vm.gc, &vm.strings)?;
-                if lt != k {
+                let result = match compare::lua_lt(va, vb, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().lt;
+                        if let Some(mm) =
+                            metamethod::get_metamethod(va, mm_name, &vm.gc)
+                                .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                        {
+                            let res = call_function(vm, mm, &[va, vb])?;
+                            !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to compare two {} values",
+                                selune_core::object::lua_type_name(va, &vm.gc)
+                            )));
+                        }
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -283,8 +559,25 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
-                let le = compare::lua_le(va, vb, &vm.gc, &vm.strings)?;
-                if le != k {
+                let result = match compare::lua_le(va, vb, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        let mm_name = vm.mm_names.as_ref().unwrap().le;
+                        if let Some(mm) =
+                            metamethod::get_metamethod(va, mm_name, &vm.gc)
+                                .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                        {
+                            let res = call_function(vm, mm, &[va, vb])?;
+                            !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to compare two {} values",
+                                selune_core::object::lua_type_name(va, &vm.gc)
+                            )));
+                        }
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -294,7 +587,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let proto = proto!(vm, ci_idx);
                 let vb = constant_to_tvalue(&proto.constants[b], &mut vm.gc);
-                let eq = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
+                let (eq, _) = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
                 if eq != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
@@ -304,7 +597,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
-                let eq = compare::lua_eq(va, imm, &vm.gc, &vm.strings);
+                let (eq, _) = compare::lua_eq(va, imm, &vm.gc, &vm.strings);
                 if eq != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
@@ -314,8 +607,16 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
-                let lt = compare::lua_lt(va, imm, &vm.gc, &vm.strings)?;
-                if lt != k {
+                let result = match compare::lua_lt(va, imm, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to compare two {} values",
+                            selune_core::object::lua_type_name(va, &vm.gc)
+                        )));
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -324,8 +625,16 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
-                let le = compare::lua_le(va, imm, &vm.gc, &vm.strings)?;
-                if le != k {
+                let result = match compare::lua_le(va, imm, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to compare two {} values",
+                            selune_core::object::lua_type_name(va, &vm.gc)
+                        )));
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -334,8 +643,16 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
-                let gt = compare::lua_lt(imm, va, &vm.gc, &vm.strings)?;
-                if gt != k {
+                let result = match compare::lua_lt(imm, va, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to compare two {} values",
+                            selune_core::object::lua_type_name(va, &vm.gc)
+                        )));
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -344,8 +661,16 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let k = inst.k();
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
-                let ge = compare::lua_le(imm, va, &vm.gc, &vm.strings)?;
-                if ge != k {
+                let result = match compare::lua_le(imm, va, &vm.gc, &vm.strings) {
+                    compare::CompareResult::Ok(v) => v,
+                    compare::CompareResult::NeedMetamethod => {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to compare two {} values",
+                            selune_core::object::lua_type_name(va, &vm.gc)
+                        )));
+                    }
+                };
+                if result != k {
                     vm.call_stack[ci_idx].pc += 1;
                 }
             }
@@ -483,7 +808,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
             // ---- Returns ----
             OpCode::Return0 => {
-                if vm.call_stack.len() <= 1 {
+                close_tbc_variables(vm, ci_idx, base, None)?;
+                if vm.call_stack.len() <= entry_depth {
                     return Ok(vec![]);
                 }
                 vm.close_upvalues(base);
@@ -492,7 +818,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
             OpCode::Return1 => {
                 let val = vm.stack[base + a];
-                if vm.call_stack.len() <= 1 {
+                close_tbc_variables(vm, ci_idx, base, None)?;
+                if vm.call_stack.len() <= entry_depth {
                     return Ok(vec![val]);
                 }
                 vm.close_upvalues(base);
@@ -513,7 +840,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         results.push(vm.stack[base + a + i]);
                     }
                 }
-                if vm.call_stack.len() <= 1 {
+                close_tbc_variables(vm, ci_idx, base, None)?;
+                if vm.call_stack.len() <= entry_depth {
                     return Ok(results);
                 }
                 vm.close_upvalues(base);
@@ -633,39 +961,199 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         vm.call_stack.push(ci);
                     }
                 } else if let Some(native_idx) = func_val.as_native_idx() {
-                    // Native function call
-                    let args: Vec<TValue> =
-                        (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
+                    // Check for special pcall/xpcall dispatch
+                    let is_pcall = vm.pcall_idx == Some(native_idx);
+                    let is_xpcall = vm.xpcall_idx == Some(native_idx);
 
-                    let native_fn = vm.gc.get_native(native_idx).func;
-                    let mut ctx = NativeContext {
-                        args: &args,
-                        gc: &mut vm.gc,
-                        strings: &mut vm.strings,
-                    };
-                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
+                    if is_pcall {
+                        // pcall(func, ...) → call func with remaining args
+                        let pcall_func = if num_args > 0 {
+                            vm.stack[base + a + 1]
+                        } else {
+                            TValue::nil()
+                        };
+                        let pcall_args: Vec<TValue> = (1..num_args)
+                            .map(|i| vm.stack[base + a + 1 + i])
+                            .collect();
 
-                    // Place results
-                    let result_base = base + a;
-                    let result_count = if num_results < 0 {
-                        results.len()
+                        let result_base = base + a;
+                        match call_function(vm, pcall_func, &pcall_args) {
+                            Ok(results) => {
+                                // Place (true, results...)
+                                let mut all = vec![TValue::from_bool(true)];
+                                all.extend(results);
+                                let result_count = if num_results < 0 {
+                                    all.len()
+                                } else {
+                                    num_results as usize
+                                };
+                                for i in 0..result_count {
+                                    vm.stack[result_base + i] =
+                                        all.get(i).copied().unwrap_or(TValue::nil());
+                                }
+                                if num_results < 0 {
+                                    vm.stack_top = result_base + all.len();
+                                }
+                            }
+                            Err(e) => {
+                                // Place (false, error_value)
+                                let err_val = e.to_tvalue(&mut vm.strings);
+                                let all = vec![TValue::from_bool(false), err_val];
+                                let result_count = if num_results < 0 {
+                                    all.len()
+                                } else {
+                                    num_results as usize
+                                };
+                                for i in 0..result_count {
+                                    vm.stack[result_base + i] =
+                                        all.get(i).copied().unwrap_or(TValue::nil());
+                                }
+                                if num_results < 0 {
+                                    vm.stack_top = result_base + all.len();
+                                }
+                            }
+                        }
+                    } else if is_xpcall {
+                        // xpcall(func, handler, ...) → call func, on error call handler
+                        let xpcall_func = if num_args > 0 {
+                            vm.stack[base + a + 1]
+                        } else {
+                            TValue::nil()
+                        };
+                        let handler = if num_args > 1 {
+                            vm.stack[base + a + 2]
+                        } else {
+                            TValue::nil()
+                        };
+                        let xpcall_args: Vec<TValue> = (2..num_args)
+                            .map(|i| vm.stack[base + a + 1 + i])
+                            .collect();
+
+                        let result_base = base + a;
+                        match call_function(vm, xpcall_func, &xpcall_args) {
+                            Ok(results) => {
+                                let mut all = vec![TValue::from_bool(true)];
+                                all.extend(results);
+                                let result_count = if num_results < 0 {
+                                    all.len()
+                                } else {
+                                    num_results as usize
+                                };
+                                for i in 0..result_count {
+                                    vm.stack[result_base + i] =
+                                        all.get(i).copied().unwrap_or(TValue::nil());
+                                }
+                                if num_results < 0 {
+                                    vm.stack_top = result_base + all.len();
+                                }
+                            }
+                            Err(e) => {
+                                // Call handler with error value
+                                let err_val = e.to_tvalue(&mut vm.strings);
+                                let handler_result =
+                                    call_function(vm, handler, &[err_val]);
+                                match handler_result {
+                                    Ok(results) => {
+                                        let mut all = vec![TValue::from_bool(false)];
+                                        all.extend(results);
+                                        let result_count = if num_results < 0 {
+                                            all.len()
+                                        } else {
+                                            num_results as usize
+                                        };
+                                        for i in 0..result_count {
+                                            vm.stack[result_base + i] =
+                                                all.get(i).copied().unwrap_or(TValue::nil());
+                                        }
+                                        if num_results < 0 {
+                                            vm.stack_top = result_base + all.len();
+                                        }
+                                    }
+                                    Err(handler_err) => {
+                                        // Handler itself errored
+                                        let handler_err_val =
+                                            handler_err.to_tvalue(&mut vm.strings);
+                                        let all = vec![
+                                            TValue::from_bool(false),
+                                            handler_err_val,
+                                        ];
+                                        let result_count = if num_results < 0 {
+                                            all.len()
+                                        } else {
+                                            num_results as usize
+                                        };
+                                        for i in 0..result_count {
+                                            vm.stack[result_base + i] =
+                                                all.get(i).copied().unwrap_or(TValue::nil());
+                                        }
+                                        if num_results < 0 {
+                                            vm.stack_top = result_base + all.len();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else {
-                        num_results as usize
-                    };
+                        // Normal native function call
+                        let args: Vec<TValue> =
+                            (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
-                    for i in 0..result_count {
-                        let val = results.get(i).copied().unwrap_or(TValue::nil());
-                        vm.stack[result_base + i] = val;
-                    }
+                        let native_fn = vm.gc.get_native(native_idx).func;
+                        let mut ctx = NativeContext {
+                            args: &args,
+                            gc: &mut vm.gc,
+                            strings: &mut vm.strings,
+                        };
+                        let results = native_fn(&mut ctx).map_err(map_native_error)?;
 
-                    if num_results < 0 {
-                        vm.stack_top = result_base + results.len();
+                        // Place results
+                        let result_base = base + a;
+                        let result_count = if num_results < 0 {
+                            results.len()
+                        } else {
+                            num_results as usize
+                        };
+
+                        for i in 0..result_count {
+                            let val = results.get(i).copied().unwrap_or(TValue::nil());
+                            vm.stack[result_base + i] = val;
+                        }
+
+                        if num_results < 0 {
+                            vm.stack_top = result_base + results.len();
+                        }
                     }
                 } else {
-                    return Err(LuaError::Runtime(format!(
-                        "attempt to call a {} value",
-                        selune_core::object::lua_type_name(func_val, &vm.gc)
-                    )));
+                    // Try __call metamethod
+                    let mm_name = vm.mm_names.as_ref().unwrap().call;
+                    if let Some(mm) = metamethod::get_metamethod(func_val, mm_name, &vm.gc) {
+                        let mut mm_args = vec![func_val];
+                        for i in 0..num_args {
+                            mm_args.push(vm.stack[base + a + 1 + i]);
+                        }
+                        let results = call_function(vm, mm, &mm_args)?;
+
+                        let result_base = base + a;
+                        let result_count = if num_results < 0 {
+                            results.len()
+                        } else {
+                            num_results as usize
+                        };
+
+                        for i in 0..result_count {
+                            let val = results.get(i).copied().unwrap_or(TValue::nil());
+                            vm.stack[result_base + i] = val;
+                        }
+
+                        if num_results < 0 {
+                            vm.stack_top = result_base + results.len();
+                        }
+                    } else {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to call a {} value",
+                            selune_core::object::lua_type_name(func_val, &vm.gc)
+                        )));
+                    }
                 }
             }
 
@@ -753,18 +1241,34 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         gc: &mut vm.gc,
                         strings: &mut vm.strings,
                     };
-                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
+                    let results = native_fn(&mut ctx).map_err(map_native_error)?;
 
                     vm.close_upvalues(base);
-                    if vm.call_stack.len() <= 1 {
+                    if vm.call_stack.len() <= entry_depth {
                         return Ok(results);
                     }
                     return_from_call(vm, &results)?;
                 } else {
-                    return Err(LuaError::Runtime(format!(
-                        "attempt to call a {} value",
-                        selune_core::object::lua_type_name(func_val, &vm.gc)
-                    )));
+                    // Try __call metamethod for TailCall
+                    let mm_name = vm.mm_names.as_ref().unwrap().call;
+                    if let Some(mm) = metamethod::get_metamethod(func_val, mm_name, &vm.gc) {
+                        let mut mm_args = vec![func_val];
+                        for i in 0..num_args {
+                            mm_args.push(vm.stack[base + a + 1 + i]);
+                        }
+                        let results = call_function(vm, mm, &mm_args)?;
+
+                        vm.close_upvalues(base);
+                        if vm.call_stack.len() <= entry_depth {
+                            return Ok(results);
+                        }
+                        return_from_call(vm, &results)?;
+                    } else {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to call a {} value",
+                            selune_core::object::lua_type_name(func_val, &vm.gc)
+                        )));
+                    }
                 }
             }
 
@@ -826,11 +1330,49 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             }
 
             OpCode::Close => {
+                close_tbc_variables(vm, ci_idx, base + a, None)?;
                 vm.close_upvalues(base + a);
             }
 
             OpCode::Tbc => {
-                // To-be-closed: no-op (would trigger __close metamethod)
+                // Register this stack slot as to-be-closed
+                vm.call_stack[ci_idx].tbc_slots.push(base + a);
+            }
+
+            // ---- Generic for loop ----
+            OpCode::TForPrep => {
+                let sbx = inst.sbx();
+                // Jump forward to TFORCALL
+                vm.call_stack[ci_idx].pc =
+                    (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+            }
+
+            OpCode::TForCall => {
+                let c = inst.c() as usize; // number of loop variables
+                let iter_func = vm.stack[base + a];
+                let state = vm.stack[base + a + 1];
+                let control = vm.stack[base + a + 2];
+                // Call iterator function: iter_func(state, control)
+                let results = call_function(vm, iter_func, &[state, control])?;
+                // Place results in R[A+4], R[A+5], ... R[A+3+c]
+                for i in 0..c {
+                    vm.stack[base + a + 4 + i] =
+                        results.get(i).copied().unwrap_or(TValue::nil());
+                }
+            }
+
+            OpCode::TForLoop => {
+                let sbx = inst.sbx();
+                // A = base+2 (control variable position)
+                // Check R[A+2] = first loop variable (which is at base+4 = (base+2)+2)
+                let first_result = vm.stack[base + a + 2];
+                if !first_result.is_nil() {
+                    // Update control variable = first result
+                    vm.stack[base + a] = first_result;
+                    // Jump back to loop body
+                    vm.call_stack[ci_idx].pc =
+                        (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                }
             }
 
             // ---- Table operations ----
@@ -849,38 +1391,23 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let c = inst.c() as usize;
                 let table_val = vm.stack[base + b];
                 let key = vm.stack[base + c];
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get(key);
+                let result = table_index(vm, table_val, key)?;
+                vm.stack[base + a] = result;
             }
 
             OpCode::GetI => {
                 let b = inst.b() as usize;
                 let c = inst.c() as i64;
                 let table_val = vm.stack[base + b];
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                vm.stack[base + a] = vm.gc.get_table(table_idx).raw_geti(c);
+                let key = TValue::from_integer(c);
+                let result = table_index(vm, table_val, key)?;
+                vm.stack[base + a] = result;
             }
 
             OpCode::GetField => {
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
                 let table_val = vm.stack[base + b];
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
                 let key_k = get_k(vm, ci_idx, c);
                 let key_sid = match key_k {
                     Constant::String(sid) => sid,
@@ -890,7 +1417,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         ))
                     }
                 };
-                vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(key_sid);
+                let key = TValue::from_string_id(key_sid);
+                let result = table_index(vm, table_val, key)?;
+                vm.stack[base + a] = result;
             }
 
             OpCode::SetTable => {
@@ -904,16 +1433,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 } else {
                     vm.stack[base + c]
                 };
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                vm.gc
-                    .get_table_mut(table_idx)
-                    .raw_set(key, val)
-                    .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+                table_newindex(vm, table_val, key, val)?;
             }
 
             OpCode::SetI => {
@@ -926,13 +1446,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 } else {
                     vm.stack[base + c]
                 };
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                vm.gc.get_table_mut(table_idx).raw_seti(b, val);
+                let key = TValue::from_integer(b);
+                table_newindex(vm, table_val, key, val)?;
             }
 
             OpCode::SetField => {
@@ -953,13 +1468,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 } else {
                     vm.stack[base + c]
                 };
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                vm.gc.get_table_mut(table_idx).raw_set_str(key_sid, val);
+                let key = TValue::from_string_id(key_sid);
+                table_newindex(vm, table_val, key, val)?;
             }
 
             OpCode::GetTabUp => {
@@ -969,11 +1479,15 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let closure_idx = vm.call_stack[ci_idx]
                     .closure_idx
                     .ok_or_else(|| LuaError::Runtime("GetTabUp: no closure".to_string()))?;
-                let uv_idx = vm.gc.get_closure(closure_idx).upvalues[b];
+                let closure = vm.gc.get_closure(closure_idx);
+                if b >= closure.upvalues.len() {
+                    return Err(LuaError::Runtime(format!(
+                        "GetTabUp: upvalue index {} out of range (closure has {} upvalues)",
+                        b, closure.upvalues.len()
+                    )));
+                }
+                let uv_idx = closure.upvalues[b];
                 let upval = vm.get_upval_value(uv_idx);
-                let table_idx = upval.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime("GetTabUp: upvalue is not a table".to_string())
-                })?;
                 let key_k = get_k(vm, ci_idx, c);
                 let key_sid = match key_k {
                     Constant::String(sid) => sid,
@@ -983,7 +1497,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         ))
                     }
                 };
-                vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(key_sid);
+                let key = TValue::from_string_id(key_sid);
+                let result = table_index(vm, upval, key)?;
+                vm.stack[base + a] = result;
             }
 
             OpCode::SetTabUp => {
@@ -1052,17 +1568,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 } else {
                     vm.stack[base + c]
                 };
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!(
-                        "attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)
-                    ))
-                })?;
-                if let Some(sid) = key.as_string_id() {
-                    vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(sid);
-                } else {
-                    vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get(key);
-                }
+                let result = table_index(vm, table_val, key)?;
+                vm.stack[base + a] = result;
             }
 
             OpCode::ExtraArg => {}
@@ -1078,6 +1585,132 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 #[allow(dead_code)]
 fn get_proto(vm: &Vm, ci_idx: usize) -> &Proto {
     &vm.protos[vm.call_stack[ci_idx].proto_idx]
+}
+
+/// Close to-be-closed variables from the given call frame whose stack index >= from_level.
+/// Calls __close(val, error_or_nil) in reverse order.
+fn close_tbc_variables(
+    vm: &mut Vm,
+    ci_idx: usize,
+    from_level: usize,
+    error_val: Option<TValue>,
+) -> Result<(), LuaError> {
+    // Collect TBC slots that need closing (those >= from_level), in reverse order
+    let slots_to_close: Vec<usize> = vm.call_stack[ci_idx]
+        .tbc_slots
+        .iter()
+        .copied()
+        .filter(|&slot| slot >= from_level)
+        .collect();
+
+    // Remove them from the tracking list
+    vm.call_stack[ci_idx]
+        .tbc_slots
+        .retain(|&slot| slot < from_level);
+
+    // Close in reverse order (last registered first)
+    let err_arg = error_val.unwrap_or(TValue::nil());
+    for &slot in slots_to_close.iter().rev() {
+        let val = vm.stack[slot];
+        if val.is_nil() {
+            continue; // nil TBC values are allowed, just skip
+        }
+        // Look up __close metamethod
+        let mm_name = vm.mm_names.as_ref().unwrap().close;
+        if let Some(mm) = metamethod::get_metamethod(val, mm_name, &vm.gc) {
+            // Call __close(val, error_or_nil)
+            // Ignore errors during close when already in error path
+            let result = call_function(vm, mm, &[val, err_arg]);
+            if error_val.is_none() {
+                // Normal exit: propagate __close errors
+                result?;
+            }
+            // Error exit: suppress __close errors (Lua 5.4 semantics)
+        }
+    }
+    Ok(())
+}
+
+/// Close TBC variables during error unwinding.
+/// Iterates frames from the top of call_stack down to target_depth,
+/// closing TBC variables in each frame. Does NOT pop frames.
+fn unwind_tbc(vm: &mut Vm, target_depth: usize, error_val: Option<TValue>) {
+    let len = vm.call_stack.len();
+    for ci_idx in (target_depth..len).rev() {
+        let base = vm.call_stack[ci_idx].base;
+        // Close TBC variables in this frame (errors suppressed since we're in error path)
+        let _ = close_tbc_variables(vm, ci_idx, base, error_val);
+    }
+}
+
+/// Table index with __index metamethod support.
+/// Handles: tables (with fallback to __index), and non-table values with __index.
+fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, LuaError> {
+    if let Some(table_idx) = table_val.as_table_idx() {
+        // Raw get first
+        let result = vm.gc.get_table(table_idx).raw_get(key);
+        if !result.is_nil() {
+            return Ok(result);
+        }
+        // Check __index metamethod
+        let mm_name = vm.mm_names.as_ref().unwrap().index;
+        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
+            if mm.as_table_idx().is_some() {
+                // __index is a table: recurse
+                return table_index(vm, mm, key);
+            }
+            // __index is a function: call with (table, key)
+            let results = call_function(vm, mm, &[table_val, key])?;
+            Ok(results.first().copied().unwrap_or(TValue::nil()))
+        } else {
+            Ok(TValue::nil())
+        }
+    } else {
+        // Non-table: check for __index metamethod (unlikely but valid for userdata etc.)
+        Err(LuaError::Runtime(format!(
+            "attempt to index a {} value",
+            selune_core::object::lua_type_name(table_val, &vm.gc)
+        )))
+    }
+}
+
+/// Table newindex with __newindex metamethod support.
+fn table_newindex(vm: &mut Vm, table_val: TValue, key: TValue, val: TValue) -> Result<(), LuaError> {
+    if let Some(table_idx) = table_val.as_table_idx() {
+        // Check if key already exists (raw)
+        let existing = vm.gc.get_table(table_idx).raw_get(key);
+        if !existing.is_nil() {
+            // Key exists, just set it (no metamethod)
+            vm.gc
+                .get_table_mut(table_idx)
+                .raw_set(key, val)
+                .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+            return Ok(());
+        }
+        // Key doesn't exist: check __newindex metamethod
+        let mm_name = vm.mm_names.as_ref().unwrap().newindex;
+        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
+            if mm.as_table_idx().is_some() {
+                // __newindex is a table: recurse
+                return table_newindex(vm, mm, key, val);
+            }
+            // __newindex is a function: call with (table, key, value)
+            call_function(vm, mm, &[table_val, key, val])?;
+            Ok(())
+        } else {
+            // No __newindex: just raw set
+            vm.gc
+                .get_table_mut(table_idx)
+                .raw_set(key, val)
+                .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+            Ok(())
+        }
+    } else {
+        Err(LuaError::Runtime(format!(
+            "attempt to index a {} value",
+            selune_core::object::lua_type_name(table_val, &vm.gc)
+        )))
+    }
 }
 
 /// Return from a function call, placing results in the caller's frame.
@@ -1104,6 +1737,183 @@ fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
     }
 
     Ok(())
+}
+
+/// Map a NativeError to a LuaError.
+fn map_native_error(e: NativeError) -> LuaError {
+    match e {
+        NativeError::String(s) => LuaError::Runtime(s),
+        NativeError::Value(v) => LuaError::LuaValue(v),
+    }
+}
+
+/// Return the operation description for metamethod error messages.
+fn mm_op_description(mm_idx: u8) -> &'static str {
+    match mm_idx {
+        0..=6 => "arithmetic",  // add, sub, mul, mod, pow, div, idiv
+        7..=11 => "bitwise operation", // band, bor, bxor, shl, shr
+        12 => "concatenation",  // concat
+        _ => "arithmetic",
+    }
+}
+
+/// Call a Lua function (closure, native, or __call metamethod) with given args.
+/// This is used by metamethod dispatch, pcall, xpcall, and TFORCALL.
+pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    if let Some(closure_idx) = func.as_closure_idx() {
+        // Lua closure call
+        let closure = vm.gc.get_closure(closure_idx);
+        let child_proto_idx = closure.proto_idx;
+        let child_proto = &vm.protos[child_proto_idx];
+        let num_params = child_proto.num_params as usize;
+        let is_vararg = child_proto.is_vararg;
+        let max_stack = child_proto.max_stack_size as usize;
+
+        if vm.call_stack.len() >= vm.max_call_depth {
+            return Err(LuaError::StackOverflow);
+        }
+
+        // Place func and args above current stack_top
+        let func_pos = vm.stack_top;
+        let new_base = func_pos + 1;
+        let needed = new_base + args.len() + max_stack + num_params + 1;
+        vm.ensure_stack(0, needed);
+
+        vm.stack[func_pos] = func;
+        for (i, &arg) in args.iter().enumerate() {
+            vm.stack[new_base + i] = arg;
+        }
+
+        let saved_call_depth = vm.call_stack.len();
+        let entry_depth = saved_call_depth + 1;
+
+        if is_vararg {
+            let num_args = args.len();
+            let actual_base = new_base + num_args;
+            vm.ensure_stack(actual_base, max_stack + 1);
+
+            for i in 0..num_params.min(num_args) {
+                vm.stack[actual_base + i] = vm.stack[new_base + i];
+            }
+            for i in num_args..num_params {
+                vm.stack[actual_base + i] = TValue::nil();
+            }
+
+            let saved_top = vm.stack_top;
+            vm.stack_top = actual_base + max_stack;
+
+            let mut ci = CallInfo::new(actual_base, child_proto_idx);
+            ci.num_results = -1;
+            ci.closure_idx = Some(closure_idx);
+            ci.func_stack_idx = func_pos;
+            ci.vararg_base = Some(new_base);
+            vm.call_stack.push(ci);
+
+            let result = execute_from(vm, entry_depth);
+            if result.is_err() {
+                // Close TBC variables in all unwinding frames
+                let err_val = result.as_ref().err().map(|e| e.to_tvalue(&mut vm.strings));
+                unwind_tbc(vm, saved_call_depth, err_val);
+            }
+            vm.call_stack.truncate(saved_call_depth);
+            vm.stack_top = saved_top;
+            result
+        } else {
+            vm.ensure_stack(new_base, max_stack + 1);
+
+            for i in args.len()..num_params {
+                vm.stack[new_base + i] = TValue::nil();
+            }
+
+            let saved_top = vm.stack_top;
+            vm.stack_top = new_base + max_stack;
+
+            let mut ci = CallInfo::new(new_base, child_proto_idx);
+            ci.num_results = -1;
+            ci.closure_idx = Some(closure_idx);
+            ci.func_stack_idx = func_pos;
+            vm.call_stack.push(ci);
+
+            let result = execute_from(vm, entry_depth);
+            if result.is_err() {
+                // Close TBC variables in all unwinding frames
+                let err_val = result.as_ref().err().map(|e| e.to_tvalue(&mut vm.strings));
+                unwind_tbc(vm, saved_call_depth, err_val);
+            }
+            vm.call_stack.truncate(saved_call_depth);
+            vm.stack_top = saved_top;
+            result
+        }
+    } else if let Some(native_idx) = func.as_native_idx() {
+        // Check for pcall/xpcall special dispatch
+        let is_pcall = vm.pcall_idx == Some(native_idx);
+        let is_xpcall = vm.xpcall_idx == Some(native_idx);
+
+        if is_pcall {
+            let pcall_func = args.first().copied().unwrap_or(TValue::nil());
+            let pcall_args = if args.len() > 1 { &args[1..] } else { &[] };
+            match call_function(vm, pcall_func, pcall_args) {
+                Ok(results) => {
+                    let mut all = vec![TValue::from_bool(true)];
+                    all.extend(results);
+                    Ok(all)
+                }
+                Err(e) => {
+                    let err_val = e.to_tvalue(&mut vm.strings);
+                    Ok(vec![TValue::from_bool(false), err_val])
+                }
+            }
+        } else if is_xpcall {
+            let xpcall_func = args.first().copied().unwrap_or(TValue::nil());
+            let handler = args.get(1).copied().unwrap_or(TValue::nil());
+            let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
+            match call_function(vm, xpcall_func, xpcall_args) {
+                Ok(results) => {
+                    let mut all = vec![TValue::from_bool(true)];
+                    all.extend(results);
+                    Ok(all)
+                }
+                Err(e) => {
+                    let err_val = e.to_tvalue(&mut vm.strings);
+                    match call_function(vm, handler, &[err_val]) {
+                        Ok(handler_results) => {
+                            let mut all = vec![TValue::from_bool(false)];
+                            all.extend(handler_results);
+                            Ok(all)
+                        }
+                        Err(handler_err) => {
+                            let handler_err_val = handler_err.to_tvalue(&mut vm.strings);
+                            Ok(vec![TValue::from_bool(false), handler_err_val])
+                        }
+                    }
+                }
+            }
+        } else {
+            // Normal native function call
+            let native_fn = vm.gc.get_native(native_idx).func;
+            let args_vec = args.to_vec();
+            let mut ctx = NativeContext {
+                args: &args_vec,
+                gc: &mut vm.gc,
+                strings: &mut vm.strings,
+            };
+            native_fn(&mut ctx).map_err(map_native_error)
+        }
+    } else {
+        // Try __call metamethod
+        let mm_name = vm.mm_names.as_ref().unwrap().call;
+        if let Some(mm) = crate::metamethod::get_metamethod(func, mm_name, &vm.gc) {
+            // Prepend the original value as first arg
+            let mut new_args = vec![func];
+            new_args.extend_from_slice(args);
+            call_function(vm, mm, &new_args)
+        } else {
+            Err(LuaError::Runtime(format!(
+                "attempt to call a {} value",
+                selune_core::object::lua_type_name(func, &vm.gc)
+            )))
+        }
+    }
 }
 
 /// Convert a compile-time Constant to a runtime TValue.
