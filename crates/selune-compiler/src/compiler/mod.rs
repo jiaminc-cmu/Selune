@@ -758,9 +758,8 @@ impl<'a> Compiler<'a> {
                         let pc = *pc;
                         let inst = self.fs().proto.code[pc];
                         let a = inst.a();
-                        self.fs_mut().proto.code[pc] = Instruction::abc(
-                            inst.opcode(), a, inst.b(), remaining + 1, inst.k(),
-                        );
+                        self.fs_mut().proto.code[pc] =
+                            Instruction::abc(inst.opcode(), a, inst.b(), remaining + 1, inst.k());
                         // Move results to correct position if needed
                         if a != base_reg + count {
                             for i in 0..remaining {
@@ -773,7 +772,11 @@ impl<'a> Compiler<'a> {
                         // Patch vararg to return `remaining` results
                         let pc = *pc;
                         self.fs_mut().proto.code[pc] = Instruction::abc(
-                            OpCode::VarArg, base_reg + count, remaining + 1, 0, false,
+                            OpCode::VarArg,
+                            base_reg + count,
+                            remaining + 1,
+                            0,
+                            false,
                         );
                         return Ok(num_wanted);
                     }
@@ -868,7 +871,8 @@ impl<'a> Compiler<'a> {
                         // Check for binary operators
                         let expr = self.finish_expression(expr)?;
                         let eline = self.line();
-                        last_array_is_multi = matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
+                        last_array_is_multi =
+                            matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
                         let _val_reg = self.discharge_to_any_reg(&expr, eline);
                         array_count += 1;
                         total_array += 1;

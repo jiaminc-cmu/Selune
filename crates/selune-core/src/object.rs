@@ -35,9 +35,7 @@ pub fn lua_type_name(val: TValue, _heap: &GcHeap) -> &'static str {
         "nil"
     } else if val.is_bool() {
         "boolean"
-    } else if val.is_integer() {
-        "number"
-    } else if val.is_float() {
+    } else if val.is_integer() || val.is_float() {
         "number"
     } else if val.is_gc() {
         match val.gc_sub_tag() {

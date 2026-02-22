@@ -330,7 +330,10 @@ impl TValue {
     /// Returns true if this is any kind of function (closure or native).
     #[inline]
     pub fn is_function(&self) -> bool {
-        matches!(self.gc_sub_tag(), Some(GC_SUB_CLOSURE) | Some(GC_SUB_NATIVE))
+        matches!(
+            self.gc_sub_tag(),
+            Some(GC_SUB_CLOSURE) | Some(GC_SUB_NATIVE)
+        )
     }
 
     /// Create a TValue from a full i64, boxing if necessary.
@@ -360,7 +363,10 @@ impl TValue {
     /// Returns true if this is any kind of integer (inline or boxed).
     #[inline]
     pub fn is_any_integer(&self, gc: &GcHeap) -> bool {
-        self.is_integer() || (self.gc_sub_tag() == Some(GC_SUB_BOXED_INT) && gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData)) == gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData)))
+        self.is_integer()
+            || (self.gc_sub_tag() == Some(GC_SUB_BOXED_INT)
+                && gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData))
+                    == gc.get_boxed_int(GcIdx::<i64>(self.gc_index().unwrap(), PhantomData)))
     }
 
     /// Attempt to extract as number (f64). Integers convert to float.
@@ -368,10 +374,8 @@ impl TValue {
     pub fn as_number(&self, gc: &GcHeap) -> Option<f64> {
         if let Some(f) = self.as_float() {
             Some(f)
-        } else if let Some(i) = self.as_full_integer(gc) {
-            Some(i as f64)
         } else {
-            None
+            self.as_full_integer(gc).map(|i| i as f64)
         }
     }
 

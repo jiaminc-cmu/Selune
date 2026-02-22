@@ -13,24 +13,25 @@ use super::helpers::*;
 fn qa_integer_overflow_wrapping() {
     // i64::MAX = 9223372036854775807, this exceeds 47-bit inline so uses boxed int
     // Test that large integers round-trip correctly
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"local x = 9223372036854775807 return x + 0", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"local x = 9223372036854775807 return x + 0", "=test")
+            .unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
-    let val = results[0].as_full_integer(&vm.gc)
+    let val = results[0]
+        .as_full_integer(&vm.gc)
         .unwrap_or_else(|| panic!("expected integer, got {:?}", results[0]));
     assert_eq!(val, i64::MAX);
 }
 
 #[test]
 fn qa_integer_min_value() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return -9223372036854775807 - 1", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return -9223372036854775807 - 1", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
-    let val = results[0].as_full_integer(&vm.gc)
+    let val = results[0]
+        .as_full_integer(&vm.gc)
         .unwrap_or_else(|| panic!("expected integer, got {:?}", results[0]));
     assert_eq!(val, i64::MIN);
 }
@@ -39,14 +40,20 @@ fn qa_integer_min_value() {
 fn qa_float_division_zero() {
     let results = run_lua("return 1.0 / 0.0");
     let val = results[0].as_float().expect("expected float");
-    assert!(val.is_infinite() && val.is_sign_positive(), "expected +inf, got {val}");
+    assert!(
+        val.is_infinite() && val.is_sign_positive(),
+        "expected +inf, got {val}"
+    );
 }
 
 #[test]
 fn qa_float_neg_division_zero() {
     let results = run_lua("return -1.0 / 0.0");
     let val = results[0].as_float().expect("expected float");
-    assert!(val.is_infinite() && val.is_sign_negative(), "expected -inf, got {val}");
+    assert!(
+        val.is_infinite() && val.is_sign_negative(),
+        "expected -inf, got {val}"
+    );
 }
 
 #[test]
@@ -103,12 +110,11 @@ fn qa_bitwise_xor_basic() {
 #[test]
 fn qa_shift_left_large() {
     // 1 << 63 = i64::MIN (0x8000...0) — boxed int since > 47 bits
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return 1 << 63", "=test",
-    ).unwrap();
+    let (proto, strings) = selune_compiler::compiler::compile(b"return 1 << 63", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
-    let val = results[0].as_full_integer(&vm.gc)
+    let val = results[0]
+        .as_full_integer(&vm.gc)
         .unwrap_or_else(|| panic!("expected integer, got {:?}", results[0]));
     assert_eq!(val, i64::MIN);
 }
@@ -130,8 +136,8 @@ fn qa_bnot_minus_one() {
 
 #[test]
 fn qa_unary_minus_float() {
-    let results = run_lua("return -(3.14)");
-    assert_float(&results, 0, -3.14);
+    let results = run_lua("return -(3.15)");
+    assert_float(&results, 0, -3.15);
 }
 
 #[test]
@@ -229,9 +235,8 @@ fn qa_le_strings() {
 
 #[test]
 fn qa_concat_int_string() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return 42 .. \" hello\"", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return 42 .. \" hello\"", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "42 hello", &vm);
@@ -239,9 +244,8 @@ fn qa_concat_int_string() {
 
 #[test]
 fn qa_concat_float_string() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return 3.14 .. \"!\"", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return 3.14 .. \"!\"", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "3.14!", &vm);
@@ -250,8 +254,10 @@ fn qa_concat_float_string() {
 #[test]
 fn qa_concat_many() {
     let (proto, strings) = selune_compiler::compiler::compile(
-        b"return \"a\" .. \"b\" .. \"c\" .. \"d\" .. \"e\"", "=test",
-    ).unwrap();
+        b"return \"a\" .. \"b\" .. \"c\" .. \"d\" .. \"e\"",
+        "=test",
+    )
+    .unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "abcde", &vm);
@@ -380,18 +386,12 @@ fn qa_table_nil_index_returns_nil() {
 #[test]
 fn qa_if_zero_is_truthy() {
     // In Lua, 0 is truthy
-    run_check_ints(
-        "if 0 then return 1 else return 0 end",
-        &[1],
-    );
+    run_check_ints("if 0 then return 1 else return 0 end", &[1]);
 }
 
 #[test]
 fn qa_if_empty_string_is_truthy() {
-    run_check_ints(
-        "if \"\" then return 1 else return 0 end",
-        &[1],
-    );
+    run_check_ints("if \"\" then return 1 else return 0 end", &[1]);
 }
 
 #[test]
@@ -464,7 +464,10 @@ fn qa_for_loop_float() {
 #[test]
 fn qa_for_step_zero_error() {
     let err = run_lua_err("for i = 1, 10, 0 do end");
-    assert!(err.contains("step is zero"), "expected step zero error, got: {err}");
+    assert!(
+        err.contains("step is zero"),
+        "expected step zero error, got: {err}"
+    );
 }
 
 #[test]
@@ -636,10 +639,7 @@ fn qa_function_returns_function() {
 
 #[test]
 fn qa_immediate_call() {
-    run_check_ints(
-        "return (function() return 42 end)()",
-        &[42],
-    );
+    run_check_ints("return (function() return 42 end)()", &[42]);
 }
 
 // ---------------------------------------------------------------------------
@@ -734,15 +734,21 @@ fn qa_error_call_nil() {
 #[test]
 fn qa_error_idiv_zero() {
     let err = run_lua_err("return 1 // 0");
-    assert!(err.contains("//") || err.contains("divide") || err.contains("attempt to perform"),
-        "got: {err}");
+    assert!(
+        err.contains("//") || err.contains("divide") || err.contains("attempt to perform"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn qa_error_mod_zero() {
     let err = run_lua_err("return 1 % 0");
-    assert!(err.contains("modulo") || err.contains("divide by zero") || err.contains("attempt to perform"),
-        "got: {err}");
+    assert!(
+        err.contains("modulo")
+            || err.contains("divide by zero")
+            || err.contains("attempt to perform"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -760,29 +766,37 @@ fn qa_error_len_nil() {
 #[test]
 fn qa_error_concat_nil() {
     let err = run_lua_err("return \"hello\" .. nil");
-    assert!(err.contains("attempt to concatenate") || err.contains("concat"),
-        "got: {err}");
+    assert!(
+        err.contains("attempt to concatenate") || err.contains("concat"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn qa_error_concat_bool() {
     let err = run_lua_err("return \"hello\" .. true");
-    assert!(err.contains("attempt to concatenate") || err.contains("concat"),
-        "got: {err}");
+    assert!(
+        err.contains("attempt to concatenate") || err.contains("concat"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn qa_error_concat_table() {
     let err = run_lua_err("return \"hello\" .. {}");
-    assert!(err.contains("attempt to concatenate") || err.contains("concat"),
-        "got: {err}");
+    assert!(
+        err.contains("attempt to concatenate") || err.contains("concat"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn qa_error_bitwise_float() {
     let err = run_lua_err("return 1.5 & 2");
-    assert!(err.contains("attempt to perform bitwise") || err.contains("integer"),
-        "got: {err}");
+    assert!(
+        err.contains("attempt to perform bitwise") || err.contains("integer"),
+        "got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,9 +1031,7 @@ fn qa_goto_backward_loop() {
 
 #[test]
 fn qa_type_of_table() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type({})", "=test",
-    ).unwrap();
+    let (proto, strings) = selune_compiler::compiler::compile(b"return type({})", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "table", &vm);
@@ -1027,8 +1039,8 @@ fn qa_type_of_table() {
 
 #[test]
 fn qa_tonumber_float_string() {
-    let results = run_lua("return tonumber(\"3.14\")");
-    assert_float(&results, 0, 3.14);
+    let results = run_lua("return tonumber(\"3.15\")");
+    assert_float(&results, 0, 3.15);
 }
 
 #[test]

@@ -168,7 +168,11 @@ pub fn arith_unm(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Result
 }
 
 /// Bitwise NOT.
-pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Result<TValue, LuaError> {
+pub fn arith_bnot(
+    v: TValue,
+    gc: &mut GcHeap,
+    strings: &StringInterner,
+) -> Result<TValue, LuaError> {
     if let Some(i) = v.as_full_integer(gc) {
         Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
@@ -183,11 +187,8 @@ pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Resul
 
 /// String length (for # operator on strings).
 pub fn str_len(v: TValue, strings: &StringInterner) -> Option<i64> {
-    if let Some(sid) = v.as_string_id() {
-        Some(strings.get_bytes(sid).len() as i64)
-    } else {
-        None
-    }
+    v.as_string_id()
+        .map(|sid| strings.get_bytes(sid).len() as i64)
 }
 
 /// Concatenate a slice of TValues into a single string.

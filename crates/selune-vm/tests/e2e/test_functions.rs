@@ -212,9 +212,8 @@ fn test_call_discard_results() {
 
 #[test]
 fn test_type_nil() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type(nil)", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return type(nil)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "nil", &vm);
@@ -222,9 +221,7 @@ fn test_type_nil() {
 
 #[test]
 fn test_type_number() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type(42)", "=test",
-    ).unwrap();
+    let (proto, strings) = selune_compiler::compiler::compile(b"return type(42)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "number", &vm);
@@ -232,9 +229,8 @@ fn test_type_number() {
 
 #[test]
 fn test_type_string() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type(\"hello\")", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return type(\"hello\")", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "string", &vm);
@@ -242,9 +238,8 @@ fn test_type_string() {
 
 #[test]
 fn test_type_boolean() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type(true)", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return type(true)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "boolean", &vm);
@@ -252,9 +247,7 @@ fn test_type_boolean() {
 
 #[test]
 fn test_type_table() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type({})", "=test",
-    ).unwrap();
+    let (proto, strings) = selune_compiler::compiler::compile(b"return type({})", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "table", &vm);
@@ -262,9 +255,8 @@ fn test_type_table() {
 
 #[test]
 fn test_type_function() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return type(type)", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return type(type)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "function", &vm);
@@ -272,18 +264,12 @@ fn test_type_function() {
 
 #[test]
 fn test_tonumber_int() {
-    run_check_ints(
-        "return tonumber(42)",
-        &[42],
-    );
+    run_check_ints("return tonumber(42)", &[42]);
 }
 
 #[test]
 fn test_tonumber_string() {
-    run_check_ints(
-        "return tonumber(\"123\")",
-        &[123],
-    );
+    run_check_ints("return tonumber(\"123\")", &[123]);
 }
 
 #[test]
@@ -294,9 +280,8 @@ fn test_tonumber_nil() {
 
 #[test]
 fn test_tostring_int() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return tostring(42)", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return tostring(42)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "42", &vm);
@@ -304,9 +289,8 @@ fn test_tostring_int() {
 
 #[test]
 fn test_tostring_bool() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return tostring(true)", "=test",
-    ).unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return tostring(true)", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_str(&results, 0, "true", &vm);
@@ -321,5 +305,8 @@ fn test_stack_overflow() {
         "local function f() return f() + 0 end
          return f()",
     );
-    assert!(err.contains("stack overflow"), "expected stack overflow, got: {err}");
+    assert!(
+        err.contains("stack overflow"),
+        "expected stack overflow, got: {err}"
+    );
 }

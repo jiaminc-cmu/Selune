@@ -111,8 +111,13 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             }
 
             // ---- Arithmetic (register-register) ----
-            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Mod | OpCode::Pow |
-            OpCode::Div | OpCode::IDiv => {
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Mod
+            | OpCode::Pow
+            | OpCode::Div
+            | OpCode::IDiv => {
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
                 let vb = vm.stack[base + b];
@@ -144,8 +149,13 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             }
 
             // ---- Arithmetic (register + constant) ----
-            OpCode::AddK | OpCode::SubK | OpCode::MulK | OpCode::ModK | OpCode::PowK |
-            OpCode::DivK | OpCode::IDivK => {
+            OpCode::AddK
+            | OpCode::SubK
+            | OpCode::MulK
+            | OpCode::ModK
+            | OpCode::PowK
+            | OpCode::DivK
+            | OpCode::IDivK => {
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
                 let vb = vm.stack[base + b];
@@ -182,21 +192,24 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] = arith::arith_op(ArithOp::Add, vb, imm, &mut vm.gc, &vm.strings)?;
+                vm.stack[base + a] =
+                    arith::arith_op(ArithOp::Add, vb, imm, &mut vm.gc, &vm.strings)?;
             }
             OpCode::ShrI => {
                 let b = inst.b() as usize;
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] = arith::bitwise_op(ArithOp::Shr, vb, imm, &mut vm.gc, &vm.strings)?;
+                vm.stack[base + a] =
+                    arith::bitwise_op(ArithOp::Shr, vb, imm, &mut vm.gc, &vm.strings)?;
             }
             OpCode::ShlI => {
                 let b = inst.b() as usize;
                 let sc = inst.c() as i8 as i64;
                 let vb = vm.stack[base + b];
                 let imm = TValue::from_full_integer(sc, &mut vm.gc);
-                vm.stack[base + a] = arith::bitwise_op(ArithOp::Shl, vb, imm, &mut vm.gc, &vm.strings)?;
+                vm.stack[base + a] =
+                    arith::bitwise_op(ArithOp::Shl, vb, imm, &mut vm.gc, &vm.strings)?;
             }
 
             // ---- Unary ----
@@ -251,7 +264,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
                 let eq = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
-                if eq != k { vm.call_stack[ci_idx].pc += 1; }
+                if eq != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::Lt => {
                 let b = inst.b() as usize;
@@ -259,7 +274,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
                 let lt = compare::lua_lt(va, vb, &vm.gc, &vm.strings)?;
-                if lt != k { vm.call_stack[ci_idx].pc += 1; }
+                if lt != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::Le => {
                 let b = inst.b() as usize;
@@ -267,7 +284,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let vb = vm.stack[base + b];
                 let le = compare::lua_le(va, vb, &vm.gc, &vm.strings)?;
-                if le != k { vm.call_stack[ci_idx].pc += 1; }
+                if le != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::EqK => {
                 let b = inst.b() as usize;
@@ -276,7 +295,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let proto = proto!(vm, ci_idx);
                 let vb = constant_to_tvalue(&proto.constants[b], &mut vm.gc);
                 let eq = compare::lua_eq(va, vb, &vm.gc, &vm.strings);
-                if eq != k { vm.call_stack[ci_idx].pc += 1; }
+                if eq != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::EqI => {
                 let sb = inst.b() as i8 as i64;
@@ -284,7 +305,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
                 let eq = compare::lua_eq(va, imm, &vm.gc, &vm.strings);
-                if eq != k { vm.call_stack[ci_idx].pc += 1; }
+                if eq != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::LtI => {
                 let sb = inst.b() as i8 as i64;
@@ -292,7 +315,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
                 let lt = compare::lua_lt(va, imm, &vm.gc, &vm.strings)?;
-                if lt != k { vm.call_stack[ci_idx].pc += 1; }
+                if lt != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::LeI => {
                 let sb = inst.b() as i8 as i64;
@@ -300,7 +325,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
                 let le = compare::lua_le(va, imm, &vm.gc, &vm.strings)?;
-                if le != k { vm.call_stack[ci_idx].pc += 1; }
+                if le != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::GtI => {
                 let sb = inst.b() as i8 as i64;
@@ -308,7 +335,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
                 let gt = compare::lua_lt(imm, va, &vm.gc, &vm.strings)?;
-                if gt != k { vm.call_stack[ci_idx].pc += 1; }
+                if gt != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::GeI => {
                 let sb = inst.b() as i8 as i64;
@@ -316,7 +345,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let va = vm.stack[base + a];
                 let imm = TValue::from_full_integer(sb, &mut vm.gc);
                 let ge = compare::lua_le(imm, va, &vm.gc, &vm.strings)?;
-                if ge != k { vm.call_stack[ci_idx].pc += 1; }
+                if ge != k {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
             }
             OpCode::Test => {
                 let k = inst.k();
@@ -360,19 +391,28 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + a + 1] = TValue::from_full_integer(i_limit, &mut vm.gc);
                     vm.stack[base + a + 2] = TValue::from_full_integer(i_step, &mut vm.gc);
                     vm.stack[base + a + 3] = TValue::from_full_integer(i_init, &mut vm.gc);
-                    let should_enter = if i_step > 0 { i_init <= i_limit } else { i_init >= i_limit };
+                    let should_enter = if i_step > 0 {
+                        i_init <= i_limit
+                    } else {
+                        i_init >= i_limit
+                    };
                     if !should_enter {
                         let sbx = inst.sbx();
-                        vm.call_stack[ci_idx].pc = (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                        vm.call_stack[ci_idx].pc =
+                            (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
                         vm.call_stack[ci_idx].pc += 1;
                     }
                 } else {
-                    let f_init = coerce::to_number(init, &vm.gc, &vm.strings)
-                        .ok_or_else(|| LuaError::Runtime("'for' initial value must be a number".to_string()))?;
-                    let f_limit = coerce::to_number(limit, &vm.gc, &vm.strings)
-                        .ok_or_else(|| LuaError::Runtime("'for' limit must be a number".to_string()))?;
-                    let f_step = coerce::to_number(step, &vm.gc, &vm.strings)
-                        .ok_or_else(|| LuaError::Runtime("'for' step must be a number".to_string()))?;
+                    let f_init = coerce::to_number(init, &vm.gc, &vm.strings).ok_or_else(|| {
+                        LuaError::Runtime("'for' initial value must be a number".to_string())
+                    })?;
+                    let f_limit =
+                        coerce::to_number(limit, &vm.gc, &vm.strings).ok_or_else(|| {
+                            LuaError::Runtime("'for' limit must be a number".to_string())
+                        })?;
+                    let f_step = coerce::to_number(step, &vm.gc, &vm.strings).ok_or_else(|| {
+                        LuaError::Runtime("'for' step must be a number".to_string())
+                    })?;
                     if f_step == 0.0 {
                         return Err(LuaError::Runtime("'for' step is zero".to_string()));
                     }
@@ -380,10 +420,15 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + a + 1] = TValue::from_float(f_limit);
                     vm.stack[base + a + 2] = TValue::from_float(f_step);
                     vm.stack[base + a + 3] = TValue::from_float(f_init);
-                    let should_enter = if f_step > 0.0 { f_init <= f_limit } else { f_init >= f_limit };
+                    let should_enter = if f_step > 0.0 {
+                        f_init <= f_limit
+                    } else {
+                        f_init >= f_limit
+                    };
                     if !should_enter {
                         let sbx = inst.sbx();
-                        vm.call_stack[ci_idx].pc = (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                        vm.call_stack[ci_idx].pc =
+                            (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
                         vm.call_stack[ci_idx].pc += 1;
                     }
                 }
@@ -400,28 +445,38 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     step.as_full_integer(&vm.gc),
                 ) {
                     let next = i_counter.wrapping_add(i_step);
-                    let continue_loop = if i_step > 0 { next <= i_limit } else { next >= i_limit };
+                    let continue_loop = if i_step > 0 {
+                        next <= i_limit
+                    } else {
+                        next >= i_limit
+                    };
                     if continue_loop {
                         // Close upvalues for the loop variable before updating
                         vm.close_upvalues(base + a + 3);
                         vm.stack[base + a] = TValue::from_full_integer(next, &mut vm.gc);
                         vm.stack[base + a + 3] = TValue::from_full_integer(next, &mut vm.gc);
                         let sbx = inst.sbx();
-                        vm.call_stack[ci_idx].pc = (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                        vm.call_stack[ci_idx].pc =
+                            (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
                     }
                 } else {
                     let f_counter = counter.as_float().unwrap();
                     let f_limit = limit.as_float().unwrap();
                     let f_step = step.as_float().unwrap();
                     let next = f_counter + f_step;
-                    let continue_loop = if f_step > 0.0 { next <= f_limit } else { next >= f_limit };
+                    let continue_loop = if f_step > 0.0 {
+                        next <= f_limit
+                    } else {
+                        next >= f_limit
+                    };
                     if continue_loop {
                         // Close upvalues for the loop variable before updating
                         vm.close_upvalues(base + a + 3);
                         vm.stack[base + a] = TValue::from_float(next);
                         vm.stack[base + a + 3] = TValue::from_float(next);
                         let sbx = inst.sbx();
-                        vm.call_stack[ci_idx].pc = (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                        vm.call_stack[ci_idx].pc =
+                            (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
                     }
                 }
             }
@@ -498,7 +553,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                             let uv_idx = parent_closure.upvalues[desc.index as usize];
                             upvals.push(uv_idx);
                         } else {
-                            return Err(LuaError::Runtime("cannot capture upvalue from non-closure".to_string()));
+                            return Err(LuaError::Runtime(
+                                "cannot capture upvalue from non-closure".to_string(),
+                            ));
                         }
                     }
                 }
@@ -537,7 +594,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
                     if is_vararg {
                         // Move fixed params to the right, store varargs
-                        let _vararg_count = if num_args > num_params { num_args - num_params } else { 0 };
+                        let _vararg_count = num_args.saturating_sub(num_params);
                         let actual_base = new_base + num_args; // after all args
 
                         vm.ensure_stack(actual_base, max_stack + 1);
@@ -577,9 +634,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     }
                 } else if let Some(native_idx) = func_val.as_native_idx() {
                     // Native function call
-                    let args: Vec<TValue> = (0..num_args)
-                        .map(|i| vm.stack[base + a + 1 + i])
-                        .collect();
+                    let args: Vec<TValue> =
+                        (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                     let native_fn = vm.gc.get_native(native_idx).func;
                     let mut ctx = NativeContext {
@@ -587,8 +643,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         gc: &mut vm.gc,
                         strings: &mut vm.strings,
                     };
-                    let results = native_fn(&mut ctx)
-                        .map_err(|e| LuaError::Runtime(e))?;
+                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
 
                     // Place results
                     let result_base = base + a;
@@ -682,9 +737,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     }
                 } else if let Some(native_idx) = func_val.as_native_idx() {
                     // Tail call to native: just call it normally and return
-                    let args: Vec<TValue> = (0..num_args)
-                        .map(|i| vm.stack[base + a + 1 + i])
-                        .collect();
+                    let args: Vec<TValue> =
+                        (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                     let native_fn = vm.gc.get_native(native_idx).func;
                     let mut ctx = NativeContext {
@@ -692,8 +746,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                         gc: &mut vm.gc,
                         strings: &mut vm.strings,
                     };
-                    let results = native_fn(&mut ctx)
-                        .map_err(|e| LuaError::Runtime(e))?;
+                    let results = native_fn(&mut ctx).map_err(LuaError::Runtime)?;
 
                     vm.close_upvalues(base);
                     if vm.call_stack.len() <= 1 {
@@ -716,16 +769,8 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     let num_params = proto!(vm, ci_idx).num_params as usize;
                     // Varargs start after fixed params in the original arg area
                     let vararg_start = vararg_base + num_params;
-                    let vararg_count = if ci.base > vararg_start {
-                        ci.base - vararg_start
-                    } else {
-                        0
-                    };
-                    let wanted = if c == 0 {
-                        vararg_count
-                    } else {
-                        c - 1
-                    };
+                    let vararg_count = ci.base.saturating_sub(vararg_start);
+                    let wanted = if c == 0 { vararg_count } else { c - 1 };
 
                     vm.ensure_stack(base + a, wanted + 1);
 
@@ -785,7 +830,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             OpCode::NewTable => {
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
-                if inst.k() { vm.call_stack[ci_idx].pc += 1; }
+                if inst.k() {
+                    vm.call_stack[ci_idx].pc += 1;
+                }
                 let table_idx = vm.gc.alloc_table(b, c);
                 vm.stack[base + a] = TValue::from_table(table_idx);
             }
@@ -796,8 +843,10 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let table_val = vm.stack[base + b];
                 let key = vm.stack[base + c];
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get(key);
             }
@@ -807,8 +856,10 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let c = inst.c() as i64;
                 let table_val = vm.stack[base + b];
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 vm.stack[base + a] = vm.gc.get_table(table_idx).raw_geti(c);
             }
@@ -818,13 +869,19 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let c = inst.c() as usize;
                 let table_val = vm.stack[base + b];
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 let key_k = get_k(vm, ci_idx, c);
                 let key_sid = match key_k {
                     Constant::String(sid) => sid,
-                    _ => return Err(LuaError::Runtime("GetField: non-string constant".to_string())),
+                    _ => {
+                        return Err(LuaError::Runtime(
+                            "GetField: non-string constant".to_string(),
+                        ))
+                    }
                 };
                 vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(key_sid);
             }
@@ -841,10 +898,15 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + c]
                 };
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
-                vm.gc.get_table_mut(table_idx).raw_set(key, val).map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+                vm.gc
+                    .get_table_mut(table_idx)
+                    .raw_set(key, val)
+                    .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
             }
 
             OpCode::SetI => {
@@ -858,8 +920,10 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + c]
                 };
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 vm.gc.get_table_mut(table_idx).raw_seti(b, val);
             }
@@ -871,7 +935,11 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let proto = proto!(vm, ci_idx);
                 let key_sid = match &proto.constants[b] {
                     Constant::String(sid) => *sid,
-                    _ => return Err(LuaError::Runtime("SetField: non-string constant".to_string())),
+                    _ => {
+                        return Err(LuaError::Runtime(
+                            "SetField: non-string constant".to_string(),
+                        ))
+                    }
                 };
                 let val = if inst.k() {
                     constant_to_tvalue(&proto.constants[c], &mut vm.gc)
@@ -879,8 +947,10 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + c]
                 };
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 vm.gc.get_table_mut(table_idx).raw_set_str(key_sid, val);
             }
@@ -889,9 +959,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
                 // Get upvalue[B] which should be a table, then index by K[C]
-                let closure_idx = vm.call_stack[ci_idx].closure_idx.ok_or_else(|| {
-                    LuaError::Runtime("GetTabUp: no closure".to_string())
-                })?;
+                let closure_idx = vm.call_stack[ci_idx]
+                    .closure_idx
+                    .ok_or_else(|| LuaError::Runtime("GetTabUp: no closure".to_string()))?;
                 let uv_idx = vm.gc.get_closure(closure_idx).upvalues[b];
                 let upval = vm.get_upval_value(uv_idx);
                 let table_idx = upval.as_table_idx().ok_or_else(|| {
@@ -900,7 +970,11 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let key_k = get_k(vm, ci_idx, c);
                 let key_sid = match key_k {
                     Constant::String(sid) => sid,
-                    _ => return Err(LuaError::Runtime("GetTabUp: non-string constant".to_string())),
+                    _ => {
+                        return Err(LuaError::Runtime(
+                            "GetTabUp: non-string constant".to_string(),
+                        ))
+                    }
                 };
                 vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(key_sid);
             }
@@ -908,9 +982,9 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             OpCode::SetTabUp => {
                 let b = inst.b() as usize;
                 let c = inst.c() as usize;
-                let closure_idx = vm.call_stack[ci_idx].closure_idx.ok_or_else(|| {
-                    LuaError::Runtime("SetTabUp: no closure".to_string())
-                })?;
+                let closure_idx = vm.call_stack[ci_idx]
+                    .closure_idx
+                    .ok_or_else(|| LuaError::Runtime("SetTabUp: no closure".to_string()))?;
                 let uv_idx = vm.gc.get_closure(closure_idx).upvalues[a];
                 let upval = vm.get_upval_value(uv_idx);
                 let table_idx = upval.as_table_idx().ok_or_else(|| {
@@ -919,7 +993,11 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                 let proto = proto!(vm, ci_idx);
                 let key_sid = match &proto.constants[b] {
                     Constant::String(sid) => *sid,
-                    _ => return Err(LuaError::Runtime("SetTabUp: non-string constant".to_string())),
+                    _ => {
+                        return Err(LuaError::Runtime(
+                            "SetTabUp: non-string constant".to_string(),
+                        ))
+                    }
                 };
                 let val = if inst.k() {
                     constant_to_tvalue(&proto.constants[c], &mut vm.gc)
@@ -939,14 +1017,20 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     c += next_inst.ax_field() as usize * 256;
                 }
                 let table_val = vm.stack[base + a];
-                let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime("SetList: not a table".to_string())
-                })?;
-                let count = if b == 0 { vm.stack_top - (base + a + 1) } else { b };
+                let table_idx = table_val
+                    .as_table_idx()
+                    .ok_or_else(|| LuaError::Runtime("SetList: not a table".to_string()))?;
+                let count = if b == 0 {
+                    vm.stack_top - (base + a + 1)
+                } else {
+                    b
+                };
                 let offset = (c - 1) * 50;
                 for i in 1..=count {
                     let val = vm.stack[base + a + i];
-                    vm.gc.get_table_mut(table_idx).raw_seti((offset + i) as i64, val);
+                    vm.gc
+                        .get_table_mut(table_idx)
+                        .raw_seti((offset + i) as i64, val);
                 }
             }
 
@@ -962,8 +1046,10 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
                     vm.stack[base + c]
                 };
                 let table_idx = table_val.as_table_idx().ok_or_else(|| {
-                    LuaError::Runtime(format!("attempt to index a {} value",
-                        selune_core::object::lua_type_name(table_val, &vm.gc)))
+                    LuaError::Runtime(format!(
+                        "attempt to index a {} value",
+                        selune_core::object::lua_type_name(table_val, &vm.gc)
+                    ))
                 })?;
                 if let Some(sid) = key.as_string_id() {
                     vm.stack[base + a] = vm.gc.get_table(table_idx).raw_get_str(sid);
@@ -975,9 +1061,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
             OpCode::ExtraArg => {}
 
             _ => {
-                return Err(LuaError::Runtime(format!(
-                    "unimplemented opcode: {:?}", op
-                )));
+                return Err(LuaError::Runtime(format!("unimplemented opcode: {:?}", op)));
             }
         }
     }
@@ -985,7 +1069,7 @@ pub fn execute(vm: &mut Vm, _start_proto_idx: usize) -> Result<Vec<TValue>, LuaE
 
 /// Get the proto for the current call frame.
 #[allow(dead_code)]
-fn get_proto<'a>(vm: &'a Vm, ci_idx: usize) -> &'a Proto {
+fn get_proto(vm: &Vm, ci_idx: usize) -> &Proto {
     &vm.protos[vm.call_stack[ci_idx].proto_idx]
 }
 

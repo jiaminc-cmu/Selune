@@ -60,10 +60,7 @@ fn test_while_false() {
 
 #[test]
 fn test_repeat_until() {
-    run_check_ints(
-        "local x = 1; repeat x = x + 1 until x >= 5; return x",
-        &[5],
-    );
+    run_check_ints("local x = 1; repeat x = x + 1 until x >= 5; return x", &[5]);
 }
 
 #[test]
@@ -161,7 +158,10 @@ fn test_or_first_truthy() {
 #[test]
 fn test_and_or_idiom() {
     // Lua ternary: (cond and a or b)
-    run_check_ints("local x = 10; if (x > 5 and true or false) then return 1 else return 0 end", &[1]);
+    run_check_ints(
+        "local x = 10; if (x > 5 and true or false) then return 1 else return 0 end",
+        &[1],
+    );
 }
 
 #[test]

@@ -66,7 +66,10 @@ pub fn assert_str(results: &[TValue], idx: usize, expected: &str, vm: &Vm) {
         .as_string_id()
         .unwrap_or_else(|| panic!("result[{idx}] = {:?}, expected string \"{expected}\"", val));
     let got = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap();
-    assert_eq!(got, expected, "result[{idx}] = \"{got}\", expected \"{expected}\"");
+    assert_eq!(
+        got, expected,
+        "result[{idx}] = \"{got}\", expected \"{expected}\""
+    );
 }
 
 /// Run Lua source and check results against expected integer values.

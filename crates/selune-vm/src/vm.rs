@@ -117,25 +117,33 @@ impl Vm {
         let print_idx = self.gc.alloc_native(native_print, "print");
         let print_val = TValue::from_native(print_idx);
         let print_name = self.strings.intern(b"print");
-        self.gc.get_table_mut(env_idx).raw_set_str(print_name, print_val);
+        self.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(print_name, print_val);
 
         // type
         let type_idx = self.gc.alloc_native(native_type, "type");
         let type_val = TValue::from_native(type_idx);
         let type_name = self.strings.intern(b"type");
-        self.gc.get_table_mut(env_idx).raw_set_str(type_name, type_val);
+        self.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(type_name, type_val);
 
         // tostring
         let tostring_idx = self.gc.alloc_native(native_tostring, "tostring");
         let tostring_val = TValue::from_native(tostring_idx);
         let tostring_name = self.strings.intern(b"tostring");
-        self.gc.get_table_mut(env_idx).raw_set_str(tostring_name, tostring_val);
+        self.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(tostring_name, tostring_val);
 
         // tonumber
         let tonumber_idx = self.gc.alloc_native(native_tonumber, "tonumber");
         let tonumber_val = TValue::from_native(tonumber_idx);
         let tonumber_name = self.strings.intern(b"tonumber");
-        self.gc.get_table_mut(env_idx).raw_set_str(tonumber_name, tonumber_val);
+        self.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(tonumber_name, tonumber_val);
     }
 
     /// Get an upvalue's current value.
@@ -257,7 +265,11 @@ pub fn format_value(
     if val.is_nil() {
         "nil".to_string()
     } else if let Some(b) = val.as_bool() {
-        if b { "true".to_string() } else { "false".to_string() }
+        if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
     } else if let Some(i) = val.as_full_integer(gc) {
         format!("{}", i)
     } else if let Some(f) = val.as_float() {
@@ -267,9 +279,7 @@ pub fn format_value(
         String::from_utf8_lossy(bytes).into_owned()
     } else if val.is_table() {
         format!("table: 0x{:x}", val.gc_index().unwrap_or(0))
-    } else if val.as_closure_idx().is_some() {
-        format!("function: 0x{:x}", val.gc_index().unwrap_or(0))
-    } else if val.as_native_idx().is_some() {
+    } else if val.as_closure_idx().is_some() || val.as_native_idx().is_some() {
         format!("function: 0x{:x}", val.gc_index().unwrap_or(0))
     } else {
         format!("{:?}", val)
