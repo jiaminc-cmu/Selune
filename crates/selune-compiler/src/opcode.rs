@@ -7,8 +7,8 @@
 /// - For iABC format:
 ///   - Bits 16-23: B (8 bits)
 ///   - Bits 24-31: C (8 bits)
-///   Note: In PUC Lua 5.4, C is bits 16-24, B is bits 25-32, but
-///   for simplicity we use the layout: opcode(7) | k(1) | A(8) | B(8) | C(8)
+///     Note: In PUC Lua 5.4, C is bits 16-24, B is bits 25-32, but
+///     for simplicity we use the layout: opcode(7) | k(1) | A(8) | B(8) | C(8)
 /// - For iABx: Bx = bits 16-31 (unsigned 16 bits)
 /// - For iAsBx: sBx = Bx - offset (signed interpretation)
 /// - For iAx: Ax = bits 8-31 (24 bits, unsigned)
@@ -147,7 +147,7 @@ impl OpCode {
     pub fn from_u8(val: u8) -> Option<OpCode> {
         if (val as usize) < Self::COUNT {
             // Safety: OpCode is repr(u8) and we've verified the range
-            Some(unsafe { std::mem::transmute(val) })
+            Some(unsafe { std::mem::transmute::<u8, OpCode>(val) })
         } else {
             None
         }
@@ -309,7 +309,7 @@ impl Instruction {
     /// Create an iAsBx instruction (signed Bx).
     pub fn asbx(op: OpCode, a: u8, sbx: i32) -> Self {
         debug_assert!(
-            sbx >= MIN_SBX && sbx <= MAX_SBX,
+            (MIN_SBX..=MAX_SBX).contains(&sbx),
             "sBx out of range: {sbx}"
         );
         let bx = (sbx + OFFSET_SBX) as u32;
@@ -326,10 +326,7 @@ impl Instruction {
 
     /// Create an isJ instruction (signed jump).
     pub fn sj(op: OpCode, sj: i32) -> Self {
-        debug_assert!(
-            sj >= MIN_SJ && sj <= MAX_SJ,
-            "sJ out of range: {sj}"
-        );
+        debug_assert!((MIN_SJ..=MAX_SJ).contains(&sj), "sJ out of range: {sj}");
         let val = (sj + OFFSET_SJ) as u32;
         let mut i = (op as u32) << POS_OP;
         i |= val << POS_A;
@@ -394,14 +391,14 @@ impl Instruction {
 
     /// Set field sBx.
     pub fn set_sbx(&mut self, sbx: i32) {
-        debug_assert!(sbx >= MIN_SBX && sbx <= MAX_SBX);
+        debug_assert!((MIN_SBX..=MAX_SBX).contains(&sbx));
         let bx = (sbx + OFFSET_SBX) as u32;
         self.0 = (self.0 & !(mask(SIZE_BX) << POS_B)) | (bx << POS_B);
     }
 
     /// Set field sJ.
     pub fn set_sj(&mut self, sj: i32) {
-        debug_assert!(sj >= MIN_SJ && sj <= MAX_SJ);
+        debug_assert!((MIN_SJ..=MAX_SJ).contains(&sj));
         let val = (sj + OFFSET_SJ) as u32;
         self.0 = (self.0 & !(mask(SIZE_SJ) << POS_A)) | (val << POS_A);
     }

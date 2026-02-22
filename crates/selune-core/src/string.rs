@@ -100,7 +100,10 @@ pub fn lua_hash(bytes: &[u8]) -> u32 {
     let step = (len >> 5) + 1;
     let mut i = len;
     while i >= step {
-        h = h ^ ((h << 5).wrapping_add(h >> 2).wrapping_add(bytes[i - 1] as u32));
+        h = h
+            ^ ((h << 5)
+                .wrapping_add(h >> 2)
+                .wrapping_add(bytes[i - 1] as u32));
         i -= step;
     }
     h

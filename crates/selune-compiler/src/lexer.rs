@@ -98,8 +98,12 @@ impl<'a> Lexer<'a> {
         loop {
             // Skip whitespace
             while let Some(ch) = self.peek() {
-                if ch == b' ' || ch == b'\t' || ch == b'\n' || ch == b'\r'
-                    || ch == b'\x0C' || ch == b'\x0B'
+                if ch == b' '
+                    || ch == b'\t'
+                    || ch == b'\n'
+                    || ch == b'\r'
+                    || ch == b'\x0C'
+                    || ch == b'\x0B'
                 {
                     self.advance_char();
                 } else {
@@ -396,7 +400,7 @@ impl<'a> Lexer<'a> {
                             span,
                         })
                     }
-                } else if self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                } else if self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     // Number starting with .
                     self.scan_number_after_dot(span)
                 } else {
@@ -460,9 +464,7 @@ impl<'a> Lexer<'a> {
     fn scan_number(&mut self, span: Span) -> Result<SpannedToken, LexError> {
         let start = self.pos;
 
-        if self.peek() == Some(b'0')
-            && self.peek_at(1).map_or(false, |c| c == b'x' || c == b'X')
-        {
+        if self.peek() == Some(b'0') && self.peek_at(1).is_some_and(|c| c == b'x' || c == b'X') {
             // Hex number
             self.advance_char(); // 0
             self.advance_char(); // x/X
@@ -472,11 +474,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_decimal_number(
-        &mut self,
-        start: usize,
-        span: Span,
-    ) -> Result<SpannedToken, LexError> {
+    fn scan_decimal_number(&mut self, start: usize, span: Span) -> Result<SpannedToken, LexError> {
         let mut is_float = false;
 
         // Integer part
@@ -567,11 +565,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_hex_number(
-        &mut self,
-        start: usize,
-        span: Span,
-    ) -> Result<SpannedToken, LexError> {
+    fn scan_hex_number(&mut self, start: usize, span: Span) -> Result<SpannedToken, LexError> {
         let mut is_float = false;
 
         let hex_start = self.pos;
@@ -821,8 +815,7 @@ impl<'a> Lexer<'a> {
                                     }
                                     _ => {
                                         return Err(LexError {
-                                            message: "invalid escape sequence in \\u{}"
-                                                .to_string(),
+                                            message: "invalid escape sequence in \\u{}".to_string(),
                                             line: span.line,
                                             column: span.column,
                                         });
@@ -842,9 +835,7 @@ impl<'a> Lexer<'a> {
                                 buf.extend_from_slice(s.as_bytes());
                             } else {
                                 return Err(LexError {
-                                    message: format!(
-                                        "invalid Unicode code point: U+{code:04X}"
-                                    ),
+                                    message: format!("invalid Unicode code point: U+{code:04X}"),
                                     line: span.line,
                                     column: span.column,
                                 });
@@ -883,9 +874,7 @@ impl<'a> Lexer<'a> {
                             }
                             if val > 255 {
                                 return Err(LexError {
-                                    message: format!(
-                                        "decimal escape too large: {val}"
-                                    ),
+                                    message: format!("decimal escape too large: {val}"),
                                     line: span.line,
                                     column: span.column,
                                 });
@@ -894,10 +883,7 @@ impl<'a> Lexer<'a> {
                         }
                         Some(ch) => {
                             return Err(LexError {
-                                message: format!(
-                                    "invalid escape sequence '\\{}'",
-                                    ch as char
-                                ),
+                                message: format!("invalid escape sequence '\\{}'", ch as char),
                                 line: span.line,
                                 column: span.column,
                             });
@@ -925,11 +911,7 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn scan_long_string(
-        &mut self,
-        level: usize,
-        span: Span,
-    ) -> Result<SpannedToken, LexError> {
+    fn scan_long_string(&mut self, level: usize, span: Span) -> Result<SpannedToken, LexError> {
         // Skip opening [=*[
         self.advance_char(); // [
         for _ in 0..level {
@@ -972,7 +954,6 @@ impl<'a> Lexer<'a> {
                     buf.push(b']');
                 }
                 Some(b'\n') | Some(b'\r') => {
-                    let ch = self.peek().unwrap();
                     self.advance_char();
                     if first_newline && buf.is_empty() {
                         // Strip first newline of long string
@@ -980,11 +961,7 @@ impl<'a> Lexer<'a> {
                         continue;
                     }
                     // Normalize line endings to \n
-                    if ch == b'\r' {
-                        buf.push(b'\n');
-                    } else {
-                        buf.push(b'\n');
-                    }
+                    buf.push(b'\n');
                     first_newline = false;
                 }
                 Some(ch) => {
@@ -1315,10 +1292,7 @@ mod tests {
     #[test]
     fn test_escape_z() {
         assert_eq!(lex_string("\"hello\\z   world\""), b"helloworld");
-        assert_eq!(
-            lex_string("\"hello\\z\n   world\""),
-            b"helloworld"
-        );
+        assert_eq!(lex_string("\"hello\\z\n   world\""), b"helloworld");
     }
 
     #[test]
@@ -1582,7 +1556,12 @@ end
         let tokens = lex_tokens("<=>=~===");
         assert_eq!(
             tokens,
-            vec![Token::LessEq, Token::GreaterEq, Token::NotEqual, Token::Equal]
+            vec![
+                Token::LessEq,
+                Token::GreaterEq,
+                Token::NotEqual,
+                Token::Equal
+            ]
         );
     }
 

@@ -25,10 +25,7 @@ pub enum ExprDesc {
     /// Constant at the given index.
     Constant(u32),
     /// Indexed: table in register, key info.
-    Indexed {
-        table: u8,
-        key: IndexKey,
-    },
+    Indexed { table: u8, key: IndexKey },
     /// Relocatable: instruction at PC whose destination register is not yet set.
     Relocatable(usize),
     /// Jump: the expression is the result of a comparison, with a jump PC.
@@ -116,8 +113,7 @@ impl BinOp {
         match self {
             BinOp::Or => (1, 1),
             BinOp::And => (2, 2),
-            BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
-            | BinOp::NotEq | BinOp::Eq => (3, 3),
+            BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::NotEq | BinOp::Eq => (3, 3),
             BinOp::BOr => (4, 4),
             BinOp::BXor => (5, 5),
             BinOp::BAnd => (6, 6),

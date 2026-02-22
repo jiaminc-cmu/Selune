@@ -49,6 +49,7 @@ struct FuncState {
     scope: ScopeManager,
     upvalues: Vec<UpvalInfo>,
     /// Index in the parent's FuncState stack.
+    #[allow(dead_code)]
     parent: Option<usize>,
 }
 
@@ -125,6 +126,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn error_at(&self, line: u32, msg: impl Into<String>) -> CompileError {
         CompileError {
             message: msg.into(),
@@ -135,10 +137,13 @@ impl<'a> Compiler<'a> {
     // ---- Token helpers ----
 
     fn current_token(&self) -> Result<&Token, CompileError> {
-        self.lexer.current().map(|st| &st.token).map_err(|e| CompileError {
-            message: e.message.clone(),
-            line: e.line,
-        })
+        self.lexer
+            .current()
+            .map(|st| &st.token)
+            .map_err(|e| CompileError {
+                message: e.message.clone(),
+                line: e.line,
+            })
     }
 
     fn check(&self, expected: &Token) -> bool {
@@ -155,7 +160,10 @@ impl<'a> Compiler<'a> {
             self.advance()?;
             Ok(())
         } else {
-            let found = self.current_token().map(|t| format!("{t}")).unwrap_or("error".into());
+            let found = self
+                .current_token()
+                .map(|t| format!("{t}"))
+                .unwrap_or("error".into());
             Err(self.error(format!("expected '{expected}', got '{found}'")))
         }
     }
@@ -170,6 +178,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn check_name(&self) -> bool {
         matches!(self.current_token(), Ok(Token::Name(_)))
     }
@@ -237,9 +246,8 @@ impl<'a> Compiler<'a> {
                     // Re-encode as asbx
                     let sbx = i as i32;
                     // Check sBx range
-                    if sbx >= crate::opcode::MIN_SBX && sbx <= crate::opcode::MAX_SBX {
-                        self.fs_mut().proto.code[pc] =
-                            Instruction::asbx(OpCode::LoadI, reg, sbx);
+                    if (crate::opcode::MIN_SBX..=crate::opcode::MAX_SBX).contains(&sbx) {
+                        self.fs_mut().proto.code[pc] = Instruction::asbx(OpCode::LoadI, reg, sbx);
                     } else {
                         // Fallback to constant
                         self.fs_mut().proto.code.pop();
@@ -257,8 +265,7 @@ impl<'a> Compiler<'a> {
                 // Try LoadF for small integer-valued floats
                 let as_int = f as i32;
                 if as_int as f64 == f
-                    && as_int >= crate::opcode::MIN_SBX
-                    && as_int <= crate::opcode::MAX_SBX
+                    && (crate::opcode::MIN_SBX..=crate::opcode::MAX_SBX).contains(&as_int)
                 {
                     self.emit(Instruction::asbx(OpCode::LoadF, reg, as_int), line);
                 } else {
@@ -287,28 +294,26 @@ impl<'a> Compiler<'a> {
                     line,
                 );
             }
-            ExprDesc::Indexed { table, key } => {
-                match key {
-                    IndexKey::Field(k) => {
-                        self.emit(
-                            Instruction::abc(OpCode::GetField, reg, *table, *k as u8, false),
-                            line,
-                        );
-                    }
-                    IndexKey::Register(key_reg) => {
-                        self.emit_abc(OpCode::GetTable, reg, *table, *key_reg, line);
-                    }
-                    IndexKey::Integer(i) => {
-                        self.emit_abc(OpCode::GetI, reg, *table, *i, line);
-                    }
-                    IndexKey::Constant(k) => {
-                        self.emit(
-                            Instruction::abc(OpCode::GetTable, reg, *table, *k as u8, true),
-                            line,
-                        );
-                    }
+            ExprDesc::Indexed { table, key } => match key {
+                IndexKey::Field(k) => {
+                    self.emit(
+                        Instruction::abc(OpCode::GetField, reg, *table, *k as u8, false),
+                        line,
+                    );
                 }
-            }
+                IndexKey::Register(key_reg) => {
+                    self.emit_abc(OpCode::GetTable, reg, *table, *key_reg, line);
+                }
+                IndexKey::Integer(i) => {
+                    self.emit_abc(OpCode::GetI, reg, *table, *i, line);
+                }
+                IndexKey::Constant(k) => {
+                    self.emit(
+                        Instruction::abc(OpCode::GetTable, reg, *table, *k as u8, true),
+                        line,
+                    );
+                }
+            },
             ExprDesc::Relocatable(pc) => {
                 self.fs_mut().proto.code[*pc].set_a(reg);
             }
@@ -357,6 +362,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Ensure an expression is in a register. May allocate a new one.
+    #[allow(dead_code)]
     fn exp_to_reg(&mut self, expr: ExprDesc, line: u32) -> ExprDesc {
         let reg = self.discharge_to_any_reg(&expr, line);
         ExprDesc::Register(reg)
@@ -465,16 +471,12 @@ impl<'a> Compiler<'a> {
                 let pc = self.emit_abc(OpCode::VarArg, 0, 0, 0, line);
                 Ok(ExprDesc::Vararg(pc))
             }
-            Token::LBrace => {
-                self.table_constructor()
-            }
+            Token::LBrace => self.table_constructor(),
             Token::Function => {
                 self.advance()?;
                 self.function_body(false)
             }
-            _ => {
-                self.primary_expression()
-            }
+            _ => self.primary_expression(),
         }
     }
 
@@ -662,7 +664,7 @@ impl<'a> Compiler<'a> {
 
     fn expr_to_index_key(&mut self, expr: ExprDesc, line: u32) -> IndexKey {
         match expr {
-            ExprDesc::Integer(i) if i >= 0 && i <= 255 => IndexKey::Integer(i as u8),
+            ExprDesc::Integer(i) if (0..=255).contains(&i) => IndexKey::Integer(i as u8),
             ExprDesc::Str(id) => {
                 let k = self.fs_mut().add_string_constant(id);
                 IndexKey::Field(k)
@@ -809,8 +811,13 @@ impl<'a> Compiler<'a> {
         } else {
             0
         };
-        self.fs_mut().proto.code[pc] =
-            Instruction::abc(OpCode::NewTable, table_reg, array_log as u8, hash_log as u8, false);
+        self.fs_mut().proto.code[pc] = Instruction::abc(
+            OpCode::NewTable,
+            table_reg,
+            array_log as u8,
+            hash_log as u8,
+            false,
+        );
 
         self.fs_mut().scope.free_reg_to(table_reg + 1);
         Ok(ExprDesc::Register(table_reg))
@@ -867,9 +874,10 @@ impl<'a> Compiler<'a> {
             (UnOp::Neg, ExprDesc::Float(f)) => return Ok(ExprDesc::Float(-f)),
             (UnOp::BNot, ExprDesc::Integer(i)) => return Ok(ExprDesc::Integer(!i)),
             (UnOp::Not, ExprDesc::Nil | ExprDesc::False) => return Ok(ExprDesc::True),
-            (UnOp::Not, ExprDesc::True | ExprDesc::Integer(_) | ExprDesc::Float(_) | ExprDesc::Str(_)) => {
-                return Ok(ExprDesc::False)
-            }
+            (
+                UnOp::Not,
+                ExprDesc::True | ExprDesc::Integer(_) | ExprDesc::Float(_) | ExprDesc::Str(_),
+            ) => return Ok(ExprDesc::False),
             _ => {}
         }
 
@@ -930,8 +938,16 @@ impl<'a> Compiler<'a> {
             let i = *i;
             if matches!(
                 op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::Pow
-                    | BinOp::Div | BinOp::IDiv | BinOp::BAnd | BinOp::BOr | BinOp::BXor
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Mod
+                    | BinOp::Pow
+                    | BinOp::Div
+                    | BinOp::IDiv
+                    | BinOp::BAnd
+                    | BinOp::BOr
+                    | BinOp::BXor
             ) {
                 let k = self.fs_mut().add_constant(Constant::Integer(i));
                 if k <= 255 {
@@ -954,22 +970,16 @@ impl<'a> Compiler<'a> {
         // Integer immediate for add/shift
         if let ExprDesc::Integer(i) = &right {
             let i = *i;
-            if i >= -128 && i <= 127 {
+            if (-128..=127).contains(&i) {
                 if op == BinOp::Add {
                     let dest = self.fs_mut().scope.alloc_reg();
                     self.emit(
-                        Instruction::abc(OpCode::AddI, dest, left_reg, (i as u8) & 0xFF, false),
+                        Instruction::abc(OpCode::AddI, dest, left_reg, i as u8, false),
                         line,
                     );
                     self.fs_mut().scope.free_reg_to(dest + 1);
                     self.emit(
-                        Instruction::abc(
-                            OpCode::MMBinI,
-                            left_reg,
-                            (i as u8) & 0xFF,
-                            op_to_mm(op),
-                            false,
-                        ),
+                        Instruction::abc(OpCode::MMBinI, left_reg, i as u8, op_to_mm(op), false),
                         line,
                     );
                     return Ok(ExprDesc::Register(dest));
@@ -977,7 +987,7 @@ impl<'a> Compiler<'a> {
                 if op == BinOp::Shr {
                     let dest = self.fs_mut().scope.alloc_reg();
                     self.emit(
-                        Instruction::abc(OpCode::ShrI, dest, left_reg, (i as u8) & 0xFF, false),
+                        Instruction::abc(OpCode::ShrI, dest, left_reg, i as u8, false),
                         line,
                     );
                     self.fs_mut().scope.free_reg_to(dest + 1);
@@ -986,7 +996,7 @@ impl<'a> Compiler<'a> {
                 if op == BinOp::Shl {
                     let dest = self.fs_mut().scope.alloc_reg();
                     self.emit(
-                        Instruction::abc(OpCode::ShlI, dest, left_reg, (i as u8) & 0xFF, false),
+                        Instruction::abc(OpCode::ShlI, dest, left_reg, i as u8, false),
                         line,
                     );
                     self.fs_mut().scope.free_reg_to(dest + 1);
@@ -1044,15 +1054,21 @@ impl<'a> Compiler<'a> {
 
         if op == BinOp::And {
             // If left is falsy, skip right; result = left
-            self.emit(Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, false), line);
+            self.emit(
+                Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, false),
+                line,
+            );
         } else {
             // If left is truthy, skip right; result = left
-            self.emit(Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, true), line);
+            self.emit(
+                Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, true),
+                line,
+            );
         }
         let jump = self.emit_sj(OpCode::Jmp, 0, line);
 
         // Right side may allocate temps, so save/restore
-        let save_reg = self.fs().scope.free_reg;
+        let _save_reg = self.fs().scope.free_reg;
         let right = self.sub_expression(right_prec)?;
         let right_line = self.line();
         self.discharge_to_reg(&right, left_reg, right_line);
@@ -1079,7 +1095,10 @@ impl<'a> Compiler<'a> {
         // Global: _ENV[name]
         let env_idx = self.resolve_upvalue_env();
         let k = self.fs_mut().add_string_constant(name);
-        Ok(ExprDesc::Global { env_upval: env_idx, name_k: k })
+        Ok(ExprDesc::Global {
+            env_upval: env_idx,
+            name_k: k,
+        })
     }
 
     /// Resolve an upvalue by walking up the function state stack.
@@ -1130,10 +1149,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Compile a function body (after 'function' keyword or in function statement).
-    pub(crate) fn function_body(
-        &mut self,
-        is_method: bool,
-    ) -> Result<ExprDesc, CompileError> {
+    pub(crate) fn function_body(&mut self, is_method: bool) -> Result<ExprDesc, CompileError> {
         let line = self.line();
 
         // Create new FuncState
@@ -1307,7 +1323,7 @@ impl<'a> Compiler<'a> {
 
             // Pad with nils if fewer expressions than variables
             if (num_exprs as usize) < num_vars {
-                for i in num_exprs as u8..num_vars as u8 {
+                for i in num_exprs..num_vars as u8 {
                     self.emit_abx(OpCode::LoadNil, base_reg + i, 0, line);
                 }
             }
@@ -1323,7 +1339,9 @@ impl<'a> Compiler<'a> {
         let start_pc = self.fs().current_pc() as u32;
         for (i, name) in names.into_iter().enumerate() {
             let (is_const, is_close) = attrs[i];
-            self.fs_mut().scope.add_local(name, is_const, is_close, start_pc);
+            self.fs_mut()
+                .scope
+                .add_local(name, is_const, is_close, start_pc);
             if is_close {
                 let reg = self.fs().scope.free_reg - 1;
                 self.emit_abc(OpCode::Tbc, reg, 0, 0, line);
@@ -1352,13 +1370,11 @@ impl<'a> Compiler<'a> {
             let esc = self.emit_jump(self.line());
             escape_jumps.push(esc);
             self.patch_jump(false_jump);
-            let false_jump_inner;
-
             self.advance()?; // consume 'elseif'
             let cond = self.expression()?;
             self.expect(&Token::Then)?;
             let cond_line = self.line();
-            false_jump_inner = self.code_test_jump(&cond, false, cond_line)?;
+            let false_jump_inner = self.code_test_jump(&cond, false, cond_line)?;
 
             self.fs_mut().scope.enter_block(false);
             self.block()?;
@@ -1584,7 +1600,8 @@ impl<'a> Compiler<'a> {
         // Patch TForLoop to jump back to loop body
         let body_start = prep_pc + 1;
         let back_offset = body_start as i32 - loop_pc as i32 - 1;
-        self.fs_mut().proto.code[loop_pc] = Instruction::asbx(OpCode::TForLoop, base + 2, back_offset);
+        self.fs_mut().proto.code[loop_pc] =
+            Instruction::asbx(OpCode::TForLoop, base + 2, back_offset);
 
         self.expect(&Token::End)?;
 
@@ -1698,10 +1715,7 @@ impl<'a> Compiler<'a> {
                 }
                 _ => {
                     self.discharge_to_reg(&first_expr, base, line);
-                    self.emit(
-                        Instruction::abc(OpCode::Return1, base, 0, 0, false),
-                        line,
-                    );
+                    self.emit(Instruction::abc(OpCode::Return1, base, 0, 0, false), line);
                 }
             }
             return Ok(());
@@ -1801,7 +1815,12 @@ impl<'a> Compiler<'a> {
             }
             // Remove resolved gotos (in reverse order to preserve indices)
             for (i, _) in resolved.into_iter().rev() {
-                self.fs_mut().scope.current_block_mut().unwrap().pending_gotos.remove(i);
+                self.fs_mut()
+                    .scope
+                    .current_block_mut()
+                    .unwrap()
+                    .pending_gotos
+                    .remove(i);
             }
         }
         Ok(())
@@ -1885,10 +1904,7 @@ impl<'a> Compiler<'a> {
             _ => {
                 let reg = self.discharge_to_any_reg(cond, line);
                 // TEST: skip next if R(A) is truthy/falsy
-                self.emit(
-                    Instruction::abc(OpCode::Test, reg, 0, 0, !jump_if),
-                    line,
-                );
+                self.emit(Instruction::abc(OpCode::Test, reg, 0, 0, !jump_if), line);
                 let jump = self.emit_sj(OpCode::Jmp, 0, line);
                 Ok(jump)
             }
@@ -2159,9 +2175,7 @@ mod tests {
 
     #[test]
     fn test_if_then_else() {
-        let (proto, _) = compile_ok(
-            "if true then local x = 1 else local y = 2 end",
-        );
+        let (proto, _) = compile_ok("if true then local x = 1 else local y = 2 end");
         assert!(has_opcode(&proto, OpCode::Jmp));
     }
 
@@ -2239,9 +2253,7 @@ mod tests {
 
     #[test]
     fn test_closure_upvalue() {
-        let (proto, _) = compile_ok(
-            "local x = 1\nfunction f() return x end",
-        );
+        let (proto, _) = compile_ok("local x = 1\nfunction f() return x end");
         assert_eq!(proto.protos.len(), 1);
         assert!(!proto.protos[0].upvalues.is_empty());
     }
@@ -2392,9 +2404,7 @@ mod tests {
 
     #[test]
     fn test_nested_function() {
-        let (proto, _) = compile_ok(
-            "function outer()\n  function inner() end\nend",
-        );
+        let (proto, _) = compile_ok("function outer()\n  function inner() end\nend");
         assert_eq!(proto.protos.len(), 1);
         assert_eq!(proto.protos[0].protos.len(), 1);
     }

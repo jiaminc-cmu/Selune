@@ -100,12 +100,15 @@ impl Proto {
 
         // Save line info
         let delta = line as i32 - self.current_line as i32;
-        if delta >= -128 && delta <= 127 {
+        if (-128..=127).contains(&delta) {
             self.line_info.push(delta as i8);
         } else {
             // Large delta: store 0 and add absolute line info
             self.line_info.push(0);
-            self.abs_line_info.push(AbsLineInfo { pc: pc as u32, line });
+            self.abs_line_info.push(AbsLineInfo {
+                pc: pc as u32,
+                line,
+            });
         }
         self.current_line = line;
 

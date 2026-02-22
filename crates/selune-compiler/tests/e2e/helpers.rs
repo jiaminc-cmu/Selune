@@ -29,6 +29,7 @@ pub fn count_opcode(proto: &Proto, op: OpCode) -> usize {
 }
 
 /// Find the first instruction with a given opcode.
+#[allow(dead_code)]
 pub fn find_opcode(proto: &Proto, op: OpCode) -> Option<usize> {
     proto.code.iter().position(|i| i.opcode() == op)
 }
@@ -36,14 +37,13 @@ pub fn find_opcode(proto: &Proto, op: OpCode) -> Option<usize> {
 /// Get string constant value by index.
 pub fn get_string_constant(proto: &Proto, idx: usize, strings: &StringInterner) -> String {
     match &proto.constants[idx] {
-        Constant::String(id) => {
-            String::from_utf8(strings.get_bytes(*id).to_vec()).unwrap()
-        }
+        Constant::String(id) => String::from_utf8(strings.get_bytes(*id).to_vec()).unwrap(),
         other => panic!("expected string constant, got {other:?}"),
     }
 }
 
 /// Get integer constant value by index.
+#[allow(dead_code)]
 pub fn get_int_constant(proto: &Proto, idx: usize) -> i64 {
     match &proto.constants[idx] {
         Constant::Integer(i) => *i,

@@ -49,30 +49,30 @@ pub enum Token {
     Name(StringId),
 
     // --- Single-char operators/punctuation ---
-    Plus,       // +
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
-    Percent,    // %
-    Caret,      // ^
-    Hash,       // #
-    Ampersand,  // &
-    Tilde,      // ~
-    Pipe,       // |
-    Less,       // <
-    Greater,    // >
-    Assign,     // =
-    LParen,     // (
-    RParen,     // )
-    LBrace,     // {
-    RBrace,     // }
-    LBracket,   // [
-    RBracket,   // ]
+    Plus,        // +
+    Minus,       // -
+    Star,        // *
+    Slash,       // /
+    Percent,     // %
+    Caret,       // ^
+    Hash,        // #
+    Ampersand,   // &
+    Tilde,       // ~
+    Pipe,        // |
+    Less,        // <
+    Greater,     // >
+    Assign,      // =
+    LParen,      // (
+    RParen,      // )
+    LBrace,      // {
+    RBrace,      // }
+    LBracket,    // [
+    RBracket,    // ]
     DoubleColon, // ::
-    Semi,       // ;
-    Colon,      // :
-    Comma,      // ,
-    Dot,        // .
+    Semi,        // ;
+    Colon,       // :
+    Comma,       // ,
+    Dot,         // .
 
     // --- Multi-char operators ---
     ShiftLeft,  // <<

@@ -38,9 +38,7 @@ fn e2e_method_definition() {
 
 #[test]
 fn e2e_closure_upvalue_capture() {
-    let (proto, _) = compile_str(
-        "local x = 1\nfunction f() return x end",
-    );
+    let (proto, _) = compile_str("local x = 1\nfunction f() return x end");
     assert_eq!(proto.protos.len(), 1);
     assert!(!proto.protos[0].upvalues.is_empty());
     assert!(proto.protos[0].upvalues[0].in_stack || !proto.protos[0].upvalues[0].in_stack);
@@ -48,18 +46,16 @@ fn e2e_closure_upvalue_capture() {
 
 #[test]
 fn e2e_nested_closure() {
-    let (proto, _) = compile_str(
-        "local x = 1\nfunction outer()\n  function inner() return x end\nend",
-    );
+    let (proto, _) =
+        compile_str("local x = 1\nfunction outer()\n  function inner() return x end\nend");
     assert_eq!(proto.protos.len(), 1); // outer
     assert_eq!(proto.protos[0].protos.len(), 1); // inner inside outer
 }
 
 #[test]
 fn e2e_local_function_recursive() {
-    let (proto, _) = compile_str(
-        "local function fib(n)\n  if n then return fib end\n  return n\nend",
-    );
+    let (proto, _) =
+        compile_str("local function fib(n)\n  if n then return fib end\n  return n\nend");
     assert!(has_opcode(&proto, OpCode::Closure));
 }
 

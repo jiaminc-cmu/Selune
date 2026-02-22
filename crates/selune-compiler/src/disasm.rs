@@ -1,5 +1,5 @@
 /// Bytecode disassembler (luac -l style output).
-use crate::opcode::{InstructionFormat, Instruction};
+use crate::opcode::{Instruction, InstructionFormat};
 use crate::proto::{Constant, Proto};
 use selune_core::string::StringInterner;
 use std::fmt::Write;
@@ -11,12 +11,7 @@ pub fn disassemble(proto: &Proto, strings: &StringInterner) -> String {
     out
 }
 
-fn disassemble_proto(
-    out: &mut String,
-    proto: &Proto,
-    strings: &StringInterner,
-    level: usize,
-) {
+fn disassemble_proto(out: &mut String, proto: &Proto, strings: &StringInterner, level: usize) {
     let indent = "  ".repeat(level);
 
     // Header

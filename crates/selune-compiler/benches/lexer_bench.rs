@@ -50,5 +50,10 @@ fn bench_lex_large(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_lex_simple, bench_lex_fibonacci, bench_lex_large);
+criterion_group!(
+    benches,
+    bench_lex_simple,
+    bench_lex_fibonacci,
+    bench_lex_large
+);
 criterion_main!(benches);
