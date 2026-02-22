@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 selune-core.workspace = true
 selune-compiler.workspace = true
+selune-stdlib.workspace = true

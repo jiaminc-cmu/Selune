@@ -728,3 +728,290 @@ fn test_add_metamethod_with_immediate() {
         &[42],
     );
 }
+
+// ---- Additional gap-fill tests (Tier 2E) ----
+
+#[test]
+fn test_index_chain_3_levels() {
+    run_check_ints(
+        r#"
+        local C = {x = 42}
+        local B = setmetatable({}, {__index = C})
+        local A = setmetatable({}, {__index = B})
+        return A.x
+        "#,
+        &[42],
+    );
+}
+
+#[test]
+fn test_rawget_bypasses_index() {
+    run_check_ints(
+        r#"
+        local t = setmetatable({}, {
+            __index = function(t, k) return 99 end
+        })
+        local meta_val = t.x
+        local raw_val = rawget(t, "x")
+        if raw_val == nil then return meta_val, 0 else return meta_val, 1 end
+        "#,
+        &[99, 0],
+    );
+}
+
+#[test]
+fn test_newindex_only_for_new_keys_detailed() {
+    run_check_ints(
+        r#"
+        local count = 0
+        local t = setmetatable({}, {
+            __newindex = function(tbl, key, val)
+                count = count + 1
+                rawset(tbl, key, val)
+            end
+        })
+        t.a = 1    -- new key, fires (count=1)
+        t.b = 2    -- new key, fires (count=2)
+        t.a = 10   -- existing key, does NOT fire
+        t.b = 20   -- existing key, does NOT fire
+        return count, t.a, t.b
+        "#,
+        &[2, 10, 20],
+    );
+}
+
+#[test]
+fn test_gt_uses_lt() {
+    // a > b is implemented as b < a
+    run_check_ints(
+        r#"
+        local mt = { __lt = function(a, b)
+            return rawget(a, "v") < rawget(b, "v")
+        end }
+        local a = setmetatable({v = 5}, mt)
+        local b = setmetatable({v = 3}, mt)
+        if a > b then return 1 else return 0 end
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_ge_uses_le() {
+    run_check_ints(
+        r#"
+        local mt = { __le = function(a, b)
+            return rawget(a, "v") <= rawget(b, "v")
+        end }
+        local a = setmetatable({v = 5}, mt)
+        local b = setmetatable({v = 5}, mt)
+        if a >= b then return 1 else return 0 end
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_call_metamethod_multi_return() {
+    run_check_ints(
+        r#"
+        local t = setmetatable({}, {
+            __call = function(self, a, b)
+                return a + b, a * b
+            end
+        })
+        local sum, prod = t(3, 4)
+        return sum, prod
+        "#,
+        &[7, 12],
+    );
+}
+
+#[test]
+fn test_metamethod_receives_both_operands() {
+    run_check_ints(
+        r#"
+        local mt = { __add = function(a, b)
+            if type(a) == "table" then a = rawget(a, "v") end
+            if type(b) == "table" then b = rawget(b, "v") end
+            return a + b
+        end }
+        local t = setmetatable({v = 10}, mt)
+        return t + 5, 5 + t
+        "#,
+        &[15, 15],
+    );
+}
+
+#[test]
+fn test_index_function_receives_table_and_key() {
+    run_check_strings(
+        r#"
+        local received_key = ""
+        local t = setmetatable({}, {
+            __index = function(tbl, key)
+                received_key = key
+                return "found"
+            end
+        })
+        local _ = t.hello
+        return received_key
+        "#,
+        &["hello"],
+    );
+}
+
+#[test]
+fn test_tostring_metamethod() {
+    run_check_strings(
+        r#"
+        local t = setmetatable({}, {
+            __tostring = function(self)
+                return "MyObject"
+            end
+        })
+        return tostring(t)
+        "#,
+        &["MyObject"],
+    );
+}
+
+#[test]
+fn test_eq_not_called_for_same_reference() {
+    // If two values ARE the same reference, == returns true without calling __eq
+    run_check_ints(
+        r#"
+        local called = false
+        local mt = { __eq = function(a, b) called = true; return false end }
+        local t = setmetatable({}, mt)
+        if t == t then
+            if called then return 0 else return 1 end
+        else
+            return -1
+        end
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_ne_with_eq_metamethod() {
+    run_check_ints(
+        r#"
+        local mt = { __eq = function(a, b) return true end }
+        local a = setmetatable({}, mt)
+        local b = setmetatable({}, mt)
+        if a ~= b then return 0 else return 1 end
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_close_metamethod_on_scope_exit() {
+    run_check_ints(
+        r#"
+        local closed = 0
+        do
+            local x <close> = setmetatable({}, {
+                __close = function() closed = closed + 1 end
+            })
+        end
+        return closed
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_close_metamethod_on_error() {
+    run_check_ints(
+        r#"
+        local closed = 0
+        pcall(function()
+            local x <close> = setmetatable({}, {
+                __close = function() closed = closed + 1 end
+            })
+            error("boom")
+        end)
+        return closed
+        "#,
+        &[1],
+    );
+}
+
+#[test]
+fn test_multiple_close_in_reverse_order() {
+    run_check_strings(
+        r#"
+        local order = ""
+        do
+            local a <close> = setmetatable({}, {
+                __close = function() order = order .. "a" end
+            })
+            local b <close> = setmetatable({}, {
+                __close = function() order = order .. "b" end
+            })
+            local c <close> = setmetatable({}, {
+                __close = function() order = order .. "c" end
+            })
+        end
+        return order
+        "#,
+        &["cba"],
+    );
+}
+
+#[test]
+fn test_concat_metamethod_with_strings() {
+    run_check_strings(
+        r#"
+        local mt = { __concat = function(a, b)
+            local av = type(a) == "table" and rawget(a, "s") or tostring(a)
+            local bv = type(b) == "table" and rawget(b, "s") or tostring(b)
+            return av .. bv
+        end }
+        local t = setmetatable({s = "hello"}, mt)
+        return t .. " world"
+        "#,
+        &["hello world"],
+    );
+}
+
+#[test]
+fn test_len_metamethod_overrides_rawlen() {
+    run_check_ints(
+        r#"
+        local t = setmetatable({1, 2, 3, 4, 5}, {
+            __len = function(self) return 0 end
+        })
+        return #t, rawlen(t)
+        "#,
+        &[0, 5],
+    );
+}
+
+#[test]
+fn test_metatable_protection() {
+    run_check_ints(
+        r#"
+        local mt = { __metatable = "protected" }
+        local t = setmetatable({}, mt)
+        local ok = pcall(setmetatable, t, {})
+        if ok then return 1 else return 0 end
+        "#,
+        &[0],
+    );
+}
+
+#[test]
+fn test_getmetatable_with_metatable_field() {
+    run_check_strings(
+        r#"
+        local mt = { __metatable = "protected" }
+        local t = setmetatable({}, mt)
+        return getmetatable(t)
+        "#,
+        &["protected"],
+    );
+}

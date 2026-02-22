@@ -81,14 +81,88 @@ pub fn to_string_for_concat(
 
 /// Format a float using Lua's %.14g-like format.
 pub fn lua_format_float(f: f64) -> String {
-    if f == 0.0 && f.is_sign_positive() {
-        return "0".to_string();
+    if f.is_nan() {
+        return "-nan".to_string();
     }
-    // Use Rust's default float formatting which is similar to %g
-    // Try integer representation first if it's a whole number
-    if f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{}", f as i64)
+    if f.is_infinite() {
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    // Use %.14g equivalent formatting
+    format_g14(f)
+}
+
+/// Produce output equivalent to C's `%.14g` for a finite float.
+fn format_g14(f: f64) -> String {
+    if f == 0.0 {
+        return if f.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+    // %.14g: use fixed notation if exponent is in [-4, 14), else scientific
+    let abs = f.abs();
+    let exp = abs.log10().floor() as i32;
+    if exp >= -4 && exp < 14 {
+        // Fixed notation: 14 significant digits
+        let decimals = (13 - exp).max(0) as usize;
+        let mut s = format!("{:.*}", decimals, f);
+        // Remove trailing zeros after decimal point, but keep at least ".0"
+        if s.contains('.') {
+            let trimmed = s.trim_end_matches('0');
+            if trimmed.ends_with('.') {
+                s = format!("{}0", trimmed);
+            } else {
+                s = trimmed.to_string();
+            }
+        }
+        s
     } else {
-        format!("{}", f)
+        // Scientific notation
+        let mut s = format!("{:.13e}", f);
+        // Rust formats exponent without + sign and variable width
+        // C printf uses e+XX format. Fix it.
+        s = fix_scientific_notation_g14(&s);
+        // Remove trailing zeros in mantissa
+        if let Some(e_pos) = s.find('e') {
+            let mantissa = &s[..e_pos];
+            let exponent = &s[e_pos..];
+            let trimmed = if mantissa.contains('.') {
+                let t = mantissa.trim_end_matches('0');
+                if t.ends_with('.') {
+                    format!("{}0", t)
+                } else {
+                    t.to_string()
+                }
+            } else {
+                mantissa.to_string()
+            };
+            s = format!("{}{}", trimmed, exponent);
+        }
+        s
+    }
+}
+
+/// Fix Rust scientific notation to match C printf format (e+XX).
+fn fix_scientific_notation_g14(s: &str) -> String {
+    // Rust produces "1.23e5" or "1.23e-5", C produces "1.23e+05" or "1.23e-05"
+    if let Some(e_pos) = s.find('e') {
+        let mantissa = &s[..e_pos];
+        let exp_str = &s[e_pos + 1..];
+        let (sign, digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+            ("-", rest)
+        } else if let Some(rest) = exp_str.strip_prefix('+') {
+            ("+", rest)
+        } else {
+            ("+", exp_str)
+        };
+        let exp_num: i32 = digits.parse().unwrap_or(0);
+        format!("{}e{}{:02}", mantissa, sign, exp_num.abs())
+    } else {
+        s.to_string()
     }
 }

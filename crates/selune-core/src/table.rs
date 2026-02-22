@@ -247,6 +247,16 @@ impl Table {
             }
         }
     }
+
+    /// Iterate over all values in the array part (for GC traversal).
+    pub fn array_values(&self) -> &[TValue] {
+        &self.array
+    }
+
+    /// Iterate over all key-value pairs in the hash part (for GC traversal).
+    pub fn hash_entries(&self) -> impl Iterator<Item = (&TableKey, &TValue)> {
+        self.hash.iter()
+    }
 }
 
 /// Convert a TValue to a TableKey for hash lookup.

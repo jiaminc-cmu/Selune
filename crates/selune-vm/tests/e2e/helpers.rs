@@ -24,12 +24,14 @@ pub fn run_lua_err(source: &str) -> String {
 }
 
 /// Check that results[idx] is an integer with the expected value.
+/// Handles both inline ints and boxed ints.
 pub fn assert_int(results: &[TValue], idx: usize, expected: i64) {
     let val = results[idx];
-    let got = val
-        .as_integer()
-        .unwrap_or_else(|| panic!("result[{idx}] = {:?}, expected integer {expected}", val));
-    assert_eq!(got, expected, "result[{idx}] = {got}, expected {expected}");
+    if let Some(got) = val.as_integer() {
+        assert_eq!(got, expected, "result[{idx}] = {got}, expected {expected}");
+    } else {
+        panic!("result[{idx}] = {:?}, expected integer {expected}", val);
+    }
 }
 
 /// Check that results[idx] is a float with the expected value.
@@ -73,8 +75,14 @@ pub fn assert_str(results: &[TValue], idx: usize, expected: &str, vm: &Vm) {
 }
 
 /// Run Lua source and check results against expected integer values.
+/// Handles both inline and boxed integers.
 pub fn run_check_ints(source: &str, expected: &[i64]) {
-    let results = run_lua(source);
+    let (proto, strings) = selune_compiler::compiler::compile(source.as_bytes(), "=test")
+        .unwrap_or_else(|e| panic!("compile error: {} at line {}", e.message, e.line));
+    let mut vm = Vm::new();
+    let results = vm
+        .execute(&proto, strings)
+        .unwrap_or_else(|e| panic!("runtime error: {e}"));
     assert_eq!(
         results.len(),
         expected.len(),
@@ -83,7 +91,11 @@ pub fn run_check_ints(source: &str, expected: &[i64]) {
         results.len()
     );
     for (i, &exp) in expected.iter().enumerate() {
-        assert_int(&results, i, exp);
+        let val = results[i];
+        let got = val.as_full_integer(&vm.gc).unwrap_or_else(|| {
+            panic!("result[{i}] = {:?}, expected integer {exp}", val);
+        });
+        assert_eq!(got, exp, "result[{i}] = {got}, expected {exp}");
     }
 }
 
@@ -99,6 +111,43 @@ pub fn run_check_floats(source: &str, expected: &[f64]) {
     );
     for (i, &exp) in expected.iter().enumerate() {
         assert_float(&results, i, exp);
+    }
+}
+
+/// Compile and execute Lua source, returning results and the VM (for string inspection).
+pub fn run_with_vm(source: &str) -> (Vec<TValue>, Vm) {
+    let (proto, strings) = selune_compiler::compiler::compile(source.as_bytes(), "=test")
+        .unwrap_or_else(|e| panic!("compile error: {} at line {}", e.message, e.line));
+    let mut vm = Vm::new();
+    let results = vm
+        .execute(&proto, strings)
+        .unwrap_or_else(|e| panic!("runtime error: {e}"));
+    (results, vm)
+}
+
+/// Assert that results[idx] is a NaN float.
+pub fn assert_float_nan(results: &[TValue], idx: usize) {
+    let val = results[idx];
+    let got = val
+        .as_float()
+        .unwrap_or_else(|| panic!("result[{idx}] = {:?}, expected NaN float", val));
+    assert!(got.is_nan(), "result[{idx}] = {got}, expected NaN");
+}
+
+/// Assert that results[idx] is +/- infinity.
+pub fn assert_float_inf(results: &[TValue], idx: usize, positive: bool) {
+    let val = results[idx];
+    let got = val
+        .as_float()
+        .unwrap_or_else(|| panic!("result[{idx}] = {:?}, expected infinity", val));
+    assert!(
+        got.is_infinite(),
+        "result[{idx}] = {got}, expected infinity"
+    );
+    if positive {
+        assert!(got > 0.0, "result[{idx}] = {got}, expected +infinity");
+    } else {
+        assert!(got < 0.0, "result[{idx}] = {got}, expected -infinity");
     }
 }
 

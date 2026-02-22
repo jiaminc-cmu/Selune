@@ -13,6 +13,8 @@ pub struct LocalVarInfo {
     pub is_const: bool,
     /// Whether this is a to-be-closed variable (Lua 5.4 <close>).
     pub is_close: bool,
+    /// Whether this local was captured as an upvalue by a nested closure.
+    pub is_captured: bool,
     /// PC where the variable becomes active.
     pub start_pc: u32,
 }
@@ -101,13 +103,49 @@ impl ScopeManager {
         None
     }
 
+    /// Check if the current block needs a Close instruction (has TBC or captured locals).
+    /// Returns the register of the first local that needs closing.
+    pub fn block_needs_close(&self) -> Option<u8> {
+        let block = self.blocks.last()?;
+        let mut first_reg = None;
+        for local in &self.locals[block.num_locals_on_entry..] {
+            if local.is_close || local.is_captured {
+                match first_reg {
+                    None => first_reg = Some(local.reg),
+                    Some(r) if local.reg < r => first_reg = Some(local.reg),
+                    _ => {}
+                }
+            }
+        }
+        first_reg
+    }
+
+    /// Mark a local variable at the given register as captured by a closure.
+    pub fn mark_captured(&mut self, reg: u8) {
+        for local in self.locals.iter_mut() {
+            if local.reg == reg {
+                local.is_captured = true;
+                return;
+            }
+        }
+    }
+
     /// Leave the current block scope. Returns break jump PCs to patch.
+    /// Unresolved pending gotos are propagated to the parent block.
     pub fn leave_block(&mut self) -> BlockScope {
         self.scope_depth -= 1;
         let block = self.blocks.pop().expect("mismatched block");
         // Remove locals declared in this block
         self.locals.truncate(block.num_locals_on_entry);
         self.free_reg = block.first_free_reg_on_entry;
+
+        // Propagate unresolved pending gotos to the parent block
+        if !block.pending_gotos.is_empty() {
+            if let Some(parent) = self.blocks.last_mut() {
+                parent.pending_gotos.extend(block.pending_gotos.iter().cloned());
+            }
+        }
+
         block
     }
 
@@ -126,6 +164,7 @@ impl ScopeManager {
             scope_depth: self.scope_depth,
             is_const,
             is_close,
+            is_captured: false,
             start_pc,
         });
         self.free_reg += 1;
