@@ -320,16 +320,16 @@ mod tests {
 
     #[test]
     fn test_float_positive() {
-        let v = TValue::from_float(3.14);
+        let v = TValue::from_float(1.5);
         assert!(v.is_float());
-        assert_eq!(v.as_float(), Some(3.14));
+        assert_eq!(v.as_float(), Some(1.5));
     }
 
     #[test]
     fn test_float_negative() {
-        let v = TValue::from_float(-2.718);
+        let v = TValue::from_float(-7.25);
         assert!(v.is_float());
-        assert_eq!(v.as_float(), Some(-2.718));
+        assert_eq!(v.as_float(), Some(-7.25));
     }
 
     #[test]

@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_decimal_floats() {
-        assert_eq!(lex_single("3.14"), Token::Float(3.14));
+        assert_eq!(lex_single("1.5"), Token::Float(1.5));
         assert_eq!(lex_single("0.5"), Token::Float(0.5));
         assert_eq!(lex_single(".5"), Token::Float(0.5));
         assert_eq!(lex_single("3."), Token::Float(3.0));

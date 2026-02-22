@@ -9,7 +9,7 @@ fn bench_create_integer(c: &mut Criterion) {
 
 fn bench_create_float(c: &mut Criterion) {
     c.bench_function("tvalue_create_float", |b| {
-        b.iter(|| TValue::from_float(black_box(3.14)));
+        b.iter(|| TValue::from_float(black_box(1.5)));
     });
 }
 
@@ -27,7 +27,7 @@ fn bench_extract_integer(c: &mut Criterion) {
 }
 
 fn bench_extract_float(c: &mut Criterion) {
-    let val = TValue::from_float(3.14);
+    let val = TValue::from_float(1.5);
     c.bench_function("tvalue_extract_float", |b| {
         b.iter(|| black_box(val).as_float());
     });
