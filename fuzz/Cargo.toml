@@ -1,0 +1,23 @@
+[package]
+name = "selune-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+selune-compiler = { path = "../crates/selune-compiler" }
+selune-core = { path = "../crates/selune-core" }
+
+[[bin]]
+name = "fuzz_lexer"
+path = "fuzz_targets/fuzz_lexer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_compiler"
+path = "fuzz_targets/fuzz_compiler.rs"
+doc = false

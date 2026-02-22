@@ -1,0 +1,19 @@
+[package]
+name = "selune-compiler"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+selune-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "lexer_bench"
+harness = false
+
+[[bench]]
+name = "compiler_bench"
+harness = false
