@@ -252,8 +252,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let mm = metamethod::get_metamethod(vb, mm_name, &vm.gc);
                         if let Some(mm_func) = mm {
                             let result = call_function(vm, mm_func, &[vb, imm])?;
-                            vm.stack[base + a] =
-                                result.first().copied().unwrap_or(TValue::nil());
+                            vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
                                 "attempt to perform bitwise operation on a {} value",
@@ -279,8 +278,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let mm = metamethod::get_metamethod(vb, mm_name, &vm.gc);
                         if let Some(mm_func) = mm {
                             let result = call_function(vm, mm_func, &[vb, imm])?;
-                            vm.stack[base + a] =
-                                result.first().copied().unwrap_or(TValue::nil());
+                            vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
                                 "attempt to perform bitwise operation on a {} value",
@@ -304,8 +302,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let mm_name = vm.mm_names.as_ref().unwrap().unm;
                         if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
                             let result = call_function(vm, mm, &[vb])?;
-                            vm.stack[base + a] =
-                                result.first().copied().unwrap_or(TValue::nil());
+                            vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
                                 "attempt to perform arithmetic on a {} value",
@@ -327,8 +324,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let mm_name = vm.mm_names.as_ref().unwrap().bnot;
                         if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
                             let result = call_function(vm, mm, &[vb])?;
-                            vm.stack[base + a] =
-                                result.first().copied().unwrap_or(TValue::nil());
+                            vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
                                 "attempt to perform bitwise operation on a {} value",
@@ -396,18 +392,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                             metamethod::get_metamethod(val, mm_name, &vm.gc)
                                         });
                                     if let Some(mm_func) = mm {
-                                        let result =
-                                            call_function(vm, mm_func, &[accum, val])?;
-                                        accum = result
-                                            .first()
-                                            .copied()
-                                            .unwrap_or(TValue::nil());
+                                        let result = call_function(vm, mm_func, &[accum, val])?;
+                                        accum = result.first().copied().unwrap_or(TValue::nil());
                                     } else {
                                         return Err(LuaError::Runtime(format!(
                                             "attempt to concatenate a {} value",
-                                            selune_core::object::lua_type_name(
-                                                accum, &vm.gc
-                                            )
+                                            selune_core::object::lua_type_name(accum, &vm.gc)
                                         )));
                                     }
                                 }
@@ -433,11 +423,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 if let Some(mm_func) = mm {
                     let result = call_function(vm, mm_func, &[va, vb])?;
                     // Destination = previous instruction's A field
-                    let prev_inst =
-                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let prev_inst = proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
                     let dest = prev_inst.a() as usize;
-                    vm.stack[base + dest] =
-                        result.first().copied().unwrap_or(TValue::nil());
+                    vm.stack[base + dest] = result.first().copied().unwrap_or(TValue::nil());
                 } else {
                     return Err(LuaError::Runtime(format!(
                         "attempt to perform {} on a {} value",
@@ -460,11 +448,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     .or_else(|| metamethod::get_metamethod(right, mm_name, &vm.gc));
                 if let Some(mm_func) = mm {
                     let result = call_function(vm, mm_func, &[left, right])?;
-                    let prev_inst =
-                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let prev_inst = proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
                     let dest = prev_inst.a() as usize;
-                    vm.stack[base + dest] =
-                        result.first().copied().unwrap_or(TValue::nil());
+                    vm.stack[base + dest] = result.first().copied().unwrap_or(TValue::nil());
                 } else {
                     return Err(LuaError::Runtime(format!(
                         "attempt to perform {} on a {} value",
@@ -487,11 +473,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     .or_else(|| metamethod::get_metamethod(right, mm_name, &vm.gc));
                 if let Some(mm_func) = mm {
                     let result = call_function(vm, mm_func, &[left, right])?;
-                    let prev_inst =
-                        proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
+                    let prev_inst = proto!(vm, ci_idx).code[vm.call_stack[ci_idx].pc - 2];
                     let dest = prev_inst.a() as usize;
-                    vm.stack[base + dest] =
-                        result.first().copied().unwrap_or(TValue::nil());
+                    vm.stack[base + dest] = result.first().copied().unwrap_or(TValue::nil());
                 } else {
                     return Err(LuaError::Runtime(format!(
                         "attempt to perform {} on a {} value",
@@ -511,9 +495,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 let result = if needs_mm && !eq {
                     // Try __eq metamethod
                     let mm_name = vm.mm_names.as_ref().unwrap().eq;
-                    if let Some(mm) =
-                        metamethod::get_metamethod(va, mm_name, &vm.gc)
-                            .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                    if let Some(mm) = metamethod::get_metamethod(va, mm_name, &vm.gc)
+                        .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
                     {
                         let res = call_function(vm, mm, &[va, vb])?;
                         !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
@@ -536,9 +519,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     compare::CompareResult::Ok(v) => v,
                     compare::CompareResult::NeedMetamethod => {
                         let mm_name = vm.mm_names.as_ref().unwrap().lt;
-                        if let Some(mm) =
-                            metamethod::get_metamethod(va, mm_name, &vm.gc)
-                                .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                        if let Some(mm) = metamethod::get_metamethod(va, mm_name, &vm.gc)
+                            .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
                         {
                             let res = call_function(vm, mm, &[va, vb])?;
                             !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
@@ -563,9 +545,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     compare::CompareResult::Ok(v) => v,
                     compare::CompareResult::NeedMetamethod => {
                         let mm_name = vm.mm_names.as_ref().unwrap().le;
-                        if let Some(mm) =
-                            metamethod::get_metamethod(va, mm_name, &vm.gc)
-                                .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+                        if let Some(mm) = metamethod::get_metamethod(va, mm_name, &vm.gc)
+                            .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
                         {
                             let res = call_function(vm, mm, &[va, vb])?;
                             !res.first().copied().unwrap_or(TValue::nil()).is_falsy()
@@ -972,9 +953,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         } else {
                             TValue::nil()
                         };
-                        let pcall_args: Vec<TValue> = (1..num_args)
-                            .map(|i| vm.stack[base + a + 1 + i])
-                            .collect();
+                        let pcall_args: Vec<TValue> =
+                            (1..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
                         match call_function(vm, pcall_func, &pcall_args) {
@@ -1025,9 +1005,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         } else {
                             TValue::nil()
                         };
-                        let xpcall_args: Vec<TValue> = (2..num_args)
-                            .map(|i| vm.stack[base + a + 1 + i])
-                            .collect();
+                        let xpcall_args: Vec<TValue> =
+                            (2..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
                         match call_function(vm, xpcall_func, &xpcall_args) {
@@ -1050,8 +1029,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             Err(e) => {
                                 // Call handler with error value
                                 let err_val = e.to_tvalue(&mut vm.strings);
-                                let handler_result =
-                                    call_function(vm, handler, &[err_val]);
+                                let handler_result = call_function(vm, handler, &[err_val]);
                                 match handler_result {
                                     Ok(results) => {
                                         let mut all = vec![TValue::from_bool(false)];
@@ -1073,10 +1051,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                         // Handler itself errored
                                         let handler_err_val =
                                             handler_err.to_tvalue(&mut vm.strings);
-                                        let all = vec![
-                                            TValue::from_bool(false),
-                                            handler_err_val,
-                                        ];
+                                        let all = vec![TValue::from_bool(false), handler_err_val];
                                         let result_count = if num_results < 0 {
                                             all.len()
                                         } else {
@@ -1343,8 +1318,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             OpCode::TForPrep => {
                 let sbx = inst.sbx();
                 // Jump forward to TFORCALL
-                vm.call_stack[ci_idx].pc =
-                    (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
+                vm.call_stack[ci_idx].pc = (vm.call_stack[ci_idx].pc as i64 + sbx as i64) as usize;
             }
 
             OpCode::TForCall => {
@@ -1356,8 +1330,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 let results = call_function(vm, iter_func, &[state, control])?;
                 // Place results in R[A+4], R[A+5], ... R[A+3+c]
                 for i in 0..c {
-                    vm.stack[base + a + 4 + i] =
-                        results.get(i).copied().unwrap_or(TValue::nil());
+                    vm.stack[base + a + 4 + i] = results.get(i).copied().unwrap_or(TValue::nil());
                 }
             }
 
@@ -1483,7 +1456,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 if b >= closure.upvalues.len() {
                     return Err(LuaError::Runtime(format!(
                         "GetTabUp: upvalue index {} out of range (closure has {} upvalues)",
-                        b, closure.upvalues.len()
+                        b,
+                        closure.upvalues.len()
                     )));
                 }
                 let uv_idx = closure.upvalues[b];
@@ -1675,7 +1649,12 @@ fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, Lu
 }
 
 /// Table newindex with __newindex metamethod support.
-fn table_newindex(vm: &mut Vm, table_val: TValue, key: TValue, val: TValue) -> Result<(), LuaError> {
+fn table_newindex(
+    vm: &mut Vm,
+    table_val: TValue,
+    key: TValue,
+    val: TValue,
+) -> Result<(), LuaError> {
     if let Some(table_idx) = table_val.as_table_idx() {
         // Check if key already exists (raw)
         let existing = vm.gc.get_table(table_idx).raw_get(key);
@@ -1750,9 +1729,9 @@ fn map_native_error(e: NativeError) -> LuaError {
 /// Return the operation description for metamethod error messages.
 fn mm_op_description(mm_idx: u8) -> &'static str {
     match mm_idx {
-        0..=6 => "arithmetic",  // add, sub, mul, mod, pow, div, idiv
+        0..=6 => "arithmetic",         // add, sub, mul, mod, pow, div, idiv
         7..=11 => "bitwise operation", // band, bor, bxor, shl, shr
-        12 => "concatenation",  // concat
+        12 => "concatenation",         // concat
         _ => "arithmetic",
     }
 }

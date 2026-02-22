@@ -48,12 +48,7 @@ pub enum CompareResult {
 }
 
 /// Lua less-than comparison.
-pub fn lua_lt(
-    a: TValue,
-    b: TValue,
-    gc: &GcHeap,
-    strings: &StringInterner,
-) -> CompareResult {
+pub fn lua_lt(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> CompareResult {
     // Both integers
     if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
         return CompareResult::Ok(ia < ib);
@@ -77,12 +72,7 @@ pub fn lua_lt(
 }
 
 /// Lua less-than-or-equal comparison.
-pub fn lua_le(
-    a: TValue,
-    b: TValue,
-    gc: &GcHeap,
-    strings: &StringInterner,
-) -> CompareResult {
+pub fn lua_le(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> CompareResult {
     // Both integers
     if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
         return CompareResult::Ok(ia <= ib);

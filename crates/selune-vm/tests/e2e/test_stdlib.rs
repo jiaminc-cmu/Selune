@@ -295,8 +295,5 @@ fn test_error_string() {
 #[test]
 fn test_error_number() {
     let err = run_lua_err("error(42)");
-    assert!(
-        err.contains("42"),
-        "expected error with '42', got: {err}"
-    );
+    assert!(err.contains("42"), "expected error with '42', got: {err}");
 }
