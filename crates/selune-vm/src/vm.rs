@@ -3,8 +3,9 @@
 use crate::callinfo::CallInfo;
 use crate::dispatch;
 use crate::error::LuaError;
+use crate::metamethod::MetamethodNames;
 use selune_compiler::proto::Proto;
-use selune_core::gc::{GcHeap, GcIdx, NativeContext, UpVal, UpValLocation};
+use selune_core::gc::{GcHeap, GcIdx, NativeContext, NativeError, NativeFunction, UpVal, UpValLocation};
 use selune_core::string::StringInterner;
 use selune_core::value::TValue;
 
@@ -26,6 +27,11 @@ pub struct Vm {
     pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
     /// Max call depth before stack overflow.
     pub max_call_depth: usize,
+    /// Pre-interned metamethod names.
+    pub mm_names: Option<MetamethodNames>,
+    /// Native indices for pcall/xpcall (set during register_natives).
+    pub pcall_idx: Option<GcIdx<NativeFunction>>,
+    pub xpcall_idx: Option<GcIdx<NativeFunction>>,
 }
 
 impl Vm {
@@ -41,6 +47,9 @@ impl Vm {
             protos: Vec::new(),
             open_upvals: Vec::new(),
             max_call_depth: 200,
+            mm_names: None,
+            pcall_idx: None,
+            xpcall_idx: None,
         }
     }
 
@@ -66,6 +75,9 @@ impl Vm {
         strings: StringInterner,
     ) -> Result<Vec<TValue>, LuaError> {
         self.strings = strings;
+
+        // Initialize metamethod names
+        self.mm_names = Some(MetamethodNames::init(&mut self.strings));
 
         // Store the proto tree (keep it as-is, navigate with proto_idx)
         self.protos.clear();
@@ -144,6 +156,98 @@ impl Vm {
         self.gc
             .get_table_mut(env_idx)
             .raw_set_str(tonumber_name, tonumber_val);
+
+        // error
+        let idx = self.gc.alloc_native(native_error, "error");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"error");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // assert
+        let idx = self.gc.alloc_native(native_assert, "assert");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"assert");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // select
+        let idx = self.gc.alloc_native(native_select, "select");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"select");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // rawget
+        let idx = self.gc.alloc_native(native_rawget, "rawget");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"rawget");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // rawset
+        let idx = self.gc.alloc_native(native_rawset, "rawset");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"rawset");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // rawequal
+        let idx = self.gc.alloc_native(native_rawequal, "rawequal");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"rawequal");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // rawlen
+        let idx = self.gc.alloc_native(native_rawlen, "rawlen");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"rawlen");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // setmetatable
+        let idx = self.gc.alloc_native(native_setmetatable, "setmetatable");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"setmetatable");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // getmetatable
+        let idx = self.gc.alloc_native(native_getmetatable, "getmetatable");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"getmetatable");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // unpack (Lua 5.1 compat, also table.unpack in 5.4)
+        let idx = self.gc.alloc_native(native_unpack, "unpack");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"unpack");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // next
+        let idx = self.gc.alloc_native(native_next, "next");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"next");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // pairs
+        let idx = self.gc.alloc_native(native_pairs, "pairs");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"pairs");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // ipairs
+        let idx = self.gc.alloc_native(native_ipairs, "ipairs");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"ipairs");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // pcall - registered as a dummy native; actual dispatch is in Call opcode
+        let idx = self.gc.alloc_native(native_pcall_stub, "pcall");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"pcall");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.pcall_idx = Some(idx);
+
+        // xpcall - registered as a dummy native; actual dispatch is in Call opcode
+        let idx = self.gc.alloc_native(native_xpcall_stub, "xpcall");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"xpcall");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.xpcall_idx = Some(idx);
     }
 
     /// Get an upvalue's current value.
@@ -208,7 +312,7 @@ impl Default for Vm {
 
 // ---- Native functions ----
 
-fn native_print(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
+fn native_print(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let mut first = true;
     for arg in ctx.args {
         if !first {
@@ -221,21 +325,21 @@ fn native_print(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
     Ok(vec![])
 }
 
-fn native_type(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
+fn native_type(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let type_name = selune_core::object::lua_type_name(val, ctx.gc);
     let sid = ctx.strings.intern(type_name.as_bytes());
     Ok(vec![TValue::from_string_id(sid)])
 }
 
-fn native_tostring(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
+fn native_tostring(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let s = format_value(val, ctx.gc, ctx.strings);
     let sid = ctx.strings.intern_or_create(s.as_bytes());
     Ok(vec![TValue::from_string_id(sid)])
 }
 
-fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
+fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
     if let Some(i) = val.as_integer() {
         return Ok(vec![TValue::from_integer(i)]);
@@ -254,6 +358,234 @@ fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, String> {
         }
     }
     Ok(vec![TValue::nil()])
+}
+
+fn native_error(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let msg = ctx.args.first().copied().unwrap_or(TValue::nil());
+    Err(NativeError::Value(msg))
+}
+
+fn native_assert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if val.is_falsy() {
+        let msg = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+        if let Some(sid) = msg.as_string_id() {
+            let s = String::from_utf8_lossy(ctx.strings.get_bytes(sid)).into_owned();
+            Err(NativeError::String(format!("assertion failed! {s}")))
+        } else if msg.is_nil() {
+            Err(NativeError::String("assertion failed!".to_string()))
+        } else {
+            Err(NativeError::Value(msg))
+        }
+    } else {
+        // On success, return all arguments passed to assert
+        Ok(ctx.args.to_vec())
+    }
+}
+
+fn native_select(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let index = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if let Some(sid) = index.as_string_id() {
+        let s = ctx.strings.get_bytes(sid);
+        if s == b"#" {
+            // Return count of remaining args
+            let count = if ctx.args.len() > 1 {
+                ctx.args.len() - 1
+            } else {
+                0
+            };
+            return Ok(vec![TValue::from_integer(count as i64)]);
+        }
+    }
+    if let Some(i) = index.as_full_integer(ctx.gc) {
+        if i < 1 {
+            return Err(NativeError::String(
+                "bad argument #1 to 'select' (index out of range)".to_string(),
+            ));
+        }
+        let start = i as usize;
+        if start > ctx.args.len() - 1 {
+            return Ok(vec![]);
+        }
+        Ok(ctx.args[start..].to_vec())
+    } else {
+        Err(NativeError::String(
+            "bad argument #1 to 'select' (number or string expected, got other)".to_string(),
+        ))
+    }
+}
+
+fn native_rawget(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let key = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    let table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'rawget' (table expected)".to_string()))?;
+    Ok(vec![ctx.gc.get_table(table_idx).raw_get(key)])
+}
+
+fn native_rawset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let key = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    let val = ctx.args.get(2).copied().unwrap_or(TValue::nil());
+    let table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'rawset' (table expected)".to_string()))?;
+    ctx.gc
+        .get_table_mut(table_idx)
+        .raw_set(key, val)
+        .map_err(|e: &str| NativeError::String(e.to_string()))?;
+    Ok(vec![table_val])
+}
+
+fn native_rawequal(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let a = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let b = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    let (eq, _) = crate::compare::lua_eq(a, b, ctx.gc, ctx.strings);
+    Ok(vec![TValue::from_bool(eq)])
+}
+
+fn native_rawlen(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if let Some(table_idx) = val.as_table_idx() {
+        let len = ctx.gc.get_table(table_idx).length();
+        Ok(vec![TValue::from_full_integer(len, ctx.gc)])
+    } else if let Some(sid) = val.as_string_id() {
+        let len = ctx.strings.get_bytes(sid).len() as i64;
+        Ok(vec![TValue::from_full_integer(len, ctx.gc)])
+    } else {
+        Err(NativeError::String(
+            "bad argument #1 to 'rawlen' (table or string expected)".to_string(),
+        ))
+    }
+}
+
+fn native_setmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let mt_val = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    let table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'setmetatable' (table expected)".to_string()))?;
+    if mt_val.is_nil() {
+        ctx.gc.get_table_mut(table_idx).metatable = None;
+    } else {
+        let mt_idx = mt_val.as_table_idx().ok_or_else(|| {
+            NativeError::String("bad argument #2 to 'setmetatable' (nil or table expected)".to_string())
+        })?;
+        ctx.gc.get_table_mut(table_idx).metatable = Some(mt_idx);
+    }
+    Ok(vec![table_val])
+}
+
+fn native_getmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if let Some(table_idx) = val.as_table_idx() {
+        if let Some(mt_idx) = ctx.gc.get_table(table_idx).metatable {
+            // Check for __metatable field
+            let mm_name = ctx.strings.intern(b"__metatable");
+            let mm_val = ctx.gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Ok(vec![mm_val]);
+            }
+            Ok(vec![TValue::from_table(mt_idx)])
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else {
+        Ok(vec![TValue::nil()])
+    }
+}
+
+fn native_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let list_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let table_idx = list_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'unpack' (table expected)".to_string()))?;
+
+    let i = ctx
+        .args
+        .get(1)
+        .and_then(|v| v.as_full_integer(ctx.gc))
+        .unwrap_or(1);
+    let j = ctx
+        .args
+        .get(2)
+        .and_then(|v| v.as_full_integer(ctx.gc))
+        .unwrap_or_else(|| ctx.gc.get_table(table_idx).length());
+
+    let mut results = Vec::new();
+    let mut k = i;
+    while k <= j {
+        results.push(ctx.gc.get_table(table_idx).raw_geti(k));
+        k += 1;
+    }
+    Ok(results)
+}
+
+fn native_next(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'next' (table expected)".to_string()))?;
+    let key = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    match ctx.gc.get_table(table_idx).next(key) {
+        Some((k, v)) => Ok(vec![k, v]),
+        None => Ok(vec![TValue::nil()]),
+    }
+}
+
+fn native_pairs(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let _table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'pairs' (table expected)".to_string()))?;
+    // Return (next, table, nil)
+    let next_idx = ctx.gc.alloc_native(native_next, "next");
+    let next_val = TValue::from_native(next_idx);
+    Ok(vec![next_val, table_val, TValue::nil()])
+}
+
+fn native_ipairs(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let _table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'ipairs' (table expected)".to_string()))?;
+    // Return (ipairs_iter, table, 0)
+    let iter_idx = ctx.gc.alloc_native(native_ipairs_iter, "ipairs_iter");
+    let iter_val = TValue::from_native(iter_idx);
+    Ok(vec![iter_val, table_val, TValue::from_integer(0)])
+}
+
+fn native_ipairs_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    let table_idx = table_val
+        .as_table_idx()
+        .ok_or_else(|| NativeError::String("bad argument #1 to 'ipairs iterator' (table expected)".to_string()))?;
+    let i = ctx
+        .args
+        .get(1)
+        .and_then(|v| v.as_full_integer(ctx.gc))
+        .unwrap_or(0);
+    let next_i = i + 1;
+    let val = ctx.gc.get_table(table_idx).raw_geti(next_i);
+    if val.is_nil() {
+        Ok(vec![TValue::nil()])
+    } else {
+        Ok(vec![
+            TValue::from_full_integer(next_i, ctx.gc),
+            val,
+        ])
+    }
+}
+
+/// Stub for pcall - actual dispatch happens in the Call opcode.
+fn native_pcall_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String("pcall stub should not be called directly".to_string()))
+}
+
+/// Stub for xpcall - actual dispatch happens in the Call opcode.
+fn native_xpcall_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String("xpcall stub should not be called directly".to_string()))
 }
 
 /// Format a TValue for display (used by print, tostring).

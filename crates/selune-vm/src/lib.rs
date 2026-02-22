@@ -6,6 +6,7 @@ pub mod coerce;
 pub mod compare;
 pub mod dispatch;
 pub mod error;
+pub mod metamethod;
 pub mod vm;
 
 use error::LuaError;

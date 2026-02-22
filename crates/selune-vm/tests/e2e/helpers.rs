@@ -86,3 +86,38 @@ pub fn run_check_ints(source: &str, expected: &[i64]) {
         assert_int(&results, i, exp);
     }
 }
+
+/// Run Lua source and check results against expected float values.
+pub fn run_check_floats(source: &str, expected: &[f64]) {
+    let results = run_lua(source);
+    assert_eq!(
+        results.len(),
+        expected.len(),
+        "expected {} results, got {}",
+        expected.len(),
+        results.len()
+    );
+    for (i, &exp) in expected.iter().enumerate() {
+        assert_float(&results, i, exp);
+    }
+}
+
+/// Run Lua source and check results against expected string values.
+pub fn run_check_strings(source: &str, expected: &[&str]) {
+    let (proto, strings) = selune_compiler::compiler::compile(source.as_bytes(), "=test")
+        .unwrap_or_else(|e| panic!("compile error: {} at line {}", e.message, e.line));
+    let mut vm = Vm::new();
+    let results = vm
+        .execute(&proto, strings)
+        .unwrap_or_else(|e| panic!("runtime error: {e}"));
+    assert_eq!(
+        results.len(),
+        expected.len(),
+        "expected {} results, got {}",
+        expected.len(),
+        results.len()
+    );
+    for (i, &exp) in expected.iter().enumerate() {
+        assert_str(&results, i, exp, &vm);
+    }
+}

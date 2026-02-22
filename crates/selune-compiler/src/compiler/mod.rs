@@ -225,6 +225,13 @@ impl<'a> Compiler<'a> {
         self.fs_mut().proto.get_mut(jump_pc).set_sj(offset);
     }
 
+    /// Emit a Close instruction if the current block has to-be-closed variables.
+    fn emit_close_if_needed(&mut self, line: u32) {
+        if let Some(close_reg) = self.fs().scope.block_has_close_var() {
+            self.emit_abc(OpCode::Close, close_reg, 0, 0, line);
+        }
+    }
+
     /// Discharge an ExprDesc into a specific register.
     fn discharge_to_reg(&mut self, expr: &ExprDesc, reg: u8, line: u32) {
         match expr {
@@ -1289,10 +1296,18 @@ impl<'a> Compiler<'a> {
     /// Resolve an upvalue by walking up the function state stack.
     fn resolve_upvalue(&mut self, fs_idx: usize, name: StringId) -> Option<u8> {
         if fs_idx == 0 {
-            // At the outermost function, check its locals only
-            let local = self.func_stack[0].scope.resolve_local(name)?;
-            let reg = local.reg;
-            return Some(self.add_upvalue(fs_idx, name, true, reg));
+            // At the outermost function, check its locals
+            if let Some(local) = self.func_stack[0].scope.resolve_local(name) {
+                let reg = local.reg;
+                return Some(self.add_upvalue(fs_idx, name, true, reg));
+            }
+            // Also check the outermost function's own upvalues (e.g., _ENV)
+            for (i, up) in self.func_stack[0].upvalues.iter().enumerate() {
+                if up.name == name {
+                    return Some(i as u8);
+                }
+            }
+            return None;
         }
 
         // Check parent's locals first
@@ -1327,10 +1342,17 @@ impl<'a> Compiler<'a> {
         idx
     }
 
-    /// Get the upvalue index for _ENV (always 0 at any function level).
+    /// Get the upvalue index for _ENV in the current function.
     fn resolve_upvalue_env(&mut self) -> u8 {
-        // _ENV is upvalue 0 of every function
-        0
+        let env_name = self.lexer.strings.intern(b"_ENV");
+        let fs_idx = self.func_stack.len() - 1;
+        // For the top-level function, _ENV is always upvalue 0 (added in compile()).
+        // For child functions, resolve it through the upvalue chain.
+        if fs_idx == 0 {
+            return 0;
+        }
+        self.resolve_upvalue(fs_idx, env_name)
+            .expect("_ENV must be resolvable")
     }
 
     /// Compile a function body (after 'function' keyword or in function statement).
@@ -1552,6 +1574,7 @@ impl<'a> Compiler<'a> {
 
         self.fs_mut().scope.enter_block(false);
         self.block()?;
+        self.emit_close_if_needed(self.line());
         self.fs_mut().scope.leave_block();
 
         // Handle elseif chain
@@ -1571,6 +1594,7 @@ impl<'a> Compiler<'a> {
 
             self.fs_mut().scope.enter_block(false);
             self.block()?;
+            self.emit_close_if_needed(self.line());
             self.fs_mut().scope.leave_block();
         }
 
@@ -1585,6 +1609,7 @@ impl<'a> Compiler<'a> {
             self.advance()?; // consume 'else'
             self.fs_mut().scope.enter_block(false);
             self.block()?;
+            self.emit_close_if_needed(self.line());
             self.fs_mut().scope.leave_block();
         } else {
             // No else: patch false_jump to after the if statement
@@ -1613,6 +1638,7 @@ impl<'a> Compiler<'a> {
 
         self.fs_mut().scope.enter_block(true);
         self.block()?;
+        self.emit_close_if_needed(self.line());
         let block = self.fs_mut().scope.leave_block();
 
         // Jump back to loop start
@@ -1636,6 +1662,7 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'do'
         self.fs_mut().scope.enter_block(false);
         self.block()?;
+        self.emit_close_if_needed(self.line());
         self.fs_mut().scope.leave_block();
         self.expect(&Token::End)?;
         Ok(())
@@ -1698,6 +1725,7 @@ impl<'a> Compiler<'a> {
         self.fs_mut().scope.add_local(var_name, false, false, pc);
 
         self.block()?;
+        self.emit_close_if_needed(self.line());
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -1738,26 +1766,23 @@ impl<'a> Compiler<'a> {
         // Allocate 4 hidden slots: iterator func, state, control, to-be-closed
         // Then the declared variables
         let iter_reg = self.fs_mut().scope.alloc_reg();
-        let state_reg = self.fs_mut().scope.alloc_reg();
-        let control_reg = self.fs_mut().scope.alloc_reg();
+        let _state_reg = self.fs_mut().scope.alloc_reg();
+        let _control_reg = self.fs_mut().scope.alloc_reg();
         let _tbc_reg = self.fs_mut().scope.alloc_reg();
 
-        // Parse iterator expression list
-        let expr = self.expression()?;
-        self.discharge_to_reg(&expr, iter_reg, line);
-        if self.test_next(&Token::Comma)? {
-            let state_expr = self.expression()?;
-            self.discharge_to_reg(&state_expr, state_reg, line);
-            if self.test_next(&Token::Comma)? {
-                let ctrl_expr = self.expression()?;
-                self.discharge_to_reg(&ctrl_expr, control_reg, line);
-            } else {
-                self.emit_abx(OpCode::LoadNil, control_reg, 0, line);
+        // Parse iterator expression list, adjusted to 3 values (iter, state, control)
+        let num_exprs = self.expression_list_adjust(iter_reg, 3)?;
+
+        // Pad with nils if fewer than 3 expressions
+        if num_exprs < 3 {
+            for i in num_exprs..3 {
+                self.emit_abx(OpCode::LoadNil, iter_reg + i, 0, line);
             }
-        } else {
-            self.emit_abx(OpCode::LoadNil, state_reg, 0, line);
-            self.emit_abx(OpCode::LoadNil, control_reg, 0, line);
         }
+
+        // Reset free_reg to base + 4 (right after the 4 hidden slots)
+        // so loop variables are allocated at the correct positions
+        self.fs_mut().scope.free_reg = base + 4;
 
         self.expect(&Token::Do)?;
 
@@ -1773,6 +1798,7 @@ impl<'a> Compiler<'a> {
         }
 
         self.block()?;
+        self.emit_close_if_needed(self.line());
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -1814,6 +1840,7 @@ impl<'a> Compiler<'a> {
         let cond = self.expression()?;
         let line = self.line();
         let loop_back_jump = self.code_test_jump(&cond, false, line)?;
+        self.emit_close_if_needed(self.line());
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -1921,11 +1948,19 @@ impl<'a> Compiler<'a> {
 
         // Multiple return values
         self.discharge_to_reg(&first_expr, base, line);
+        // Advance free_reg past discharged value so next expression doesn't clobber it
+        if self.fs().scope.free_reg <= base + 1 {
+            self.fs_mut().scope.free_reg = base + 1;
+        }
         let mut count = 1u8;
         while self.test_next(&Token::Comma)? {
             let expr = self.expression()?;
             self.discharge_to_reg(&expr, base + count, line);
             count += 1;
+            // Advance free_reg past this value too
+            if self.fs().scope.free_reg <= base + count {
+                self.fs_mut().scope.free_reg = base + count;
+            }
         }
         self.test_next(&Token::Semi)?;
         self.emit(

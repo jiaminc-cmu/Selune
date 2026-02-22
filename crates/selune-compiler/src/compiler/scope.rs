@@ -89,6 +89,18 @@ impl ScopeManager {
         });
     }
 
+    /// Check if the current block has any to-be-closed variables.
+    /// Returns the register of the first close variable in the block (if any).
+    pub fn block_has_close_var(&self) -> Option<u8> {
+        let block = self.blocks.last()?;
+        for local in &self.locals[block.num_locals_on_entry..] {
+            if local.is_close {
+                return Some(local.reg);
+            }
+        }
+        None
+    }
+
     /// Leave the current block scope. Returns break jump PCs to patch.
     pub fn leave_block(&mut self) -> BlockScope {
         self.scope_depth -= 1;

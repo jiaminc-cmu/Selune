@@ -6,18 +6,32 @@ use selune_core::gc::GcHeap;
 use selune_core::string::StringInterner;
 use selune_core::value::TValue;
 
+/// Result of an arithmetic operation that may need a metamethod fallback.
+pub enum ArithResult {
+    /// Operation succeeded with this value.
+    Ok(TValue),
+    /// Type mismatch — caller should try metamethod (MMBin).
+    NeedMetamethod,
+    /// Actual error (e.g. division by zero) — propagate.
+    Error(LuaError),
+}
+
 /// Perform a binary arithmetic operation.
+/// Returns `ArithResult::NeedMetamethod` on type mismatch instead of erroring.
 pub fn arith_op(
     op: ArithOp,
     a: TValue,
     b: TValue,
     gc: &mut GcHeap,
     strings: &StringInterner,
-) -> Result<TValue, LuaError> {
+) -> ArithResult {
     // Fast path: both integers (except Div and Pow which always produce float)
     if !matches!(op, ArithOp::Div | ArithOp::Pow) {
         if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
-            return int_arith(op, ia, ib, gc);
+            return match int_arith(op, ia, ib, gc) {
+                Ok(v) => ArithResult::Ok(v),
+                Err(e) => ArithResult::Error(e),
+            };
         }
     }
 
@@ -26,14 +40,11 @@ pub fn arith_op(
     let fb = coerce::to_number(b, gc, strings);
 
     match (fa, fb) {
-        (Some(fa), Some(fb)) => {
-            let result = float_arith(op, fa, fb)?;
-            Ok(TValue::from_float(result))
-        }
-        _ => Err(LuaError::Runtime(format!(
-            "attempt to perform arithmetic on a {} value",
-            type_name_of(a, gc)
-        ))),
+        (Some(fa), Some(fb)) => match float_arith(op, fa, fb) {
+            Ok(result) => ArithResult::Ok(TValue::from_float(result)),
+            Err(e) => ArithResult::Error(e),
+        },
+        _ => ArithResult::NeedMetamethod,
     }
 }
 
@@ -151,37 +162,27 @@ fn lua_shr(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Unary minus.
-pub fn arith_unm(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Result<TValue, LuaError> {
+/// Unary minus. Returns NeedMetamethod on type mismatch.
+pub fn arith_unm(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> ArithResult {
     if let Some(i) = v.as_full_integer(gc) {
-        Ok(TValue::from_full_integer(i.wrapping_neg(), gc))
+        ArithResult::Ok(TValue::from_full_integer(i.wrapping_neg(), gc))
     } else if let Some(f) = v.as_float() {
-        Ok(TValue::from_float(-f))
+        ArithResult::Ok(TValue::from_float(-f))
     } else if let Some(f) = coerce::to_number(v, gc, strings) {
-        Ok(TValue::from_float(-f))
+        ArithResult::Ok(TValue::from_float(-f))
     } else {
-        Err(LuaError::Runtime(format!(
-            "attempt to perform arithmetic on a {} value",
-            type_name_of(v, gc)
-        )))
+        ArithResult::NeedMetamethod
     }
 }
 
-/// Bitwise NOT.
-pub fn arith_bnot(
-    v: TValue,
-    gc: &mut GcHeap,
-    strings: &StringInterner,
-) -> Result<TValue, LuaError> {
+/// Bitwise NOT. Returns NeedMetamethod on type mismatch.
+pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> ArithResult {
     if let Some(i) = v.as_full_integer(gc) {
-        Ok(TValue::from_full_integer(!i, gc))
+        ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
-        Ok(TValue::from_full_integer(!i, gc))
+        ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else {
-        Err(LuaError::Runtime(format!(
-            "attempt to perform bitwise operation on a {} value",
-            type_name_of(v, gc)
-        )))
+        ArithResult::NeedMetamethod
     }
 }
 
@@ -192,51 +193,45 @@ pub fn str_len(v: TValue, strings: &StringInterner) -> Option<i64> {
 }
 
 /// Concatenate a slice of TValues into a single string.
+/// Returns NeedMetamethod if any value can't be converted to string.
 pub fn lua_concat(
     values: &[TValue],
     gc: &GcHeap,
     strings: &mut StringInterner,
-) -> Result<TValue, LuaError> {
+) -> ArithResult {
     let mut result = Vec::new();
     for &v in values.iter() {
         if let Some(sid) = coerce::to_string_for_concat(v, gc, strings) {
             result.extend_from_slice(strings.get_bytes(sid));
         } else {
-            return Err(LuaError::Runtime(format!(
-                "attempt to concatenate a {} value",
-                type_name_of(v, gc)
-            )));
+            return ArithResult::NeedMetamethod;
         }
     }
     let sid = strings.intern_or_create(&result);
-    Ok(TValue::from_string_id(sid))
-}
-
-fn type_name_of(v: TValue, gc: &GcHeap) -> &'static str {
-    selune_core::object::lua_type_name(v, gc)
+    ArithResult::Ok(TValue::from_string_id(sid))
 }
 
 /// Bitwise operations that need integer coercion.
+/// Returns NeedMetamethod on type mismatch.
 pub fn bitwise_op(
     op: ArithOp,
     a: TValue,
     b: TValue,
     gc: &mut GcHeap,
     strings: &StringInterner,
-) -> Result<TValue, LuaError> {
-    let ia = coerce::to_integer(a, gc, strings).ok_or_else(|| {
-        LuaError::Runtime(format!(
-            "attempt to perform bitwise operation on a {} value",
-            type_name_of(a, gc)
-        ))
-    })?;
-    let ib = coerce::to_integer(b, gc, strings).ok_or_else(|| {
-        LuaError::Runtime(format!(
-            "attempt to perform bitwise operation on a {} value",
-            type_name_of(b, gc)
-        ))
-    })?;
-    int_arith(op, ia, ib, gc)
+) -> ArithResult {
+    let ia = match coerce::to_integer(a, gc, strings) {
+        Some(i) => i,
+        None => return ArithResult::NeedMetamethod,
+    };
+    let ib = match coerce::to_integer(b, gc, strings) {
+        Some(i) => i,
+        None => return ArithResult::NeedMetamethod,
+    };
+    match int_arith(op, ia, ib, gc) {
+        Ok(v) => ArithResult::Ok(v),
+        Err(e) => ArithResult::Error(e),
+    }
 }
 
 /// Arithmetic operation enum.

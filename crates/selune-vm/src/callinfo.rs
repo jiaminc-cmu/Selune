@@ -23,6 +23,8 @@ pub struct CallInfo {
     pub vararg_base: Option<usize>,
     /// Counter for tail calls to detect infinite tail recursion.
     pub tail_count: u32,
+    /// Stack indices of to-be-closed variables in this frame.
+    pub tbc_slots: Vec<usize>,
 }
 
 impl CallInfo {
@@ -37,6 +39,7 @@ impl CallInfo {
             func_stack_idx: 0,
             vararg_base: None,
             tail_count: 0,
+            tbc_slots: Vec::new(),
         }
     }
 }

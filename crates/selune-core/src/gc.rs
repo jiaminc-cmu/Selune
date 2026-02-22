@@ -57,11 +57,26 @@ pub struct LuaClosure {
     pub upvalues: Vec<GcIdx<UpVal>>,
 }
 
+/// Error type for native functions.
+#[derive(Debug)]
+pub enum NativeError {
+    /// A string error message (for internal errors).
+    String(String),
+    /// A Lua TValue error (for error() throwing arbitrary values).
+    Value(TValue),
+}
+
+impl From<String> for NativeError {
+    fn from(s: String) -> Self {
+        NativeError::String(s)
+    }
+}
+
 /// A native (Rust) function callable from Lua.
 pub struct NativeFunction {
     /// The function pointer. Takes &mut Vm proxy args and returns results.
     /// We store it as a raw fn pointer; the Vm reference is passed separately.
-    pub func: fn(&mut NativeContext) -> Result<Vec<TValue>, String>,
+    pub func: fn(&mut NativeContext) -> Result<Vec<TValue>, NativeError>,
     pub name: &'static str,
 }
 
@@ -183,7 +198,7 @@ impl GcHeap {
 
     pub fn alloc_native(
         &mut self,
-        func: fn(&mut NativeContext) -> Result<Vec<TValue>, String>,
+        func: fn(&mut NativeContext) -> Result<Vec<TValue>, NativeError>,
         name: &'static str,
     ) -> GcIdx<NativeFunction> {
         let native = NativeFunction { func, name };
