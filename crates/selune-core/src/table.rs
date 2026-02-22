@@ -303,6 +303,11 @@ fn table_key_to_tvalue(k: TableKey) -> TValue {
 
 impl std::fmt::Debug for Table {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "table(array={}, hash={})", self.array.len(), self.hash.len())
+        write!(
+            f,
+            "table(array={}, hash={})",
+            self.array.len(),
+            self.hash.len()
+        )
     }
 }

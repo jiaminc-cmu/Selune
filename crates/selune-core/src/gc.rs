@@ -145,15 +145,26 @@ impl GcHeap {
     }
 
     pub fn get_table(&self, idx: GcIdx<Table>) -> &Table {
-        self.tables[idx.0 as usize].as_ref().expect("table was freed")
+        self.tables[idx.0 as usize]
+            .as_ref()
+            .expect("table was freed")
     }
 
     pub fn get_table_mut(&mut self, idx: GcIdx<Table>) -> &mut Table {
-        self.tables[idx.0 as usize].as_mut().expect("table was freed")
+        self.tables[idx.0 as usize]
+            .as_mut()
+            .expect("table was freed")
     }
 
-    pub fn alloc_closure(&mut self, proto_idx: usize, upvalues: Vec<GcIdx<UpVal>>) -> GcIdx<LuaClosure> {
-        let closure = LuaClosure { proto_idx, upvalues };
+    pub fn alloc_closure(
+        &mut self,
+        proto_idx: usize,
+        upvalues: Vec<GcIdx<UpVal>>,
+    ) -> GcIdx<LuaClosure> {
+        let closure = LuaClosure {
+            proto_idx,
+            upvalues,
+        };
         if let Some(idx) = self.closure_free.pop() {
             self.closures[idx as usize] = Some(closure);
             GcIdx(idx, PhantomData)
@@ -165,7 +176,9 @@ impl GcHeap {
     }
 
     pub fn get_closure(&self, idx: GcIdx<LuaClosure>) -> &LuaClosure {
-        self.closures[idx.0 as usize].as_ref().expect("closure was freed")
+        self.closures[idx.0 as usize]
+            .as_ref()
+            .expect("closure was freed")
     }
 
     pub fn alloc_native(
@@ -185,7 +198,9 @@ impl GcHeap {
     }
 
     pub fn get_native(&self, idx: GcIdx<NativeFunction>) -> &NativeFunction {
-        self.natives[idx.0 as usize].as_ref().expect("native fn was freed")
+        self.natives[idx.0 as usize]
+            .as_ref()
+            .expect("native fn was freed")
     }
 
     pub fn alloc_upval(&mut self, location: UpValLocation) -> GcIdx<UpVal> {
@@ -201,11 +216,15 @@ impl GcHeap {
     }
 
     pub fn get_upval(&self, idx: GcIdx<UpVal>) -> &UpVal {
-        self.upvals[idx.0 as usize].as_ref().expect("upval was freed")
+        self.upvals[idx.0 as usize]
+            .as_ref()
+            .expect("upval was freed")
     }
 
     pub fn get_upval_mut(&mut self, idx: GcIdx<UpVal>) -> &mut UpVal {
-        self.upvals[idx.0 as usize].as_mut().expect("upval was freed")
+        self.upvals[idx.0 as usize]
+            .as_mut()
+            .expect("upval was freed")
     }
 }
 

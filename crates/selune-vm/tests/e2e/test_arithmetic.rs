@@ -131,11 +131,9 @@ fn test_len_empty_string() {
 
 #[test]
 fn test_concat_strings() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return \"hello\" .. \" \" .. \"world\"",
-        "=test",
-    )
-    .unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return \"hello\" .. \" \" .. \"world\"", "=test")
+            .unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_eq!(results.len(), 1);
@@ -144,11 +142,8 @@ fn test_concat_strings() {
 
 #[test]
 fn test_concat_with_numbers() {
-    let (proto, strings) = selune_compiler::compiler::compile(
-        b"return \"value: \" .. 42",
-        "=test",
-    )
-    .unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return \"value: \" .. 42", "=test").unwrap();
     let mut vm = selune_vm::vm::Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_eq!(results.len(), 1);
@@ -158,7 +153,10 @@ fn test_concat_with_numbers() {
 #[test]
 fn test_complex_expression() {
     // (2 + 3) * 4 - 1
-    run_check_ints("local a = 2; local b = 3; local c = 4; return (a + b) * c - 1", &[19]);
+    run_check_ints(
+        "local a = 2; local b = 3; local c = 4; return (a + b) * c - 1",
+        &[19],
+    );
 }
 
 #[test]

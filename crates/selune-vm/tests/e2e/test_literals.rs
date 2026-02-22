@@ -52,7 +52,8 @@ fn test_return_nil() {
 
 #[test]
 fn test_return_string() {
-    let (proto, strings) = selune_compiler::compiler::compile(b"return \"hello\"", "=test").unwrap();
+    let (proto, strings) =
+        selune_compiler::compiler::compile(b"return \"hello\"", "=test").unwrap();
     let mut vm = Vm::new();
     let results = vm.execute(&proto, strings).unwrap();
     assert_eq!(results.len(), 1);

@@ -168,7 +168,11 @@ pub fn arith_unm(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Result
 }
 
 /// Bitwise NOT.
-pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Result<TValue, LuaError> {
+pub fn arith_bnot(
+    v: TValue,
+    gc: &mut GcHeap,
+    strings: &StringInterner,
+) -> Result<TValue, LuaError> {
     if let Some(i) = v.as_full_integer(gc) {
         Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {

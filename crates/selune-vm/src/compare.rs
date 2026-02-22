@@ -36,7 +36,12 @@ pub fn lua_eq(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> bo
 }
 
 /// Lua less-than comparison.
-pub fn lua_lt(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> Result<bool, LuaError> {
+pub fn lua_lt(
+    a: TValue,
+    b: TValue,
+    gc: &GcHeap,
+    strings: &StringInterner,
+) -> Result<bool, LuaError> {
     // Both integers
     if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
         return Ok(ia < ib);
@@ -63,7 +68,12 @@ pub fn lua_lt(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> Re
 }
 
 /// Lua less-than-or-equal comparison.
-pub fn lua_le(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> Result<bool, LuaError> {
+pub fn lua_le(
+    a: TValue,
+    b: TValue,
+    gc: &GcHeap,
+    strings: &StringInterner,
+) -> Result<bool, LuaError> {
     // Both integers
     if let (Some(ia), Some(ib)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
         return Ok(ia <= ib);
