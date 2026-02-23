@@ -9,14 +9,21 @@ pub fn execute(instructions: &[OpCode]) -> TValue {
             OpCode::LoadInt(dst, val) => {
                 registers[*dst] = TValue::int(*val);
             }
+            OpCode::LoadFloat(dst, val) => {
+                registers[*dst] = TValue::float(*val);
+            }
             OpCode::Add(dst, lhs, rhs) => {
                 let l = registers[*lhs];
                 let r = registers[*rhs];
                 unsafe {
-                    if l.tag == Tag::Int && r.tag == Tag::Int {
-                        registers[*dst] = TValue::int(l.payload.i + r.payload.i);
-                    } else {
-                        panic!("Type Error!");
+                    match (l.tag, r.tag) {
+                        (Tag::Int, Tag::Int) => {
+                            registers[*dst] = TValue::int(l.payload.i + r.payload.i);
+                        }
+                        (Tag::Float, Tag::Float) => {
+                            registers[*dst] = TValue::float(l.payload.f + r.payload.f);
+                        }
+                        _ => panic!("Type Error!"),
                     }
                 }
             }
