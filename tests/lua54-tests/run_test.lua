@@ -29,4 +29,5 @@ if ok then
 else
   print("FAIL: " .. testfile)
   print("  " .. tostring(err))
+  os.exit(1)
 end

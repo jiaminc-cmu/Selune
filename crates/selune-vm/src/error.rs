@@ -26,7 +26,7 @@ impl LuaError {
                 TValue::from_string_id(sid)
             }
             LuaError::StackOverflow => {
-                let sid = strings.intern(b"stack overflow");
+                let sid = strings.intern(b"C stack overflow");
                 TValue::from_string_id(sid)
             }
             LuaError::LuaValue(v) => *v,
@@ -42,7 +42,7 @@ impl fmt::Display for LuaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LuaError::Runtime(msg) => write!(f, "{msg}"),
-            LuaError::StackOverflow => write!(f, "stack overflow"),
+            LuaError::StackOverflow => write!(f, "C stack overflow"),
             LuaError::LuaValue(v) => write!(f, "{:?}", v),
             LuaError::Yield(_) => write!(f, "cannot yield from main thread"),
         }

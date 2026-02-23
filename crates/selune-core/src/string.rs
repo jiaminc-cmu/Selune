@@ -130,6 +130,19 @@ impl StringInterner {
         }
     }
 
+    /// Look up a short string without creating it. Returns None if not yet interned.
+    pub fn find(&self, bytes: &[u8]) -> Option<StringId> {
+        let hash = lua_hash(bytes);
+        if let Some(ids) = self.short_lookup.get(&hash) {
+            for &id in ids {
+                if self.strings[id as usize].as_bytes() == bytes {
+                    return Some(StringId(id));
+                }
+            }
+        }
+        None
+    }
+
     /// Intern a short string (<=40 bytes). Returns existing StringId if already interned.
     pub fn intern(&mut self, bytes: &[u8]) -> StringId {
         debug_assert!(bytes.len() <= SSO_MAX, "use create_long for long strings");

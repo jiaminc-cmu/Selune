@@ -26,6 +26,8 @@ pub struct Lexer<'a> {
     column: u32,
     current: Option<Result<SpannedToken, LexError>>,
     pub strings: StringInterner,
+    /// Original text of the current token (used for error messages, e.g., "near '1.000'")
+    pub token_text: String,
 }
 
 impl<'a> Lexer<'a> {
@@ -38,6 +40,7 @@ impl<'a> Lexer<'a> {
             column: 1,
             current: None,
             strings: StringInterner::new(),
+            token_text: String::new(),
         };
         // Prime the first token
         lexer.current = Some(lexer.scan_token());
@@ -53,6 +56,7 @@ impl<'a> Lexer<'a> {
             column: 1,
             current: None,
             strings,
+            token_text: String::new(),
         };
         // Prime the first token using the provided interner
         lexer.current = Some(lexer.scan_token());
@@ -179,6 +183,17 @@ impl<'a> Lexer<'a> {
     fn scan_token(&mut self) -> Result<SpannedToken, LexError> {
         self.skip_whitespace_and_comments();
 
+        let token_start = self.pos;
+        let result = self.scan_token_inner();
+        // Set token_text from the source bytes consumed
+        let token_end = self.pos;
+        if token_start < token_end && token_start < self.source.len() {
+            self.token_text = String::from_utf8_lossy(&self.source[token_start..token_end]).into_owned();
+        }
+        result
+    }
+
+    fn scan_token_inner(&mut self) -> Result<SpannedToken, LexError> {
         let span = Span {
             line: self.line,
             column: self.column,
@@ -187,6 +202,7 @@ impl<'a> Lexer<'a> {
         let ch = match self.peek() {
             Some(ch) => ch,
             None => {
+                self.token_text = "<eof>".to_string();
                 return Ok(SpannedToken {
                     token: Token::Eof,
                     span,
@@ -445,8 +461,15 @@ impl<'a> Lexer<'a> {
             _ if is_ident_start(ch) => self.scan_name(span),
             _ => {
                 self.advance_char();
+                // PUC Lua format: "unexpected symbol near '<\X>'" for non-printable,
+                // "unexpected symbol near 'c'" for printable chars
+                let near_str = if ch.is_ascii_graphic() || ch == b' ' {
+                    format!("'{}'", ch as char)
+                } else {
+                    format!("'<\\{}>'", ch)
+                };
                 Err(LexError {
-                    message: format!("unexpected character '{}'", ch as char),
+                    message: format!("unexpected symbol near {}", near_str),
                     line: span.line,
                     column: span.column,
                 })
@@ -543,6 +566,26 @@ impl<'a> Lexer<'a> {
                         column: span.column,
                     });
                 }
+            }
+        }
+
+        // After a number, if the next char is a letter or underscore, it's malformed
+        if let Some(ch) = self.peek() {
+            if ch.is_ascii_alphabetic() || ch == b'_' {
+                // Consume the rest of the "word" for better error messages
+                while let Some(ch) = self.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
+                        self.advance_char();
+                    } else {
+                        break;
+                    }
+                }
+                let text = std::str::from_utf8(&self.source[start..self.pos]).unwrap_or("?");
+                return Err(LexError {
+                    message: format!("malformed number near '{text}'"),
+                    line: span.line,
+                    column: span.column,
+                });
             }
         }
 
@@ -645,6 +688,25 @@ impl<'a> Lexer<'a> {
             });
         }
 
+        // After a number, if the next char is a letter or underscore, it's malformed
+        if let Some(ch) = self.peek() {
+            if ch.is_ascii_alphabetic() || ch == b'_' {
+                while let Some(ch) = self.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
+                        self.advance_char();
+                    } else {
+                        break;
+                    }
+                }
+                let text = std::str::from_utf8(&self.source[start..self.pos]).unwrap_or("?");
+                return Err(LexError {
+                    message: format!("malformed number near '{text}'"),
+                    line: span.line,
+                    column: span.column,
+                });
+            }
+        }
+
         let text = std::str::from_utf8(&self.source[start..self.pos]).unwrap();
 
         if is_float {
@@ -738,7 +800,25 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Build the "near" token for string error messages.
+    /// Shows the string content from `start_pos` to current position.
+    /// If `include_current` is true, includes the character at self.pos.
+    fn string_near_token(&self, start_pos: usize, include_current: bool) -> String {
+        let end = if include_current && self.pos < self.source.len() {
+            self.pos + 1
+        } else {
+            self.pos
+        };
+        let end = end.min(self.source.len());
+        let raw = &self.source[start_pos..end];
+        // Truncate to reasonable length
+        let truncated = if raw.len() > 50 { &raw[..50] } else { raw };
+        let s = String::from_utf8_lossy(truncated);
+        format!("'{}'", s)
+    }
+
     fn scan_short_string(&mut self, span: Span) -> Result<SpannedToken, LexError> {
+        let string_start = self.pos; // position of the opening quote
         let quote = self.advance_char().unwrap();
         let mut buf = Vec::new();
 
@@ -746,14 +826,14 @@ impl<'a> Lexer<'a> {
             match self.peek() {
                 None => {
                     return Err(LexError {
-                        message: "unterminated string".to_string(),
+                        message: format!("unfinished string near <eof>"),
                         line: span.line,
                         column: span.column,
                     });
                 }
                 Some(ch) if ch == b'\n' || ch == b'\r' => {
                     return Err(LexError {
-                        message: "unterminated string".to_string(),
+                        message: format!("unfinished string near {}", self.string_near_token(string_start, false)),
                         line: span.line,
                         column: span.column,
                     });
@@ -816,14 +896,32 @@ impl<'a> Lexer<'a> {
                         }
                         Some(b'x') => {
                             self.advance_char();
-                            let h1 = self.expect_hex_digit(span)?;
-                            let h2 = self.expect_hex_digit(span)?;
+                            let h1 = match self.peek() {
+                                Some(ch) if ch.is_ascii_hexdigit() => { self.advance_char(); hex_value(ch) }
+                                _ => return Err(LexError {
+                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
+                                    line: span.line, column: span.column,
+                                }),
+                            };
+                            let h2 = match self.peek() {
+                                Some(ch) if ch.is_ascii_hexdigit() => { self.advance_char(); hex_value(ch) }
+                                _ => return Err(LexError {
+                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
+                                    line: span.line, column: span.column,
+                                }),
+                            };
                             buf.push((h1 << 4) | h2);
                         }
                         Some(b'u') => {
                             self.advance_char();
-                            self.expect_char(b'{', span)?;
-                            let mut code: u32 = 0;
+                            match self.peek() {
+                                Some(b'{') => { self.advance_char(); }
+                                _ => return Err(LexError {
+                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
+                                    line: span.line, column: span.column,
+                                }),
+                            }
+                            let mut code: u64 = 0;
                             let mut count = 0;
                             loop {
                                 match self.peek() {
@@ -833,11 +931,11 @@ impl<'a> Lexer<'a> {
                                     }
                                     Some(ch) if ch.is_ascii_hexdigit() => {
                                         self.advance_char();
-                                        code = code * 16 + hex_value(ch) as u32;
+                                        code = code * 16 + hex_value(ch) as u64;
                                         count += 1;
                                         if code > 0x7FFF_FFFF {
                                             return Err(LexError {
-                                                message: "UTF-8 value too large".to_string(),
+                                                message: format!("UTF-8 value too large near {}", self.string_near_token(string_start, false)),
                                                 line: span.line,
                                                 column: span.column,
                                             });
@@ -845,7 +943,7 @@ impl<'a> Lexer<'a> {
                                     }
                                     _ => {
                                         return Err(LexError {
-                                            message: "invalid escape sequence in \\u{}".to_string(),
+                                            message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
                                             line: span.line,
                                             column: span.column,
                                         });
@@ -854,13 +952,13 @@ impl<'a> Lexer<'a> {
                             }
                             if count == 0 {
                                 return Err(LexError {
-                                    message: "missing digits in \\u{}".to_string(),
+                                    message: format!("missing unicode value near {}", self.string_near_token(string_start, true)),
                                     line: span.line,
                                     column: span.column,
                                 });
                             }
                             // Encode as UTF-8 (Lua 5.4 supports up to 0x7FFFFFFF)
-                            encode_utf8_lua(code, &mut buf);
+                            encode_utf8_lua(code as u32, &mut buf);
                         }
                         Some(b'z') => {
                             self.advance_char();
@@ -895,23 +993,23 @@ impl<'a> Lexer<'a> {
                             }
                             if val > 255 {
                                 return Err(LexError {
-                                    message: format!("decimal escape too large: {val}"),
+                                    message: format!("decimal escape too large near {}", self.string_near_token(string_start, true)),
                                     line: span.line,
                                     column: span.column,
                                 });
                             }
                             buf.push(val as u8);
                         }
-                        Some(ch) => {
+                        Some(_ch) => {
                             return Err(LexError {
-                                message: format!("invalid escape sequence '\\{}'", ch as char),
+                                message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
                                 line: span.line,
                                 column: span.column,
                             });
                         }
                         None => {
                             return Err(LexError {
-                                message: "unterminated string".to_string(),
+                                message: "unfinished string near <eof>".to_string(),
                                 line: span.line,
                                 column: span.column,
                             });
@@ -956,7 +1054,7 @@ impl<'a> Lexer<'a> {
             match self.peek() {
                 None => {
                     return Err(LexError {
-                        message: "unterminated long string/comment".to_string(),
+                        message: "unfinished long string near <eof>".to_string(),
                         line: self.line,
                         column: self.column,
                     });
@@ -1502,13 +1600,13 @@ mod tests {
     #[test]
     fn test_error_unterminated_string() {
         let err = lex_error("\"hello");
-        assert!(err.message.contains("unterminated string"));
+        assert!(err.message.contains("unfinished string"));
     }
 
     #[test]
     fn test_error_unterminated_long_string() {
         let err = lex_error("[[hello");
-        assert!(err.message.contains("unterminated long string"));
+        assert!(err.message.contains("unfinished long string"));
     }
 
     #[test]

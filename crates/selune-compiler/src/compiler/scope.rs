@@ -55,6 +55,15 @@ pub struct LabelInfo {
 }
 
 /// Manages scopes and local variables for a single function.
+/// A finished local variable (gone out of scope) with end_pc recorded.
+#[derive(Clone, Debug)]
+pub struct FinishedLocal {
+    pub name: StringId,
+    pub reg: u8,
+    pub start_pc: u32,
+    pub end_pc: u32,
+}
+
 pub struct ScopeManager {
     /// All local variables in the current function.
     pub locals: Vec<LocalVarInfo>,
@@ -66,6 +75,12 @@ pub struct ScopeManager {
     pub free_reg: u8,
     /// High-water mark for register usage.
     pub max_reg: u8,
+    /// Locals that have gone out of scope, accumulated for proto.local_vars.
+    pub finished_locals: Vec<FinishedLocal>,
+    /// Flag set when register allocation would exceed the limit.
+    pub reg_overflow: bool,
+    /// Flag set when local variable count exceeds the limit.
+    pub local_overflow: bool,
 }
 
 impl ScopeManager {
@@ -76,6 +91,9 @@ impl ScopeManager {
             scope_depth: 0,
             free_reg: 0,
             max_reg: 0,
+            finished_locals: Vec::new(),
+            reg_overflow: false,
+            local_overflow: false,
         }
     }
 
@@ -119,6 +137,12 @@ impl ScopeManager {
             }
         }
         first_reg
+    }
+
+    /// Check if any to-be-closed variable exists in the current function scope.
+    /// When true, `return f()` cannot be compiled as a tail call.
+    pub fn has_tbc_in_scope(&self) -> bool {
+        self.locals.iter().any(|l| l.is_close)
     }
 
     /// Mark a local variable at the given register as captured by a closure.
@@ -176,8 +200,21 @@ impl ScopeManager {
     }
 
     pub fn leave_block(&mut self) -> BlockScope {
+        self.leave_block_at_pc(0)
+    }
+
+    pub fn leave_block_at_pc(&mut self, end_pc: u32) -> BlockScope {
         self.scope_depth -= 1;
         let block = self.blocks.pop().expect("mismatched block");
+        // Record locals going out of scope into finished_locals
+        for local in &self.locals[block.num_locals_on_entry..] {
+            self.finished_locals.push(FinishedLocal {
+                name: local.name,
+                reg: local.reg,
+                start_pc: local.start_pc,
+                end_pc,
+            });
+        }
         // Remove locals declared in this block
         self.locals.truncate(block.num_locals_on_entry);
         self.free_reg = block.first_free_reg_on_entry;
@@ -208,6 +245,9 @@ impl ScopeManager {
         is_close: bool,
         start_pc: u32,
     ) -> u8 {
+        if self.locals.len() >= 200 {
+            self.local_overflow = true;
+        }
         let reg = self.free_reg;
         self.locals.push(LocalVarInfo {
             name,
@@ -227,8 +267,11 @@ impl ScopeManager {
 
     /// Allocate a temporary register.
     pub fn alloc_reg(&mut self) -> u8 {
+        if self.free_reg >= 249 {
+            self.reg_overflow = true;
+        }
         let reg = self.free_reg;
-        self.free_reg += 1;
+        self.free_reg = self.free_reg.wrapping_add(1);
         if self.free_reg > self.max_reg {
             self.max_reg = self.free_reg;
         }
@@ -237,8 +280,11 @@ impl ScopeManager {
 
     /// Allocate n consecutive registers, returning the first.
     pub fn alloc_regs(&mut self, n: u8) -> u8 {
+        if self.free_reg.checked_add(n).is_none() || self.free_reg + n > 249 {
+            self.reg_overflow = true;
+        }
         let first = self.free_reg;
-        self.free_reg += n;
+        self.free_reg = self.free_reg.wrapping_add(n);
         if self.free_reg > self.max_reg {
             self.max_reg = self.free_reg;
         }
@@ -270,6 +316,26 @@ impl ScopeManager {
     /// Find the nearest enclosing loop block.
     pub fn find_loop_block(&mut self) -> Option<&mut BlockScope> {
         self.blocks.iter_mut().rev().find(|b| b.is_loop)
+    }
+
+    /// Check if a break from the current position needs to close upvalues.
+    /// Scans from current locals back to the enclosing loop block's entry level.
+    /// Returns the register of the first captured/TBC local, if any.
+    pub fn break_needs_close(&self) -> Option<u8> {
+        // Find the enclosing loop block
+        let loop_block = self.blocks.iter().rev().find(|b| b.is_loop)?;
+        let loop_entry_locals = loop_block.num_locals_on_entry;
+        let mut first_reg = None;
+        for local in &self.locals[loop_entry_locals..] {
+            if local.is_close || local.is_captured {
+                match first_reg {
+                    None => first_reg = Some(local.reg),
+                    Some(r) if local.reg < r => first_reg = Some(local.reg),
+                    _ => {}
+                }
+            }
+        }
+        first_reg
     }
 
     /// Get the current innermost block.

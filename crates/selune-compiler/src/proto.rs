@@ -26,9 +26,11 @@ pub struct UpvalDesc {
 }
 
 /// A local variable debug entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalVar {
     pub name: StringId,
+    /// Register index for this local.
+    pub reg: u8,
     /// First PC where the variable is active.
     pub start_pc: u32,
     /// First PC where the variable is dead.
@@ -70,6 +72,11 @@ pub struct Proto {
     /// Local variable debug info.
     pub local_vars: Vec<LocalVar>,
 
+    /// First line where this function is defined (0 for main chunk).
+    pub linedefined: u32,
+    /// Last line where this function is defined (0 for main chunk).
+    pub lastlinedefined: u32,
+
     /// Current line being compiled (used during compilation).
     current_line: u32,
 }
@@ -89,6 +96,8 @@ impl Proto {
             line_info: Vec::new(),
             abs_line_info: Vec::new(),
             local_vars: Vec::new(),
+            linedefined: 0,
+            lastlinedefined: 0,
             current_line: 0,
         }
     }

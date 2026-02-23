@@ -2,6 +2,8 @@
 
 use selune_core::gc::{GcIdx, LuaClosure};
 
+use selune_core::value::TValue;
+
 /// Status of a call frame (used for yield across pcall/xpcall).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CallStatus {
@@ -17,6 +19,14 @@ pub enum CallStatus {
     XpcallYield {
         result_base: usize,
         num_results: i32,
+    },
+    /// Yielded during __close in a Return handler.
+    /// On resume, after all __close calls complete, finish the return.
+    CloseReturnYield {
+        /// The saved return values.
+        saved_results: Vec<TValue>,
+        /// Remaining TBC slots to close (indices in reverse order).
+        remaining_tbc_slots: Vec<usize>,
     },
 }
 

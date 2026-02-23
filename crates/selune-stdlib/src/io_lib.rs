@@ -610,6 +610,9 @@ pub fn register(
     let close_fn_idx = gc.alloc_native(native_file_gc, "__close");
     gc.get_table_mut(file_mt)
         .raw_set_str(close_key, TValue::from_native(close_fn_idx));
+    let name_key = strings.intern(b"__name");
+    let name_val = TValue::from_string_id(strings.intern(b"FILE*"));
+    gc.get_table_mut(file_mt).raw_set_str(name_key, name_val);
 
     // Store the metatable in thread-local so alloc_file_userdata can use it
     FILE_METATABLE.with(|cell| {
@@ -864,9 +867,11 @@ fn native_io_input(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         }
     }
 
-    Err(NativeError::String(
-        "bad argument #1 to 'input' (string or FILE* expected)".to_string(),
-    ))
+    let tname = selune_core::object::obj_type_name(arg, ctx.gc, ctx.strings);
+    Err(NativeError::String(format!(
+        "bad argument #1 to 'input' (FILE* expected, got {})",
+        tname
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,7 +1371,12 @@ fn native_file_gc(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
                 lua_file.is_closed = true;
             }
         }
+        Ok(vec![])
+    } else {
+        let tname = selune_core::object::obj_type_name(arg, ctx.gc, ctx.strings);
+        Err(NativeError::String(format!(
+            "bad argument #1 to '__gc' (FILE* expected, got {})",
+            if arg.is_nil() { "no value".to_string() } else { tname }
+        )))
     }
-
-    Ok(vec![])
 }

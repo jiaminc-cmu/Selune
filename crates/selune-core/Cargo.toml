@@ -4,6 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[dependencies]
+indexmap.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true

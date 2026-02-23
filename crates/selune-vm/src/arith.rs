@@ -197,6 +197,11 @@ pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Arith
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
+    } else if v.is_float() || v.as_number(gc).is_some() {
+        // Number but can't convert to integer
+        ArithResult::Error(crate::error::LuaError::Runtime(
+            "number has no integer representation".to_string(),
+        ))
     } else {
         ArithResult::NeedMetamethod
     }

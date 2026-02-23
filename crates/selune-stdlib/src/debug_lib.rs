@@ -15,6 +15,7 @@ pub struct DebugIndices {
     pub getupvalue_idx: GcIdx<NativeFunction>,
     pub setupvalue_idx: GcIdx<NativeFunction>,
     pub getinfo_idx: GcIdx<NativeFunction>,
+    pub traceback_idx: GcIdx<NativeFunction>,
 }
 
 pub fn register(
@@ -51,8 +52,14 @@ pub fn register(
         TValue::from_native(getinfo_idx),
     );
 
+    // traceback needs full VM access (redirected through dispatch.rs)
+    let traceback_idx = gc.alloc_native(native_debug_traceback, "traceback");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"traceback"),
+        TValue::from_native(traceback_idx),
+    );
+
     // Stubs for functions that need full VM access
-    register_fn(gc, debug_table, strings, "traceback", native_debug_traceback);
     register_fn(gc, debug_table, strings, "sethook", native_debug_sethook);
     register_fn(gc, debug_table, strings, "getlocal", native_debug_getlocal);
     register_fn(gc, debug_table, strings, "setlocal", native_debug_setlocal);
@@ -65,6 +72,7 @@ pub fn register(
         getupvalue_idx,
         setupvalue_idx,
         getinfo_idx,
+        traceback_idx,
     }
 }
 
@@ -314,22 +322,16 @@ fn native_debug_upvalueid(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
         let closure = ctx.gc.get_closure(cl_idx);
         let idx = (n - 1) as usize;
         if n < 1 || idx >= closure.upvalues.len() {
-            return Err(NativeError::String(format!(
-                "bad argument #2 to 'upvalueid' (invalid upvalue index {})",
-                n
-            )));
+            // Lua 5.4: return nil for out-of-range upvalue indices
+            return Ok(vec![TValue::nil()]);
         }
         let uv_idx = closure.upvalues[idx];
         // Return the raw GcIdx as an integer identifier.
         // Two closures sharing the same upvalue will return the same id.
         Ok(vec![TValue::from_light_userdata(uv_idx.0 as usize)])
     } else {
-        // For C/native functions, Lua 5.4 uses the address of the upvalue slot.
-        // We don't have upvalues for native functions, so error like Lua does.
-        Err(NativeError::String(format!(
-            "bad argument #2 to 'upvalueid' (invalid upvalue index {})",
-            n
-        )))
+        // For C/native functions, return nil for any upvalue index
+        Ok(vec![TValue::nil()])
     }
 }
 
@@ -459,6 +461,11 @@ fn native_debug_setuservalue(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nat
     let ud_idx = match val.as_userdata_idx() {
         Some(idx) => idx,
         None => {
+            if val.is_light_userdata() {
+                return Err(NativeError::String(
+                    "bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)".into(),
+                ));
+            }
             return Err(NativeError::String(
                 "bad argument #1 to 'setuservalue' (userdata expected)".into(),
             ));

@@ -494,7 +494,7 @@ fn test_assert_false_default_message() {
         local ok, msg = pcall(assert, false)
         return msg
         "#,
-        &["assertion failed!"],
+        &["test:2: assertion failed!"],
     );
 }
 

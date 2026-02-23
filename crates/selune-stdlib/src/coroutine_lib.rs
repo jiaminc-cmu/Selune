@@ -16,6 +16,7 @@ pub struct CoroutineIndices {
     pub yield_idx: GcIdx<NativeFunction>,
     pub wrap_idx: GcIdx<NativeFunction>,
     pub wrap_resume_idx: GcIdx<NativeFunction>,
+    pub running_idx: GcIdx<NativeFunction>,
 }
 
 pub fn register(
@@ -50,6 +51,12 @@ pub fn register(
     // Internal wrap resume function (not registered in coroutine table)
     let wrap_resume_idx = gc.alloc_native(native_stub, "coroutine.wrap_resume");
 
+    // coroutine.running is VM-dispatched (needs to know current coroutine)
+    let running_idx = gc.alloc_native(native_stub, "coroutine.running");
+    let running_val = TValue::from_native(running_idx);
+    let running_name = strings.intern(b"running");
+    gc.get_table_mut(co_table).raw_set_str(running_name, running_val);
+
     // Register coroutine table into _ENV
     let name = strings.intern(b"coroutine");
     gc.get_table_mut(env_idx).raw_set_str(name, TValue::from_table(co_table));
@@ -59,6 +66,7 @@ pub fn register(
         yield_idx,
         wrap_idx: wrap_stub,
         wrap_resume_idx,
+        running_idx,
     }
 }
 

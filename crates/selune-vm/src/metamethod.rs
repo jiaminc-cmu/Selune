@@ -30,6 +30,7 @@ pub struct MetamethodNames {
     pub concat: StringId,
     pub tostring: StringId,
     pub close: StringId,
+    pub pairs: StringId,
 }
 
 impl MetamethodNames {
@@ -59,6 +60,7 @@ impl MetamethodNames {
             concat: strings.intern(b"__concat"),
             tostring: strings.intern(b"__tostring"),
             close: strings.intern(b"__close"),
+            pairs: strings.intern(b"__pairs"),
         }
     }
 

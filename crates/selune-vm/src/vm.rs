@@ -19,6 +19,8 @@ pub struct LuaThread {
     pub stack_top: usize,
     pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
     pub status: CoroutineStatus,
+    /// Thread ID for this saved state (usize::MAX = main thread, otherwise coroutine index).
+    pub thread_id: usize,
 }
 
 /// Coroutine lifecycle states.
@@ -57,6 +59,11 @@ pub struct Vm {
     pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
     /// Max call depth before stack overflow.
     pub max_call_depth: usize,
+    /// Nesting depth of call_function / execute_from (tracks C-equivalent stack depth).
+    /// Incremented on each call_function entry, decremented on exit. Not reset by coroutine switches.
+    pub c_stack_depth: usize,
+    /// Maximum C stack depth before "C stack overflow".
+    pub max_c_stack_depth: usize,
     /// Pre-interned metamethod names.
     pub mm_names: Option<MetamethodNames>,
     /// Native indices for pcall/xpcall (set during register_natives).
@@ -111,12 +118,76 @@ pub struct Vm {
     pub debug_setupvalue_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for debug.getinfo (needs VM access for call stack / proto info).
     pub debug_getinfo_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.traceback (needs VM access for call stack).
+    pub debug_traceback_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for coroutine.running (needs VM access to know current coroutine).
     pub coro_running_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for string.format (needs VM access for __tostring metamethod).
     pub string_format_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for string.dump (needs VM access to read protos from closures).
     pub string_dump_idx: Option<GcIdx<NativeFunction>>,
+    /// Stored TValue for the global `next` function (for pairs() to return same identity).
+    pub next_val: TValue,
+    /// Stored TValue for the ipairs iterator function (singleton).
+    pub ipairs_iter_val: TValue,
+    /// Native index for pairs (needs VM access for __pairs metamethod).
+    pub pairs_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for ipairs iterator (needs VM access for __index metamethod).
+    pub ipairs_iter_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.insert (needs VM access for __len/__newindex metamethods).
+    pub table_insert_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.remove (needs VM access for __len/__index/__newindex metamethods).
+    pub table_remove_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.concat (needs VM access for __len/__index metamethods).
+    pub table_concat_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.unpack (needs VM access for __len/__index metamethods).
+    pub table_unpack_idx: Option<GcIdx<NativeFunction>>,
+    /// Depth counter for __close metamethod calls (for debug.traceback).
+    pub in_tbc_close: u32,
+    /// Set when an error originated from a __close metamethod (for traceback).
+    pub last_error_from_close: bool,
+}
+
+/// Format a source name for error messages (matching PUC Lua behavior).
+/// - `=name` → `name` (exact source)
+/// - `@file` → `file` (filename, truncated)
+/// - otherwise → `[string "first_line..."]` (string chunk)
+pub fn format_source_name(name: &str) -> String {
+    const LUA_IDSIZE: usize = 60;
+    if name.starts_with('=') {
+        // Exact source: use as-is minus the '=', truncated
+        let s = &name[1..];
+        if s.len() >= LUA_IDSIZE {
+            s[..LUA_IDSIZE - 1].to_string()
+        } else {
+            s.to_string()
+        }
+    } else if name.starts_with('@') {
+        // File source
+        let s = &name[1..];
+        if s.len() >= LUA_IDSIZE {
+            // Truncate from the end, add "..."
+            format!("...{}", &s[s.len() - (LUA_IDSIZE - 4)..])
+        } else {
+            s.to_string()
+        }
+    } else {
+        // String source: [string "first_line..."]
+        // Get first line
+        let first_line = name.lines().next().unwrap_or(name);
+        // Overhead: [string " (9) + ..."] (5) = 14 chars; max output = LUA_IDSIZE - 1 = 59
+        let max_content = LUA_IDSIZE - 1 - 14; // 45
+        if first_line.len() > max_content || name.contains('\n') {
+            let truncated = if first_line.len() > max_content {
+                &first_line[..max_content]
+            } else {
+                first_line
+            };
+            format!("[string \"{}...\"]", truncated)
+        } else {
+            format!("[string \"{}\"]", first_line)
+        }
+    }
 }
 
 impl Vm {
@@ -132,6 +203,8 @@ impl Vm {
             protos: Vec::new(),
             open_upvals: Vec::new(),
             max_call_depth: 200,
+            c_stack_depth: 0,
+            max_c_stack_depth: 200,
             mm_names: None,
             pcall_idx: None,
             xpcall_idx: None,
@@ -159,9 +232,20 @@ impl Vm {
             debug_getupvalue_idx: None,
             debug_setupvalue_idx: None,
             debug_getinfo_idx: None,
+            debug_traceback_idx: None,
             coro_running_idx: None,
             string_format_idx: None,
             string_dump_idx: None,
+            next_val: TValue::nil(),
+            ipairs_iter_val: TValue::nil(),
+            pairs_idx: None,
+            ipairs_iter_idx: None,
+            table_insert_idx: None,
+            table_remove_idx: None,
+            table_concat_idx: None,
+            table_unpack_idx: None,
+            in_tbc_close: 0,
+            last_error_from_close: false,
         }
     }
 
@@ -218,9 +302,14 @@ impl Vm {
         self.debug_getupvalue_idx = Some(stdlib_indices.debug_getupvalue_idx);
         self.debug_setupvalue_idx = Some(stdlib_indices.debug_setupvalue_idx);
         self.debug_getinfo_idx = Some(stdlib_indices.debug_getinfo_idx);
+        self.debug_traceback_idx = Some(stdlib_indices.debug_traceback_idx);
         self.coro_running_idx = Some(stdlib_indices.coro_running_idx);
         self.string_format_idx = Some(stdlib_indices.string_format_idx);
         self.string_dump_idx = Some(stdlib_indices.string_dump_idx);
+        self.table_insert_idx = Some(stdlib_indices.table_insert_idx);
+        self.table_remove_idx = Some(stdlib_indices.table_remove_idx);
+        self.table_concat_idx = Some(stdlib_indices.table_concat_idx);
+        self.table_unpack_idx = Some(stdlib_indices.table_unpack_idx);
 
         // Create string metatable with __index = string library table
         let string_mt = self.gc.alloc_table(0, 4);
@@ -267,13 +356,7 @@ impl Vm {
         self.strings = strings;
         let proto = result.map_err(|e| {
             // Format: "source:line: message" matching PUC Lua error format
-            let src = if name.starts_with('=') {
-                &name[1..]
-            } else if name.starts_with('@') {
-                &name[1..]
-            } else {
-                name
-            };
+            let src = format_source_name(name);
             format!("{}:{}: {}", src, e.line, e.message)
         })?;
 
@@ -439,17 +522,24 @@ impl Vm {
         // next
         let idx = self.gc.alloc_native(native_next, "next");
         let val = TValue::from_native(idx);
+        self.next_val = val;
         let name = self.strings.intern(b"next");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
 
-        // pairs
-        let idx = self.gc.alloc_native(native_pairs, "pairs");
+        // ipairs_iter (singleton — allocated once, reused by all ipairs calls)
+        let iter_idx = self.gc.alloc_native(native_ipairs_iter_stub, "ipairs_iter");
+        self.ipairs_iter_val = TValue::from_native(iter_idx);
+        self.ipairs_iter_idx = Some(iter_idx);
+
+        // pairs — needs VM redirect for __pairs metamethod
+        let idx = self.gc.alloc_native(native_pairs_stub, "pairs");
         let val = TValue::from_native(idx);
+        self.pairs_idx = Some(idx);
         let name = self.strings.intern(b"pairs");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
 
-        // ipairs
-        let idx = self.gc.alloc_native(native_ipairs, "ipairs");
+        // ipairs — stores ipairs_iter singleton as upvalue so it can return the same function
+        let idx = self.gc.alloc_native_with_upvalue(native_ipairs, "ipairs", self.ipairs_iter_val);
         let val = TValue::from_native(idx);
         let name = self.strings.intern(b"ipairs");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
@@ -547,16 +637,14 @@ impl Vm {
 
     /// Read a value from a saved thread's stack.
     fn get_thread_stack_value(&self, thread_id: usize, stack_idx: usize) -> TValue {
-        // thread_id maps into coro_caller_stack (saved caller states)
-        // or coroutines (saved coroutine states)
-        // We use a convention: thread_id == usize::MAX means main thread saved in caller stack
-        // Otherwise it's a coroutine ID
-        if thread_id == usize::MAX {
-            // Main thread is saved in the caller stack (most recent entry)
-            if let Some(caller) = self.coro_caller_stack.last() {
-                return caller.stack.get(stack_idx).copied().unwrap_or(TValue::nil());
+        // Search the coro_caller_stack for a saved state with matching thread_id
+        for saved in &self.coro_caller_stack {
+            if saved.thread_id == thread_id {
+                return saved.stack.get(stack_idx).copied().unwrap_or(TValue::nil());
             }
-        } else if thread_id < self.coroutines.len() {
+        }
+        // Also check saved coroutine states (for suspended coroutines)
+        if thread_id < self.coroutines.len() {
             return self.coroutines[thread_id].stack.get(stack_idx).copied().unwrap_or(TValue::nil());
         }
         TValue::nil()
@@ -564,13 +652,17 @@ impl Vm {
 
     /// Write a value to a saved thread's stack.
     fn set_thread_stack_value(&mut self, thread_id: usize, stack_idx: usize, val: TValue) {
-        if thread_id == usize::MAX {
-            if let Some(caller) = self.coro_caller_stack.last_mut() {
-                if stack_idx < caller.stack.len() {
-                    caller.stack[stack_idx] = val;
+        // Search the coro_caller_stack for a saved state with matching thread_id
+        for saved in &mut self.coro_caller_stack {
+            if saved.thread_id == thread_id {
+                if stack_idx < saved.stack.len() {
+                    saved.stack[stack_idx] = val;
                 }
+                return;
             }
-        } else if thread_id < self.coroutines.len() {
+        }
+        // Also check saved coroutine states
+        if thread_id < self.coroutines.len() {
             if stack_idx < self.coroutines[thread_id].stack.len() {
                 self.coroutines[thread_id].stack[stack_idx] = val;
             }
@@ -602,6 +694,7 @@ impl Vm {
             stack_top: 0,
             open_upvals: Vec::new(),
             status: CoroutineStatus::Suspended,
+            thread_id: id,
         };
         // Place the function at R[0]
         thread.stack[0] = func;
@@ -640,13 +733,14 @@ impl Vm {
     }
 
     /// Save the current running state into a LuaThread snapshot.
-    pub fn save_running_state(&self) -> LuaThread {
+    pub fn save_running_state(&self, thread_id: usize) -> LuaThread {
         LuaThread {
             stack: self.stack.clone(),
             call_stack: self.call_stack.clone(),
             stack_top: self.stack_top,
             open_upvals: self.open_upvals.clone(),
             status: CoroutineStatus::Normal, // caller becomes Normal while waiting
+            thread_id,
         }
     }
 
@@ -965,17 +1059,20 @@ fn native_error(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
 }
 
 fn native_assert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if ctx.args.is_empty() {
+        return Err(NativeError::String(
+            "bad argument #1 to 'assert' (value expected)".to_string(),
+        ));
+    }
+    let val = ctx.args[0];
     if val.is_falsy() {
-        let msg = ctx.args.get(1).copied().unwrap_or(TValue::nil());
-        if let Some(sid) = msg.as_string_id() {
-            // PUC Lua: assert(v, msg) raises msg directly (no prefix)
-            let s = String::from_utf8_lossy(ctx.strings.get_bytes(sid)).into_owned();
-            Err(NativeError::String(s))
-        } else if msg.is_nil() {
+        if ctx.args.len() <= 1 {
+            // No message argument provided: default "assertion failed!" with source prefix
             Err(NativeError::String("assertion failed!".to_string()))
         } else {
-            // Non-string error value (number, table, etc.)
+            // PUC Lua: assert passes the message through lua_error unchanged (no prefix)
+            // This includes nil, tables, strings, etc.
+            let msg = ctx.args[1];
             Err(NativeError::Value(msg))
         }
     } else {
@@ -1187,50 +1284,42 @@ fn native_next(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     })?;
     let key = ctx.args.get(1).copied().unwrap_or(TValue::nil());
     match ctx.gc.get_table(table_idx).next(key) {
-        Some((k, v)) => Ok(vec![k, v]),
-        None => Ok(vec![TValue::nil()]),
+        Ok(Some((k, v))) => Ok(vec![k, v]),
+        Ok(None) => Ok(vec![TValue::nil()]),
+        Err(()) => Err(NativeError::String("invalid key to 'next'".to_string())),
     }
 }
 
-fn native_pairs(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
-    let _table_idx = table_val.as_table_idx().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'pairs' (table expected)".to_string())
-    })?;
-    // Return (next, table, nil)
-    let next_idx = ctx.gc.alloc_native(native_next, "next");
-    let next_val = TValue::from_native(next_idx);
-    Ok(vec![next_val, table_val, TValue::nil()])
+/// Stub for pairs - actual dispatch happens via call_function for __pairs metamethod support.
+fn native_pairs_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "pairs stub should not be called directly".to_string(),
+    ))
 }
 
 fn native_ipairs(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
-    let _table_idx = table_val.as_table_idx().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'ipairs' (table expected)".to_string())
-    })?;
-    // Return (ipairs_iter, table, 0)
-    let iter_idx = ctx.gc.alloc_native(native_ipairs_iter, "ipairs_iter");
-    let iter_val = TValue::from_native(iter_idx);
+    if table_val.as_table_idx().is_none() {
+        return Err(NativeError::String(
+            "bad argument #1 to 'ipairs' (table expected)".to_string(),
+        ));
+    }
+    // Return (ipairs_iter_singleton, table, 0) — ipairs_iter_val set via upvalue is not available here
+    // We use a dummy that will be replaced in the redirect path. For now ipairs doesn't need redirect.
+    // Actually, we just need the singleton from the NativeContext. Let's use a trick: store in upvalue.
+    // But the simplest approach: ipairs doesn't need redirect, it just returns the stored iter.
+    // Problem: we don't have access to Vm here. Let's allocate from ctx.
+    // Actually the test requires identity: ipairs{} == ipairs{}. The iter must be same TValue.
+    // We need upvalue to pass the singleton. Let's use the upvalue field.
+    let iter_val = ctx.upvalue;
     Ok(vec![iter_val, table_val, TValue::from_integer(0)])
 }
 
-fn native_ipairs_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let table_val = ctx.args.first().copied().unwrap_or(TValue::nil());
-    let table_idx = table_val.as_table_idx().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'ipairs iterator' (table expected)".to_string())
-    })?;
-    let i = ctx
-        .args
-        .get(1)
-        .and_then(|v| v.as_full_integer(ctx.gc))
-        .unwrap_or(0);
-    let next_i = i + 1;
-    let val = ctx.gc.get_table(table_idx).raw_geti(next_i);
-    if val.is_nil() {
-        Ok(vec![TValue::nil()])
-    } else {
-        Ok(vec![TValue::from_full_integer(next_i, ctx.gc), val])
-    }
+/// Stub for ipairs_iter - actual dispatch via call_function for __index support.
+fn native_ipairs_iter_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "ipairs_iter stub should not be called directly".to_string(),
+    ))
 }
 
 /// Stub for pcall - actual dispatch happens in the Call opcode.

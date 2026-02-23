@@ -7,7 +7,7 @@ use crate::opcode::{Instruction, OpCode, MAX_BX};
 use crate::proto::{Constant, Proto, UpvalDesc};
 use crate::token::Token;
 use expr::{BinOp, ExprDesc, IndexKey, UnOp, UNARY_PRIORITY};
-use scope::{LabelInfo, PendingGoto, ScopeManager};
+use scope::{LabelInfo, LocalVarInfo, PendingGoto, ScopeManager};
 use selune_core::string::{StringId, StringInterner};
 use std::fmt;
 
@@ -97,11 +97,16 @@ impl FuncState {
     }
 }
 
+/// Maximum nesting level (matches PUC Lua's LUAI_MAXCCALLS)
+const MAX_NEST_LEVEL: u32 = 200;
+
 /// The compiler: holds the lexer, string interner, and function state stack.
 pub struct Compiler<'a> {
     lexer: Lexer<'a>,
     /// Stack of function states (nested functions).
     func_stack: Vec<FuncState>,
+    /// Current nesting depth (expressions, blocks, etc.)
+    nest_level: u32,
 }
 
 impl<'a> Compiler<'a> {
@@ -109,6 +114,7 @@ impl<'a> Compiler<'a> {
         Compiler {
             lexer: Lexer::new(source),
             func_stack: Vec::new(),
+            nest_level: 0,
         }
     }
 
@@ -116,6 +122,7 @@ impl<'a> Compiler<'a> {
         Compiler {
             lexer: Lexer::with_strings(source, strings),
             func_stack: Vec::new(),
+            nest_level: 0,
         }
     }
 
@@ -131,10 +138,85 @@ impl<'a> Compiler<'a> {
         self.lexer.line()
     }
 
+    /// Increment nesting level, returning error if too deep.
+    fn incr_nesting(&mut self) -> Result<(), CompileError> {
+        self.nest_level += 1;
+        if self.nest_level > MAX_NEST_LEVEL {
+            Err(self.error("chunk has too many syntax levels"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Decrement nesting level.
+    fn decr_nesting(&mut self) {
+        self.nest_level = self.nest_level.saturating_sub(1);
+    }
+
+    /// Check if register allocation has overflowed and return an error if so.
+    fn check_reg_overflow(&mut self) -> Result<(), CompileError> {
+        if self.fs().scope.reg_overflow {
+            self.fs_mut().scope.reg_overflow = false;
+            Err(self.error("function or expression needs too many registers"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Check if local variable count has overflowed and return an error if so.
+    fn check_local_overflow(&mut self) -> Result<(), CompileError> {
+        if self.fs().scope.local_overflow {
+            self.fs_mut().scope.local_overflow = false;
+            let func_line = self.fs().proto.linedefined;
+            let msg = if func_line == 0 {
+                "main function has too many local variables".to_string()
+            } else {
+                format!("function at line {} has too many local variables", func_line)
+            };
+            Err(self.syntax_error(msg))
+        } else {
+            Ok(())
+        }
+    }
+
     fn error(&self, msg: impl Into<String>) -> CompileError {
         CompileError {
             message: msg.into(),
             line: self.line(),
+        }
+    }
+
+    /// Create a syntax error with "near <token>" appended (like PUC's luaX_syntaxerror).
+    fn syntax_error(&self, msg: impl Into<String>) -> CompileError {
+        let near = self.current_token_near_str();
+        CompileError {
+            message: format!("{} near {}", msg.into(), near),
+            line: self.line(),
+        }
+    }
+
+    /// Format the current token for use in "near <token>" error messages.
+    /// For names: 'actualname', for eof: '<eof>', for keywords: 'keyword', etc.
+    fn current_token_near_str(&self) -> String {
+        match self.lexer.current() {
+            Ok(st) => match &st.token {
+                Token::Name(sid) => {
+                    let bytes = self.lexer.strings.get_bytes(*sid);
+                    let s = String::from_utf8_lossy(bytes);
+                    format!("'{}'", s)
+                }
+                Token::String(_) => {
+                    // Use original source text for string literals
+                    format!("'{}'", self.lexer.token_text)
+                }
+                Token::Integer(_) | Token::Float(_) => {
+                    // Use the original source text for number tokens
+                    format!("'{}'", self.lexer.token_text)
+                }
+                Token::Eof => "<eof>".to_string(),
+                other => format!("'{}'", other),
+            },
+            Err(_) => "<eof>".to_string(),
         }
     }
 
@@ -172,11 +254,13 @@ impl<'a> Compiler<'a> {
             self.advance()?;
             Ok(())
         } else {
-            let found = self
-                .current_token()
-                .map(|t| format!("{t}"))
-                .unwrap_or("error".into());
-            Err(self.error(format!("expected '{expected}', got '{found}'")))
+            let found = self.current_token().ok().cloned();
+            let near_str = match &found {
+                Some(Token::Eof) => "<eof>".to_string(),
+                Some(t) => format!("'{}'", t),
+                None => "<eof>".to_string(),
+            };
+            Err(self.error(format!("'{}' expected near {}", expected, near_str)))
         }
     }
 
@@ -186,7 +270,7 @@ impl<'a> Compiler<'a> {
                 self.advance()?;
                 Ok(id)
             }
-            other => Err(self.error(format!("expected name, got '{other}'"))),
+            other => Err(self.syntax_error(format!("expected name, got '{other}'"))),
         }
     }
 
@@ -282,8 +366,10 @@ impl<'a> Compiler<'a> {
             ExprDesc::Float(f) => {
                 let f = *f;
                 // Try LoadF for small integer-valued floats
+                // But NOT for -0.0 (LoadF can't represent negative zero)
                 let as_int = f as i32;
-                if as_int as f64 == f
+                if f.to_bits() != (-0.0_f64).to_bits()
+                    && as_int as f64 == f
                     && (crate::opcode::MIN_SBX..=crate::opcode::MAX_SBX).contains(&as_int)
                 {
                     self.emit(Instruction::asbx(OpCode::LoadF, reg, as_int), line);
@@ -308,17 +394,39 @@ impl<'a> Compiler<'a> {
                 self.emit_load_constant(reg, *k, line);
             }
             ExprDesc::Global { env_upval, name_k } => {
-                self.emit(
-                    Instruction::abc(OpCode::GetTabUp, reg, *env_upval, *name_k as u8, false),
-                    line,
-                );
+                if *name_k <= 255 {
+                    self.emit(
+                        Instruction::abc(OpCode::GetTabUp, reg, *env_upval, *name_k as u8, false),
+                        line,
+                    );
+                } else {
+                    // Constant index too large for C field; fall back to GetUpval + load key + GetTable
+                    let env_upval = *env_upval;
+                    let name_k = *name_k;
+                    let env_reg = self.fs_mut().scope.alloc_reg();
+                    self.emit_abc(OpCode::GetUpval, env_reg, env_upval, 0, line);
+                    let key_reg = self.fs_mut().scope.alloc_reg();
+                    self.emit_load_constant(key_reg, name_k, line);
+                    self.emit_abc(OpCode::GetTable, reg, env_reg, key_reg, line);
+                    self.fs_mut().scope.free_reg_to(env_reg);
+                }
             }
             ExprDesc::Indexed { table, key } => match key {
                 IndexKey::Field(k) => {
-                    self.emit(
-                        Instruction::abc(OpCode::GetField, reg, *table, *k as u8, false),
-                        line,
-                    );
+                    if *k <= 255 {
+                        self.emit(
+                            Instruction::abc(OpCode::GetField, reg, *table, *k as u8, false),
+                            line,
+                        );
+                    } else {
+                        // Constant index too large for C field; load key into register and use GetTable
+                        let table = *table;
+                        let k = *k;
+                        let key_reg = self.fs_mut().scope.alloc_reg();
+                        self.emit_load_constant(key_reg, k, line);
+                        self.emit_abc(OpCode::GetTable, reg, table, key_reg, line);
+                        self.fs_mut().scope.free_reg_to(key_reg);
+                    }
                 }
                 IndexKey::Register(key_reg) => {
                     self.emit_abc(OpCode::GetTable, reg, *table, *key_reg, line);
@@ -327,10 +435,20 @@ impl<'a> Compiler<'a> {
                     self.emit_abc(OpCode::GetI, reg, *table, *i, line);
                 }
                 IndexKey::Constant(k) => {
-                    self.emit(
-                        Instruction::abc(OpCode::GetTable, reg, *table, *k as u8, true),
-                        line,
-                    );
+                    if *k <= 255 {
+                        self.emit(
+                            Instruction::abc(OpCode::GetTable, reg, *table, *k as u8, true),
+                            line,
+                        );
+                    } else {
+                        // Constant index too large; load into register
+                        let table = *table;
+                        let k = *k;
+                        let key_reg = self.fs_mut().scope.alloc_reg();
+                        self.emit_load_constant(key_reg, k, line);
+                        self.emit_abc(OpCode::GetTable, reg, table, key_reg, line);
+                        self.fs_mut().scope.free_reg_to(key_reg);
+                    }
                 }
             },
             ExprDesc::Relocatable(pc) => {
@@ -406,6 +524,13 @@ impl<'a> Compiler<'a> {
 
     /// Precedence climbing expression parser.
     fn sub_expression(&mut self, min_prec: u8) -> Result<ExprDesc, CompileError> {
+        self.incr_nesting()?;
+        let result = self.sub_expression_inner(min_prec);
+        self.decr_nesting();
+        result
+    }
+
+    fn sub_expression_inner(&mut self, min_prec: u8) -> Result<ExprDesc, CompileError> {
         let line = self.line();
         let mut expr = if let Some(unop) = self.check_unary_op()? {
             self.advance()?;
@@ -433,6 +558,7 @@ impl<'a> Compiler<'a> {
                 let first_reg = self.fs_mut().scope.alloc_reg();
                 self.discharge_to_reg(&expr, first_reg, op_line);
                 let mut count: u8 = 1;
+                let mut concat_nesting: u32 = 0;
                 loop {
                     // Parse the next operand at concat's left priority,
                     // so higher-priority ops (+ * ^ unary) are absorbed
@@ -453,10 +579,15 @@ impl<'a> Compiler<'a> {
                     if let Some(next_op) = self.check_binary_op()? {
                         if next_op == BinOp::Concat {
                             self.advance()?;
+                            self.incr_nesting()?;
+                            concat_nesting += 1;
                             continue;
                         }
                     }
                     break;
+                }
+                for _ in 0..concat_nesting {
+                    self.decr_nesting();
                 }
                 self.emit_abc(OpCode::Concat, first_reg, count, 0, op_line);
                 self.fs_mut().scope.free_reg_to(first_reg + 1);
@@ -537,8 +668,9 @@ impl<'a> Compiler<'a> {
                     other => other,
                 }
             }
-            other => {
-                return Err(self.error(format!("unexpected symbol '{other}'")));
+            _other => {
+                let near_str = self.current_token_near_str();
+                return Err(self.error(format!("unexpected symbol near {near_str}")));
             }
         };
 
@@ -581,10 +713,22 @@ impl<'a> Compiler<'a> {
                     // Place method at func_reg, self at func_reg+1
                     let func_reg = self.fs_mut().scope.alloc_reg();
                     let _self_slot = self.fs_mut().scope.alloc_reg();
-                    self.emit(
-                        Instruction::abc(OpCode::Self_, func_reg, table_reg, k as u8, true),
-                        line,
-                    );
+                    if k <= 255 {
+                        self.emit(
+                            Instruction::abc(OpCode::Self_, func_reg, table_reg, k as u8, true),
+                            line,
+                        );
+                    } else {
+                        // Constant index too large for inline; load key into register,
+                        // then use Self_ with k=0 (register key).
+                        let key_reg = self.fs_mut().scope.alloc_reg();
+                        self.emit_load_constant(key_reg, k, line);
+                        self.emit(
+                            Instruction::abc(OpCode::Self_, func_reg, table_reg, key_reg as u8, false),
+                            line,
+                        );
+                        self.fs_mut().scope.free_reg_to(key_reg);
+                    }
                     expr = self.method_call(func_reg, line)?;
                 }
                 Token::LParen | Token::LBrace | Token::String(_) => {
@@ -646,15 +790,28 @@ impl<'a> Compiler<'a> {
 
     /// Parse a function call.
     fn function_call(&mut self, func_expr: ExprDesc, line: u32) -> Result<ExprDesc, CompileError> {
-        // Discharge function to a safe register. If the function is already
-        // in a register at or above any active locals (i.e., it was just loaded
-        // to free_reg by Self, Closure, etc.), reuse it directly.
-        // Otherwise, allocate a fresh register to avoid clobbering locals.
+        // Discharge function to a register for the call.
+        // The call base register must be at free_reg or above to avoid
+        // clobbering temporaries that are already allocated above it.
+        // If the function is in a register below free_reg (local or earlier temp),
+        // we must MOVE it to a fresh register.
         let num_locals = self.fs().scope.locals.len() as u8;
+        let free_reg_at_entry = self.fs().scope.free_reg;
         let func_reg = match &func_expr {
-            ExprDesc::Register(r) if *r >= num_locals => {
-                // Already above all locals — safe to use directly
+            ExprDesc::Register(r) if *r >= free_reg_at_entry => {
+                // At the top of stack — safe to use directly
+                // Ensure free_reg accounts for this register
+                if self.fs().scope.free_reg <= *r {
+                    self.fs_mut().scope.free_reg = *r + 1;
+                }
                 *r
+            }
+            ExprDesc::Register(r) if *r >= num_locals => {
+                // Above locals but below free_reg — there are active temps above.
+                // MOVE to fresh register to avoid post-call free_reg_to clobbering those temps.
+                let reg = self.fs_mut().scope.alloc_reg();
+                self.emit(Instruction::abc(OpCode::Move, reg, *r, 0, false), line);
+                reg
             }
             ExprDesc::Call(pc) => {
                 // Chained call: resolve the previous call to 1 result in its A
@@ -665,6 +822,18 @@ impl<'a> Compiler<'a> {
                 // free_reg should be at a+1 after the previous call set it
                 self.fs_mut().scope.free_reg_to(a + 1);
                 a
+            }
+            ExprDesc::Indexed { table, .. }
+                if self.fs().scope.resolve_local_by_reg(*table).is_none() =>
+            {
+                // Table field access on a temporary register (e.g., string.byte):
+                // discharge the function into the table register itself, reusing it.
+                // This avoids wasting a register and ensures the function is at the
+                // expected position for table constructors with multi-return calls.
+                // Must NOT reuse local variable registers (they're still needed).
+                let reg = *table;
+                self.discharge_to_reg(&func_expr, reg, line);
+                reg
             }
             _ => {
                 let reg = self.fs_mut().scope.alloc_reg();
@@ -697,7 +866,7 @@ impl<'a> Compiler<'a> {
                 1u8
             }
             _ => {
-                return Err(self.error("function arguments expected"));
+                return Err(self.syntax_error("function arguments expected"));
             }
         };
 
@@ -741,7 +910,7 @@ impl<'a> Compiler<'a> {
                 1u8
             }
             _ => {
-                return Err(self.error("function arguments expected"));
+                return Err(self.syntax_error("function arguments expected"));
             }
         };
 
@@ -765,6 +934,9 @@ impl<'a> Compiler<'a> {
     fn expression_list(&mut self, base_reg: u8) -> Result<u8, CompileError> {
         let mut count = 0u8;
         loop {
+            if (base_reg as u16) + (count as u16) >= 249 {
+                return Err(self.error("function or expression needs too many registers"));
+            }
             let expr = self.expression()?;
             let line = self.line();
 
@@ -844,6 +1016,7 @@ impl<'a> Compiler<'a> {
                 self.fs_mut().scope.free_reg = target;
             }
             count += 1;
+            self.check_reg_overflow()?;
             self.advance()?; // consume comma
         }
         Ok(count)
@@ -912,6 +1085,7 @@ impl<'a> Compiler<'a> {
                 self.fs_mut().scope.free_reg = target;
             }
             count += 1;
+            self.check_reg_overflow()?;
             self.advance()?; // consume comma
         }
         Ok(count)
@@ -973,10 +1147,17 @@ impl<'a> Compiler<'a> {
                         let kline = self.line();
                         let k = self.fs_mut().add_string_constant(name);
                         let val_reg = self.discharge_to_any_reg(&val, kline);
-                        self.emit(
-                            Instruction::abc(OpCode::SetField, table_reg, k as u8, val_reg, false),
-                            kline,
-                        );
+                        if k <= 255 {
+                            self.emit(
+                                Instruction::abc(OpCode::SetField, table_reg, k as u8, val_reg, false),
+                                kline,
+                            );
+                        } else {
+                            let key_reg = self.fs_mut().scope.alloc_reg();
+                            self.emit_load_constant(key_reg, k, kline);
+                            self.emit_abc(OpCode::SetTable, table_reg, key_reg, val_reg, kline);
+                            self.fs_mut().scope.free_reg_to(key_reg);
+                        }
                         // Free temp regs but preserve stacked array values
                         self.fs_mut().scope.free_reg_to(table_reg + 1 + array_count as u8);
                         hash_count += 1;
@@ -1370,32 +1551,39 @@ impl<'a> Compiler<'a> {
     ) -> Result<ExprDesc, CompileError> {
         let left_reg = self.discharge_to_any_reg(&left, line);
 
-        if op == BinOp::And {
-            // If left is falsy, skip right; result = left
-            self.emit(
-                Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, false),
-                line,
-            );
+        // If the left operand is a local variable (its register is below
+        // free_reg), we must allocate a fresh temp register as the destination
+        // to avoid clobbering the local when the right-side is evaluated.
+        // This matches PUC Lua's luaK_exp2anyreg behavior which refuses to
+        // reuse a local's register when jump lists are involved.
+        let dest_reg = if self.fs().scope.resolve_local_by_reg(left_reg).is_some() {
+            let r = self.fs_mut().scope.alloc_reg();
+            r
         } else {
-            // If left is truthy, skip right; result = left
-            self.emit(
-                Instruction::abc(OpCode::TestSet, left_reg, left_reg, 0, true),
-                line,
-            );
-        }
+            left_reg
+        };
+
+        let k = op == BinOp::And; // And: k=true (skip JMP when truthy), Or: k=false
+        self.emit(
+            Instruction::abc(OpCode::TestSet, dest_reg, left_reg, 0, k),
+            line,
+        );
         let jump = self.emit_sj(OpCode::Jmp, 0, line);
 
         // Right side may allocate temps, so save/restore
-        let _save_reg = self.fs().scope.free_reg;
+        let save_reg = self.fs().scope.free_reg;
         let right = self.sub_expression(right_prec)?;
         let right_line = self.line();
-        self.discharge_to_reg(&right, left_reg, right_line);
-        if self.fs().scope.free_reg > left_reg + 1 {
-            self.fs_mut().scope.free_reg_to(left_reg + 1);
+        self.discharge_to_reg(&right, dest_reg, right_line);
+        // Free any temps allocated by the right side, but never go below
+        // the original free_reg (to preserve params and other locals).
+        let restore = save_reg.max(dest_reg + 1);
+        if self.fs().scope.free_reg > restore {
+            self.fs_mut().scope.free_reg_to(restore);
         }
 
         self.patch_jump(jump);
-        Ok(ExprDesc::Register(left_reg))
+        Ok(ExprDesc::Register(dest_reg))
     }
 
     /// Resolve a name: local → upvalue → _ENV global.
@@ -1406,12 +1594,24 @@ impl<'a> Compiler<'a> {
         }
 
         // Check upvalues
-        if let Some(idx) = self.resolve_upvalue(self.func_stack.len() - 1, name) {
+        if let Some(idx) = self.resolve_upvalue(self.func_stack.len() - 1, name)? {
             return Ok(ExprDesc::Upvalue(idx));
         }
 
         // Global: _ENV[name]
-        let env_idx = self.resolve_upvalue_env();
+        // First check if _ENV is a local in the current function (e.g. `local _ENV = ...`)
+        let env_name = self.lexer.strings.intern(b"_ENV");
+        if let Some(env_local) = self.fs().scope.resolve_local(env_name) {
+            // _ENV is a local — use Indexed (GetField/SetField on the local register)
+            let env_reg = env_local.reg;
+            let k = self.fs_mut().add_string_constant(name);
+            return Ok(ExprDesc::Indexed {
+                table: env_reg,
+                key: IndexKey::Field(k),
+            });
+        }
+
+        let env_idx = self.resolve_upvalue_env()?;
         let k = self.fs_mut().add_string_constant(name);
         Ok(ExprDesc::Global {
             env_upval: env_idx,
@@ -1420,7 +1620,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Resolve an upvalue by walking up the function state stack.
-    fn resolve_upvalue(&mut self, fs_idx: usize, name: StringId) -> Option<u8> {
+    fn resolve_upvalue(&mut self, fs_idx: usize, name: StringId) -> Result<Option<u8>, CompileError> {
         if fs_idx == 0 {
             // At the outermost function, check its locals
             if let Some(local) = self.func_stack[0].scope.resolve_local(name) {
@@ -1428,15 +1628,15 @@ impl<'a> Compiler<'a> {
                 let is_const = local.is_const;
                 // Mark the local as captured by a closure
                 self.func_stack[0].scope.mark_captured(reg);
-                return Some(self.add_upvalue(fs_idx, name, true, reg, is_const));
+                return Ok(Some(self.add_upvalue(fs_idx, name, true, reg, is_const)?));
             }
             // Also check the outermost function's own upvalues (e.g., _ENV)
             for (i, up) in self.func_stack[0].upvalues.iter().enumerate() {
                 if up.name == name {
-                    return Some(i as u8);
+                    return Ok(Some(i as u8));
                 }
             }
-            return None;
+            return Ok(None);
         }
 
         // Check parent's locals first
@@ -1446,26 +1646,36 @@ impl<'a> Compiler<'a> {
             let is_const = local.is_const || local.is_close;
             // Mark the local as captured by a closure
             self.func_stack[parent_idx].scope.mark_captured(reg);
-            return Some(self.add_upvalue(fs_idx, name, true, reg, is_const));
+            return Ok(Some(self.add_upvalue(fs_idx, name, true, reg, is_const)?));
         }
 
         // Check parent's upvalues
-        if let Some(parent_upval) = self.resolve_upvalue(parent_idx, name) {
+        if let Some(parent_upval) = self.resolve_upvalue(parent_idx, name)? {
             let parent_is_const = self.func_stack[parent_idx].upvalues[parent_upval as usize].is_const;
-            return Some(self.add_upvalue(fs_idx, name, false, parent_upval, parent_is_const));
+            return Ok(Some(self.add_upvalue(fs_idx, name, false, parent_upval, parent_is_const)?));
         }
 
-        None
+        Ok(None)
     }
 
-    fn add_upvalue(&mut self, fs_idx: usize, name: StringId, in_stack: bool, index: u8, is_const: bool) -> u8 {
+    fn add_upvalue(&mut self, fs_idx: usize, name: StringId, in_stack: bool, index: u8, is_const: bool) -> Result<u8, CompileError> {
         let fs = &mut self.func_stack[fs_idx];
         // Check if already registered
         for (i, up) in fs.upvalues.iter().enumerate() {
             if up.in_stack == in_stack && up.index == index {
-                return i as u8;
+                return Ok(i as u8);
             }
         }
+        if fs.upvalues.len() >= 255 {
+            let func_line = self.func_stack[fs_idx].proto.linedefined;
+            let msg = if func_line == 0 {
+                "main function has too many upvalues".to_string()
+            } else {
+                format!("function at line {} has too many upvalues", func_line)
+            };
+            return Err(self.syntax_error(msg));
+        }
+        let fs = &mut self.func_stack[fs_idx];
         let idx = fs.upvalues.len() as u8;
         fs.upvalues.push(UpvalInfo {
             name,
@@ -1473,20 +1683,20 @@ impl<'a> Compiler<'a> {
             index,
             is_const,
         });
-        idx
+        Ok(idx)
     }
 
     /// Get the upvalue index for _ENV in the current function.
-    fn resolve_upvalue_env(&mut self) -> u8 {
+    fn resolve_upvalue_env(&mut self) -> Result<u8, CompileError> {
         let env_name = self.lexer.strings.intern(b"_ENV");
         let fs_idx = self.func_stack.len() - 1;
         // For the top-level function, _ENV is always upvalue 0 (added in compile()).
         // For child functions, resolve it through the upvalue chain.
         if fs_idx == 0 {
-            return 0;
+            return Ok(0);
         }
         self.resolve_upvalue(fs_idx, env_name)
-            .expect("_ENV must be resolvable")
+            .map(|opt| opt.expect("_ENV must be resolvable"))
     }
 
     /// Compile a function body (after 'function' keyword or in function statement).
@@ -1506,6 +1716,7 @@ impl<'a> Compiler<'a> {
             new_fs.proto.num_params = 1;
         }
 
+        new_fs.proto.linedefined = line;
         self.func_stack.push(new_fs);
 
         self.expect(&Token::LParen)?;
@@ -1521,14 +1732,32 @@ impl<'a> Compiler<'a> {
         let ret_line = self.line();
         self.emit_abc(OpCode::Return0, 0, 0, 0, ret_line);
 
+        // Set lastlinedefined to the line of the 'end' keyword
+        self.fs_mut().proto.lastlinedefined = ret_line;
+
         // Adjust labels at function end and check for unresolved gotos
         self.close_block_gotos();
         self.check_unresolved_gotos()?;
 
         // Pop FuncState
         let mut child_fs = self.func_stack.pop().unwrap();
-        child_fs.scope.leave_block();
+        let end_pc = child_fs.current_pc() as u32;
+        child_fs.scope.leave_block_at_pc(end_pc);
         child_fs.proto.max_stack_size = child_fs.scope.max_reg + 2;
+
+        // Populate local_vars from finished_locals (sorted by register)
+        child_fs.scope.finished_locals.sort_by_key(|l| (l.reg, l.start_pc));
+        child_fs.proto.local_vars = child_fs
+            .scope
+            .finished_locals
+            .iter()
+            .map(|fl| crate::proto::LocalVar {
+                name: fl.name,
+                reg: fl.reg,
+                start_pc: fl.start_pc,
+                end_pc: fl.end_pc,
+            })
+            .collect();
 
         // Convert upvalue info
         child_fs.proto.upvalues = child_fs
@@ -1581,6 +1810,10 @@ impl<'a> Compiler<'a> {
         loop {
             match self.current_token()? {
                 Token::End | Token::Else | Token::ElseIf | Token::Until | Token::Eof => break,
+                Token::Return => {
+                    self.stat_return()?;
+                    break; // return is the last statement in a block
+                }
                 _ => {
                     self.statement()?;
                 }
@@ -1591,6 +1824,13 @@ impl<'a> Compiler<'a> {
 
     /// Statement dispatch — placeholder, will be filled in commit 8.
     fn statement(&mut self) -> Result<(), CompileError> {
+        self.incr_nesting()?;
+        let result = self.statement_inner();
+        self.decr_nesting();
+        result
+    }
+
+    fn statement_inner(&mut self) -> Result<(), CompileError> {
         match self.current_token()?.clone() {
             Token::Semi => {
                 self.advance()?;
@@ -1691,6 +1931,7 @@ impl<'a> Compiler<'a> {
             self.fs_mut()
                 .scope
                 .add_local(name, is_const, is_close, start_pc);
+            self.check_local_overflow()?;
             if is_close {
                 let reg = self.fs().scope.free_reg - 1;
                 self.emit_abc(OpCode::Tbc, reg, 0, 0, line);
@@ -1705,17 +1946,20 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'if'
         let mut escape_jumps = Vec::new();
 
-        // Compile the first condition
+        // Compile the first condition — save free_reg so that
+        // temporaries used for the condition are freed after the test
+        let save_free = self.fs().scope.free_reg;
         let cond = self.expression()?;
         self.expect(&Token::Then)?;
         let line = self.line();
         let mut false_jump = self.code_test_jump(&cond, false, line)?;
+        self.fs_mut().scope.free_reg_to(save_free);
 
         self.fs_mut().scope.enter_block(false);
         self.block()?;
-        self.emit_close_if_needed(self.line());
         self.close_block_gotos();
-        self.fs_mut().scope.leave_block();
+        self.emit_close_if_needed(self.line());
+        { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
         // Handle elseif chain
         while self.check(&Token::ElseIf) {
@@ -1727,16 +1971,18 @@ impl<'a> Compiler<'a> {
             }
 
             self.advance()?; // consume 'elseif'
+            let save_free_ei = self.fs().scope.free_reg;
             let cond = self.expression()?;
             self.expect(&Token::Then)?;
             let cond_line = self.line();
             false_jump = self.code_test_jump(&cond, false, cond_line)?;
+            self.fs_mut().scope.free_reg_to(save_free_ei);
 
             self.fs_mut().scope.enter_block(false);
             self.block()?;
-            self.emit_close_if_needed(self.line());
             self.close_block_gotos();
-            self.fs_mut().scope.leave_block();
+            self.emit_close_if_needed(self.line());
+            { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
         }
 
         if self.check(&Token::Else) {
@@ -1750,9 +1996,9 @@ impl<'a> Compiler<'a> {
             self.advance()?; // consume 'else'
             self.fs_mut().scope.enter_block(false);
             self.block()?;
-            self.emit_close_if_needed(self.line());
             self.close_block_gotos();
-            self.fs_mut().scope.leave_block();
+            self.emit_close_if_needed(self.line());
+            { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
         } else {
             // No else: patch false_jump to after the if statement
             if let Some(fj) = false_jump {
@@ -1773,16 +2019,18 @@ impl<'a> Compiler<'a> {
     fn stat_while(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume 'while'
         let loop_start = self.fs().current_pc();
+        let save_free = self.fs().scope.free_reg;
         let cond = self.expression()?;
         self.expect(&Token::Do)?;
         let line = self.line();
         let exit_jump = self.code_test_jump(&cond, false, line)?;
+        self.fs_mut().scope.free_reg_to(save_free);
 
         self.fs_mut().scope.enter_block(true);
         self.block()?;
-        self.emit_close_if_needed(self.line());
         self.close_block_gotos();
-        let block = self.fs_mut().scope.leave_block();
+        self.emit_close_if_needed(self.line());
+        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
         // Jump back to loop start
         let back_jump = self.emit_sj(OpCode::Jmp, 0, self.line());
@@ -1805,9 +2053,9 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'do'
         self.fs_mut().scope.enter_block(false);
         self.block()?;
-        self.emit_close_if_needed(self.line());
         self.close_block_gotos();
-        self.fs_mut().scope.leave_block();
+        self.emit_close_if_needed(self.line());
+        { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
         self.expect(&Token::End)?;
         Ok(())
     }
@@ -1823,7 +2071,7 @@ impl<'a> Compiler<'a> {
         } else if self.check(&Token::Comma) || self.check(&Token::In) {
             self.stat_for_generic(name)
         } else {
-            Err(self.error("'=' or 'in' expected in for statement"))
+            Err(self.syntax_error("'=' or 'in' expected in for statement"))
         }
     }
 
@@ -1869,10 +2117,10 @@ impl<'a> Compiler<'a> {
         self.fs_mut().scope.add_local(var_name, false, false, pc);
 
         self.block()?;
-        self.emit_close_if_needed(self.line());
         self.close_block_gotos();
+        self.emit_close_if_needed(self.line());
 
-        let block = self.fs_mut().scope.leave_block();
+        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
         // ForLoop: increment and test
         let loop_pc = self.emit_abx(OpCode::ForLoop, base, 0, self.line());
@@ -1896,7 +2144,6 @@ impl<'a> Compiler<'a> {
     }
 
     fn stat_for_generic(&mut self, first_name: StringId) -> Result<(), CompileError> {
-        let line = self.line();
         let base = self.fs().scope.free_reg;
 
         // Collect variable names
@@ -1907,6 +2154,7 @@ impl<'a> Compiler<'a> {
         }
 
         self.expect(&Token::In)?;
+        let line = self.line();
 
         // Allocate 4 hidden slots: iterator func, state, control, to-be-closed
         // Then the declared variables
@@ -1915,12 +2163,12 @@ impl<'a> Compiler<'a> {
         let _control_reg = self.fs_mut().scope.alloc_reg();
         let _tbc_reg = self.fs_mut().scope.alloc_reg();
 
-        // Parse iterator expression list, adjusted to 3 values (iter, state, control)
-        let num_exprs = self.expression_list_adjust(iter_reg, 3)?;
+        // Parse iterator expression list, adjusted to 4 values (iter, state, control, to-be-closed)
+        let num_exprs = self.expression_list_adjust(iter_reg, 4)?;
 
-        // Pad with nils if fewer than 3 expressions
-        if num_exprs < 3 {
-            for i in num_exprs..3 {
+        // Pad with nils if fewer than 4 expressions
+        if num_exprs < 4 {
+            for i in num_exprs..4 {
                 self.emit_abx(OpCode::LoadNil, iter_reg + i, 0, line);
             }
         }
@@ -1929,12 +2177,32 @@ impl<'a> Compiler<'a> {
         // so loop variables are allocated at the correct positions
         self.fs_mut().scope.free_reg = base + 4;
 
+        // Mark the 4th slot (base + 3) as to-be-closed
+        self.emit_abc(OpCode::Tbc, base + 3, 0, 0, line);
+
         self.expect(&Token::Do)?;
 
         // TForPrep
         let prep_pc = self.emit_abx(OpCode::TForPrep, base, 0, line);
 
         self.fs_mut().scope.enter_block(true);
+
+        // Add hidden TBC local for the 4th for-generic slot (base + 3)
+        // so that break_needs_close() detects it and emits Close before break
+        {
+            let tbc_name = self.lexer.strings.intern(b"(for toclose)");
+            let pc = self.fs().current_pc() as u32;
+            let scope_depth = self.fs().scope.scope_depth;
+            self.fs_mut().scope.locals.push(LocalVarInfo {
+                name: tbc_name,
+                reg: (base + 3) as u8,
+                scope_depth,
+                is_const: false,
+                is_close: true,
+                is_captured: false,
+                start_pc: pc,
+            });
+        }
 
         // Declare loop variables
         for name in &names {
@@ -1943,15 +2211,15 @@ impl<'a> Compiler<'a> {
         }
 
         self.block()?;
-        self.emit_close_if_needed(self.line());
         self.close_block_gotos();
+        self.emit_close_if_needed(self.line());
 
-        let block = self.fs_mut().scope.leave_block();
+        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
-        // TForCall + TForLoop
+        // TForCall + TForLoop — use the line of the `for` keyword for proper error messages
         let nvars = names.len() as u8;
-        self.emit_abc(OpCode::TForCall, base, 0, nvars, self.line());
-        let loop_pc = self.emit_abx(OpCode::TForLoop, base + 2, 0, self.line());
+        self.emit_abc(OpCode::TForCall, base, 0, nvars, line);
+        let loop_pc = self.emit_abx(OpCode::TForLoop, base + 2, 0, line);
 
         // Patch TForPrep to jump to TForCall
         let call_pc = loop_pc - 1;
@@ -1964,8 +2232,12 @@ impl<'a> Compiler<'a> {
         self.fs_mut().proto.code[loop_pc] =
             Instruction::asbx(OpCode::TForLoop, base + 2, back_offset);
 
+        // Close the TBC variable (base + 3) when loop exits normally
+        self.emit_abc(OpCode::Close, base + 3, 0, 0, line);
+
         self.expect(&Token::End)?;
 
+        // Break jumps land here (after Close)
         for brk in block.break_jumps {
             self.patch_jump(brk);
         }
@@ -1985,16 +2257,37 @@ impl<'a> Compiler<'a> {
 
         let cond = self.expression()?;
         let line = self.line();
-        let loop_back_jump = self.code_test_jump(&cond, false, line)?;
-        self.emit_close_if_needed(self.line());
-        self.close_block_gotos();
 
-        let block = self.fs_mut().scope.leave_block();
+        // Check if block has captured upvalues that need closing
+        let close_reg = self.fs().scope.block_needs_close();
 
-        // Jump back if condition is false (None means condition is always true, never loop back)
-        if let Some(jmp) = loop_back_jump {
-            self.patch_jump_to(jmp, loop_start);
+        if let Some(creg) = close_reg {
+            // Upvalues need closing: restructure to close before both paths
+            // 1. Jump to EXIT if condition is TRUE
+            let exit_jump = self.code_test_jump(&cond, true, line)?;
+            // 2. Close upvalues for loop-back path
+            self.emit_abc(OpCode::Close, creg, 0, 0, line);
+            // 3. Jump back to loop start
+            let back_jump = self.emit_sj(OpCode::Jmp, 0, line);
+            self.patch_jump_to(back_jump, loop_start);
+            // 4. EXIT: close upvalues for exit path
+            if let Some(ej) = exit_jump {
+                self.patch_jump(ej);
+            }
+            self.close_block_gotos();
+            self.emit_abc(OpCode::Close, creg, 0, 0, line);
+        } else {
+            // No upvalues: simple loop-back jump
+            let loop_back_jump = self.code_test_jump(&cond, false, line)?;
+            self.close_block_gotos();
+
+            // Jump back if condition is false
+            if let Some(jmp) = loop_back_jump {
+                self.patch_jump_to(jmp, loop_start);
+            }
         }
+
+        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
         // Patch breaks to after the loop
         for brk in block.break_jumps {
@@ -2007,6 +2300,7 @@ impl<'a> Compiler<'a> {
     fn stat_function(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume 'function'
         let line = self.line();
+        let save_free_reg = self.fs().scope.free_reg;
 
         // Parse function name: name {'.' name} [':' name]
         let first_name = self.expect_name()?;
@@ -2041,6 +2335,7 @@ impl<'a> Compiler<'a> {
 
         let func = self.function_body(is_method)?;
         self.code_store(&expr, &func, line)?;
+        self.fs_mut().scope.free_reg_to(save_free_reg);
         Ok(())
     }
 
@@ -2069,14 +2364,20 @@ impl<'a> Compiler<'a> {
             self.test_next(&Token::Semi)?;
             match &first_expr {
                 ExprDesc::Call(pc) => {
-                    // Tail call optimization for single call return
                     let pc = *pc;
                     let inst = self.fs().proto.code[pc];
                     let a = inst.a();
                     let b = inst.b();
-                    self.fs_mut().proto.code[pc] =
-                        Instruction::abc(OpCode::TailCall, a, b, 0, inst.k());
-                    self.emit_abc(OpCode::Return, a, 0, 0, line);
+                    // Tail call optimization — disabled when TBC variables are in scope
+                    if self.fs().scope.has_tbc_in_scope() {
+                        // Cannot tail call: TBC vars need closing before return
+                        // Keep as regular Call, return its results
+                        self.emit_abc(OpCode::Return, a, 0, 0, line);
+                    } else {
+                        self.fs_mut().proto.code[pc] =
+                            Instruction::abc(OpCode::TailCall, a, b, 0, inst.k());
+                        self.emit_abc(OpCode::Return, a, 0, 0, line);
+                    }
                 }
                 ExprDesc::Vararg(pc) => {
                     // Multi-return vararg: return all varargs
@@ -2174,6 +2475,11 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'break'
         let line = self.line();
 
+        // Close upvalues if breaking over captured/TBC locals
+        if let Some(close_reg) = self.fs().scope.break_needs_close() {
+            self.emit_abc(OpCode::Close, close_reg, 0, 0, line);
+        }
+
         // Find enclosing loop
         let jump = self.emit_sj(OpCode::Jmp, 0, line);
 
@@ -2183,7 +2489,7 @@ impl<'a> Compiler<'a> {
         });
 
         if found.is_none() {
-            return Err(self.error("'break' outside loop"));
+            return Err(self.syntax_error("<break> outside loop"));
         }
         Ok(())
     }
@@ -2193,7 +2499,6 @@ impl<'a> Compiler<'a> {
         self.advance()?; // consume 'goto'
         let line = self.line();
         let name = self.expect_name()?;
-        let pc = self.emit_sj(OpCode::Jmp, 0, line);
         let num_locals = self.fs().scope.num_locals();
 
         // Try to resolve immediately (backward goto to already-defined label)
@@ -2211,8 +2516,21 @@ impl<'a> Compiler<'a> {
                     goto_name_str, line, local_name_str
                 )));
             }
+            // Backward goto: if jumping over captured locals, emit Close first
+            if num_locals > label_num_locals {
+                // Check if any locals being jumped over are captured
+                let need_close = self.fs().scope.locals[label_num_locals..num_locals]
+                    .iter()
+                    .any(|l| l.is_captured || l.is_close);
+                if need_close {
+                    let close_reg = self.fs().scope.locals[label_num_locals].reg;
+                    self.emit_abc(OpCode::Close, close_reg, 0, 0, line);
+                }
+            }
+            let pc = self.emit_sj(OpCode::Jmp, 0, line);
             self.patch_jump_to(pc, target_pc);
         } else {
+            let pc = self.emit_sj(OpCode::Jmp, 0, line);
             // Save as pending goto
             if let Some(block) = self.fs_mut().scope.current_block_mut() {
                 block.pending_gotos.push(PendingGoto {
@@ -2263,6 +2581,13 @@ impl<'a> Compiler<'a> {
             line: label_line,
         });
 
+        // Check if this label could be at block end (next token is block-terminating)
+        let at_block_end = match self.current_token() {
+            Ok(Token::End) | Ok(Token::Else) | Ok(Token::ElseIf) | Ok(Token::Eof) => true,
+            Ok(Token::Semi) | Ok(Token::DoubleColon) => true, // semicolons/more labels don't emit code
+            _ => false, // Until, Name, etc. = definitely NOT at block end
+        };
+
         // Resolve pending gotos that reference this label
         // First pass: collect matching gotos (to avoid borrow conflicts)
         // Gotos that would jump into scope of a local are left pending — they will either
@@ -2276,9 +2601,19 @@ impl<'a> Compiler<'a> {
                     // Only resolve if goto doesn't jump over local variable declarations
                     if goto_info.num_locals >= num_locals {
                         resolved.push((i, goto_info.pc));
+                    } else if !at_block_end {
+                        // Label is NOT at block end — this goto definitely jumps into scope
+                        let local_name = self.fs().scope.locals[goto_info.num_locals].name;
+                        let local_name_bytes = self.lexer.strings.get_bytes(local_name).to_vec();
+                        let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
+                        let goto_name_bytes = self.lexer.strings.get_bytes(goto_info.name).to_vec();
+                        let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
+                        return Err(self.error(&format!(
+                            "<goto {}> at line {} jumps into the scope of local '{}'",
+                            goto_name_str, goto_info.line, local_name_str
+                        )));
                     }
-                    // If goto_info.num_locals < num_locals, leave it pending.
-                    // close_block_gotos may adjust the label's num_locals at block end.
+                    // else: label might be at block end, leave pending for adjust_end_labels
                 }
             }
         }
@@ -2308,8 +2643,41 @@ impl<'a> Compiler<'a> {
             // Assignment
             let mut targets = vec![expr];
             while self.test_next(&Token::Comma)? {
+                self.incr_nesting()?;
                 let target = self.primary_expression()?;
+                // check_conflict: if this new target is a local/register assignment,
+                // check all previous indexed targets. If any uses the same register
+                // as its table or key, save the local to a temp register first.
+                // This matches PUC Lua's check_conflict() in lparser.c.
+                if let ExprDesc::Register(new_reg) = target {
+                    let mut conflict = false;
+                    // The temp register will be at current free_reg if conflict found
+                    let extra = self.fs().scope.free_reg;
+                    for prev in targets.iter_mut() {
+                        if let ExprDesc::Indexed { table, key } = prev {
+                            if *table == new_reg {
+                                conflict = true;
+                                *table = extra;
+                            }
+                            // Also check if the key register matches
+                            if let IndexKey::Register(kr) = key {
+                                if *kr == new_reg {
+                                    conflict = true;
+                                    *kr = extra;
+                                }
+                            }
+                        }
+                    }
+                    if conflict {
+                        let extra = self.fs_mut().scope.alloc_reg();
+                        self.emit_abc(OpCode::Move, extra, new_reg, 0, line);
+                    }
+                }
                 targets.push(target);
+            }
+            // Restore nesting for all the extra targets
+            for _ in 1..targets.len() {
+                self.decr_nesting();
             }
             self.expect(&Token::Assign)?;
 
@@ -2328,8 +2696,11 @@ impl<'a> Compiler<'a> {
                 }
             }
 
-            // Store values to targets
-            for (i, target) in targets.iter().enumerate() {
+            // Store values to targets (in reverse order, matching PUC Lua semantics).
+            // Reverse order ensures that when a variable appears on both sides
+            // (e.g., `a, a[i] = 1, 2`), indexed stores see the original value
+            // before the local is overwritten.
+            for (i, target) in targets.iter().enumerate().rev() {
                 let val = ExprDesc::Register(base + i as u8);
                 self.code_store(target, &val, line)?;
             }
@@ -2354,7 +2725,7 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 _ => {
-                    return Err(self.error("expression is not a statement"));
+                    return Err(self.syntax_error("expression is not a statement"));
                 }
             }
         }
@@ -2397,10 +2768,13 @@ impl<'a> Compiler<'a> {
                 }
             }
             _ => {
+                let save_free = self.fs().scope.free_reg;
                 let reg = self.discharge_to_any_reg(cond, line);
                 // TEST: skip next if R(A) is truthy/falsy
                 self.emit(Instruction::abc(OpCode::Test, reg, 0, 0, !jump_if), line);
                 let jump = self.emit_sj(OpCode::Jmp, 0, line);
+                // Free any temporary register allocated for the condition
+                self.fs_mut().scope.free_reg_to(save_free);
                 Ok(Some(jump))
             }
         }
@@ -2421,7 +2795,7 @@ impl<'a> Compiler<'a> {
                 if let Some(local) = self.fs().scope.resolve_local_by_reg(reg) {
                     if local.is_const || local.is_close {
                         let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(local.name)).into_owned();
-                        return Err(self.error(&format!("attempt to assign to const variable '{}'", name)));
+                        return Err(self.error_at(line, format!("attempt to assign to const variable '{}'", name)));
                     }
                 }
                 self.discharge_to_reg(value, reg, line);
@@ -2431,7 +2805,7 @@ impl<'a> Compiler<'a> {
                 // Check if the upvalue is a const variable
                 if self.fs().upvalues[idx as usize].is_const {
                     let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(self.fs().upvalues[idx as usize].name)).into_owned();
-                    return Err(self.error(&format!("attempt to assign to const variable '{}'", name)));
+                    return Err(self.error_at(line, format!("attempt to assign to const variable '{}'", name)));
                 }
                 let val_reg = self.discharge_to_any_reg(value, line);
                 self.emit_abc(OpCode::SetUpval, val_reg, idx, 0, line);
@@ -2440,20 +2814,38 @@ impl<'a> Compiler<'a> {
                 let env_upval = *env_upval;
                 let name_k = *name_k;
                 let val_reg = self.discharge_to_any_reg(value, line);
-                self.emit(
-                    Instruction::abc(OpCode::SetTabUp, env_upval, name_k as u8, val_reg, false),
-                    line,
-                );
+                if name_k <= 255 {
+                    self.emit(
+                        Instruction::abc(OpCode::SetTabUp, env_upval, name_k as u8, val_reg, false),
+                        line,
+                    );
+                } else {
+                    // Constant index too large; fall back to GetUpval + load key + SetTable
+                    let env_reg = self.fs_mut().scope.alloc_reg();
+                    self.emit_abc(OpCode::GetUpval, env_reg, env_upval, 0, line);
+                    let key_reg = self.fs_mut().scope.alloc_reg();
+                    self.emit_load_constant(key_reg, name_k, line);
+                    self.emit_abc(OpCode::SetTable, env_reg, key_reg, val_reg, line);
+                    self.fs_mut().scope.free_reg_to(env_reg);
+                }
             }
             ExprDesc::Indexed { table, key } => {
                 let table = *table;
                 let val_reg = self.discharge_to_any_reg(value, line);
                 match key {
                     IndexKey::Field(k) => {
-                        self.emit(
-                            Instruction::abc(OpCode::SetField, table, *k as u8, val_reg, false),
-                            line,
-                        );
+                        if *k <= 255 {
+                            self.emit(
+                                Instruction::abc(OpCode::SetField, table, *k as u8, val_reg, false),
+                                line,
+                            );
+                        } else {
+                            // Constant index too large; load key into register and use SetTable
+                            let key_reg = self.fs_mut().scope.alloc_reg();
+                            self.emit_load_constant(key_reg, *k, line);
+                            self.emit_abc(OpCode::SetTable, table, key_reg, val_reg, line);
+                            self.fs_mut().scope.free_reg_to(key_reg);
+                        }
                     }
                     IndexKey::Register(key_reg) => {
                         self.emit_abc(OpCode::SetTable, table, *key_reg, val_reg, line);
@@ -2462,15 +2854,23 @@ impl<'a> Compiler<'a> {
                         self.emit_abc(OpCode::SetI, table, *i, val_reg, line);
                     }
                     IndexKey::Constant(k) => {
-                        self.emit(
-                            Instruction::abc(OpCode::SetTable, table, *k as u8, val_reg, true),
-                            line,
-                        );
+                        if *k <= 255 {
+                            self.emit(
+                                Instruction::abc(OpCode::SetTable, table, *k as u8, val_reg, true),
+                                line,
+                            );
+                        } else {
+                            // Constant index too large; load into register
+                            let key_reg = self.fs_mut().scope.alloc_reg();
+                            self.emit_load_constant(key_reg, *k, line);
+                            self.emit_abc(OpCode::SetTable, table, key_reg, val_reg, line);
+                            self.fs_mut().scope.free_reg_to(key_reg);
+                        }
                     }
                 }
             }
             _ => {
-                return Err(self.error("invalid assignment target"));
+                return Err(self.syntax_error("invalid assignment target"));
             }
         }
         Ok(())
@@ -2627,8 +3027,24 @@ fn compile_inner(compiler: &mut Compiler<'_>, name: &str) -> Result<Proto, Compi
 
     // Finalize
     let mut fs = compiler.func_stack.pop().unwrap();
-    fs.scope.leave_block();
+    let end_pc = fs.current_pc() as u32;
+    fs.scope.leave_block_at_pc(end_pc);
     fs.proto.max_stack_size = fs.scope.max_reg + 2;
+
+    // Populate local_vars from finished_locals (sorted by register)
+    fs.scope.finished_locals.sort_by_key(|l| (l.reg, l.start_pc));
+    fs.proto.local_vars = fs
+        .scope
+        .finished_locals
+        .iter()
+        .map(|fl| crate::proto::LocalVar {
+            name: fl.name,
+            reg: fl.reg,
+            start_pc: fl.start_pc,
+            end_pc: fl.end_pc,
+        })
+        .collect();
+
     fs.proto.upvalues = fs
         .upvalues
         .iter()

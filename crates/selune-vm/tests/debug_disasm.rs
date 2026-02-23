@@ -45,7 +45,7 @@ fn dump_bytecodes() {
         ),
     ];
 
-    for (label, source) in tests {
+    for (label, source) in &tests {
         eprintln!("=== {} ===", label);
         let (proto, strings) =
             selune_compiler::compiler::compile(source.as_bytes(), "=test").unwrap();

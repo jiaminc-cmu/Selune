@@ -9,6 +9,8 @@ use selune_core::value::TValue;
 /// Result from string library registration.
 pub struct StringLibIndices {
     pub gsub_idx: GcIdx<NativeFunction>,
+    pub format_idx: GcIdx<NativeFunction>,
+    pub dump_idx: GcIdx<NativeFunction>,
     pub string_table_idx: GcIdx<Table>,
 }
 
@@ -29,7 +31,6 @@ pub fn register(
     register_fn(gc, string_table, strings, "reverse", native_string_reverse);
     register_fn(gc, string_table, strings, "upper", native_string_upper);
     register_fn(gc, string_table, strings, "lower", native_string_lower);
-    register_fn(gc, string_table, strings, "format", native_string_format);
     register_fn(gc, string_table, strings, "find", native_string_find);
     register_fn(gc, string_table, strings, "match", native_string_match);
     register_fn(gc, string_table, strings, "gmatch", native_string_gmatch);
@@ -37,11 +38,23 @@ pub fn register(
     register_fn(gc, string_table, strings, "unpack", native_string_unpack);
     register_fn(gc, string_table, strings, "packsize", native_string_packsize);
 
+    // string.format needs VM access for __tostring metamethod calls
+    let format_idx = gc.alloc_native(native_string_format, "format");
+    let format_val = TValue::from_native(format_idx);
+    let format_name = strings.intern(b"format");
+    gc.get_table_mut(string_table).raw_set_str(format_name, format_val);
+
     // string.gsub needs VM access for function replacement
     let gsub_idx = gc.alloc_native(native_string_gsub_stub, "gsub");
     let gsub_val = TValue::from_native(gsub_idx);
     let gsub_name = strings.intern(b"gsub");
     gc.get_table_mut(string_table).raw_set_str(gsub_name, gsub_val);
+
+    // string.dump needs VM access for proto serialization
+    let dump_idx = gc.alloc_native(native_string_dump_stub, "dump");
+    let dump_val = TValue::from_native(dump_idx);
+    let dump_name = strings.intern(b"dump");
+    gc.get_table_mut(string_table).raw_set_str(dump_name, dump_val);
 
     let name = strings.intern(b"string");
     gc.get_table_mut(env_idx)
@@ -49,6 +62,8 @@ pub fn register(
 
     StringLibIndices {
         gsub_idx,
+        format_idx,
+        dump_idx,
         string_table_idx: string_table,
     }
 }
@@ -64,6 +79,454 @@ fn register_fn(
     let val = TValue::from_native(idx);
     let key = strings.intern(name.as_bytes());
     gc.get_table_mut(table).raw_set_str(key, val);
+}
+
+/// Try to convert a value to string via __tostring metamethod or __name.
+/// Used by string.format "%s" for tables/userdata without direct string conversion.
+fn tostring_via_meta(val: TValue, ctx: &mut NativeContext) -> Result<Vec<u8>, NativeError> {
+    // Check table metatable for __tostring
+    let mt = if let Some(tbl_idx) = val.as_table_idx() {
+        ctx.gc.get_table(tbl_idx).metatable
+    } else if let Some(ud_idx) = val.as_userdata_idx() {
+        ctx.gc.get_userdata(ud_idx).metatable
+    } else {
+        None
+    };
+
+    if let Some(mt_idx) = mt {
+        let tostring_key = ctx.strings.intern(b"__tostring");
+        let mm = ctx.gc.get_table(mt_idx).raw_get_str(tostring_key);
+        if !mm.is_nil() {
+            if let Some(native_idx) = mm.as_native_idx() {
+                // Call native __tostring
+                let native_fn = ctx.gc.get_native(native_idx).func;
+                let args = [val];
+                let mut sub_ctx = NativeContext {
+                    args: &args,
+                    gc: ctx.gc,
+                    strings: ctx.strings,
+                    upvalue: TValue::nil(),
+                };
+                let results = native_fn(&mut sub_ctx)
+                    .map_err(|e| NativeError::String(format!("{:?}", e)))?;
+                if let Some(sid) = results.first().and_then(|v| v.as_string_id()) {
+                    return Ok(ctx.strings.get_bytes(sid).to_vec());
+                }
+                return Err(NativeError::String(
+                    "'__tostring' must return a string".to_string(),
+                ));
+            }
+            if mm.as_closure_idx().is_some() {
+                // Can't call Lua closures from native context; return opaque
+                // representation. This will be handled properly when string.format
+                // is VM-redirected.
+            }
+        }
+        // Check __name for type name fallback
+        let name_key = ctx.strings.intern(b"__name");
+        let name_val = ctx.gc.get_table(mt_idx).raw_get_str(name_key);
+        if let Some(sid) = name_val.as_string_id() {
+            let name_bytes = ctx.strings.get_bytes(sid).to_vec();
+            // Format as "typename: 0x..."
+            let ptr = format!("0x{:014x}", val.raw_bits());
+            let mut result = name_bytes;
+            result.extend_from_slice(b": ");
+            result.extend_from_slice(ptr.as_bytes());
+            return Ok(result);
+        }
+    }
+    // Default: "table: 0x..." or "userdata: 0x..."
+    let type_name = if val.as_table_idx().is_some() {
+        "table"
+    } else if val.as_userdata_idx().is_some() {
+        "userdata"
+    } else {
+        "?"
+    };
+    let ptr = format!("0x{:014x}", val.raw_bits());
+    Ok(format!("{}: {}", type_name, ptr).into_bytes())
+}
+
+/// Format an unsigned integer with C-style format specifiers (%x, %X, %o, %u).
+/// Handles width, zero-padding, left-align, '#' flag.
+fn sprintf_int(fmt: &str, n: u64, spec: u8) -> String {
+    let bytes = fmt.as_bytes();
+    let mut i = 1; // skip '%'
+    let mut left_align = false;
+    let mut zero_pad = false;
+    let mut alt_form = false;
+    // Parse flags
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' => { left_align = true; i += 1; }
+            b'0' => { zero_pad = true; i += 1; }
+            b'#' => { alt_form = true; i += 1; }
+            b'+' | b' ' => { i += 1; } // ignore for unsigned
+            _ => break,
+        }
+    }
+    // Parse width
+    let mut width = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        width = width * 10 + (bytes[i] - b'0') as usize;
+        i += 1;
+    }
+    // Parse precision
+    let mut prec: Option<usize> = None;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            p = p * 10 + (bytes[i] - b'0') as usize;
+            i += 1;
+        }
+        prec = Some(p);
+    }
+    // Format the number
+    let digits = match spec {
+        b'x' => format!("{:x}", n),
+        b'X' => format!("{:X}", n),
+        b'o' => format!("{:o}", n),
+        _ => format!("{}", n),
+    };
+    // Apply precision (minimum digits)
+    let digits = if let Some(p) = prec {
+        if p == 0 && n == 0 {
+            String::new()
+        } else if digits.len() < p {
+            format!("{:0>width$}", digits, width = p)
+        } else {
+            digits
+        }
+    } else {
+        digits
+    };
+    // Build prefix
+    let prefix = if alt_form {
+        match spec {
+            b'x' => { if n != 0 { "0x" } else { "" } }
+            b'X' => { if n != 0 { "0X" } else { "" } }
+            b'o' => { if !digits.starts_with('0') && !digits.is_empty() { "0" } else { "" } }
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    let content = format!("{}{}", prefix, digits);
+    if content.len() >= width {
+        content
+    } else if left_align {
+        format!("{:<width$}", content, width = width)
+    } else if zero_pad && prec.is_none() {
+        // Zero-pad between prefix and digits
+        let pad_len = width - content.len();
+        format!("{}{}{}", prefix, "0".repeat(pad_len), digits)
+    } else {
+        format!("{:>width$}", content, width = width)
+    }
+}
+
+/// Format a signed integer with C-style format specifiers (%d, %i).
+/// Handles width, zero-padding, left-align, '+', ' ' flags, and precision.
+fn sprintf_signed(fmt: &str, n: i64) -> String {
+    let bytes = fmt.as_bytes();
+    let mut i = 1; // skip '%'
+    let mut left_align = false;
+    let mut zero_pad = false;
+    let mut plus_flag = false;
+    let mut space_flag = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' => { left_align = true; i += 1; }
+            b'0' => { zero_pad = true; i += 1; }
+            b'+' => { plus_flag = true; i += 1; }
+            b' ' => { space_flag = true; i += 1; }
+            b'#' => { i += 1; }
+            _ => break,
+        }
+    }
+    let mut width = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        width = width * 10 + (bytes[i] - b'0') as usize;
+        i += 1;
+    }
+    let mut prec: Option<usize> = None;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            p = p * 10 + (bytes[i] - b'0') as usize;
+            i += 1;
+        }
+        prec = Some(p);
+    }
+    let abs_n = if n == i64::MIN {
+        format!("{}", n as u64) // handle overflow
+    } else {
+        format!("{}", n.unsigned_abs())
+    };
+    // Apply precision
+    let digits = if let Some(p) = prec {
+        if p == 0 && n == 0 {
+            String::new()
+        } else if abs_n.len() < p {
+            format!("{:0>width$}", abs_n, width = p)
+        } else {
+            abs_n
+        }
+    } else {
+        abs_n
+    };
+    // Build sign
+    let sign = if n < 0 {
+        "-"
+    } else if plus_flag {
+        "+"
+    } else if space_flag {
+        " "
+    } else {
+        ""
+    };
+    let content = format!("{}{}", sign, digits);
+    if content.len() >= width {
+        content
+    } else if left_align {
+        format!("{:<width$}", content, width = width)
+    } else if zero_pad && prec.is_none() {
+        // Zero-pad between sign and digits
+        let pad_len = width - content.len();
+        format!("{}{}{}", sign, "0".repeat(pad_len), digits)
+    } else {
+        format!("{:>width$}", content, width = width)
+    }
+}
+
+/// Format a floating-point number in hexadecimal format (%a / %A).
+/// Produces format like: [-]0x1.HHHHHHHHHHHHHp+EE
+fn format_hex_float(f: f64, upper: bool, prec: Option<usize>, flags: &[u8], width_str: &str) -> String {
+    let p_char = if upper { 'P' } else { 'p' };
+    let x_char = if upper { 'X' } else { 'x' };
+    let flag_plus = flags.contains(&b'+');
+    let flag_space = flags.contains(&b' ');
+    let flag_minus = flags.contains(&b'-');
+    let flag_zero = flags.contains(&b'0');
+    let w: usize = width_str.parse().unwrap_or(0);
+
+    // Determine sign prefix
+    let sign_prefix = |negative: bool| -> &'static str {
+        if negative { "-" }
+        else if flag_plus { "+" }
+        else if flag_space { " " }
+        else { "" }
+    };
+
+    if f.is_nan() {
+        let core = if upper { "NAN" } else { "nan" };
+        let s = format!("{}{}", sign_prefix(false), core);
+        return pad_string(&s, w, flag_minus, false);
+    }
+    if f.is_infinite() {
+        let neg = f < 0.0;
+        let core = if upper { "INF" } else { "inf" };
+        let s = format!("{}{}", sign_prefix(neg), core);
+        return pad_string(&s, w, flag_minus, false);
+    }
+
+    let negative = f.is_sign_negative();
+    let f_abs = f.abs();
+    let sp = sign_prefix(negative);
+
+    if f_abs == 0.0 {
+        let core = match prec {
+            Some(0) => format!("0{}0{}+0", x_char, p_char),
+            Some(p) => format!("0{}0.{}{}+0", x_char, "0".repeat(p), p_char),
+            None => format!("0{}0{}+0", x_char, p_char),
+        };
+        let s = format!("{}{}", sp, core);
+        return pad_string(&s, w, flag_minus, flag_zero && !flag_minus);
+    }
+
+    let bits = f_abs.to_bits();
+    let exp_raw = ((bits >> 52) & 0x7ff) as i64;
+    let mantissa_bits = bits & 0x000fffffffffffff;
+
+    let (exp, full_mantissa) = if exp_raw == 0 {
+        // Denormalized number
+        let mut m = mantissa_bits;
+        let mut e: i64 = -1022;
+        // Normalize: shift until we have a leading 1 in bit 52
+        while m != 0 && (m & (1u64 << 52)) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        (e, m & 0x000fffffffffffff)
+    } else {
+        (exp_raw - 1023, mantissa_bits)
+    };
+
+    let exp_str = if exp >= 0 { format!("+{}", exp) } else { format!("{}", exp) };
+
+    // 52 mantissa bits = 13 hex digits
+    let all_hex = if upper {
+        format!("{:013X}", full_mantissa)
+    } else {
+        format!("{:013x}", full_mantissa)
+    };
+
+    let core = match prec {
+        Some(0) => {
+            format!("0{}1{}{}", x_char, p_char, exp_str)
+        }
+        Some(p) => {
+            let hex = if p >= 13 {
+                format!("{}{}", all_hex, "0".repeat(p - 13))
+            } else {
+                all_hex[..p].to_string()
+            };
+            format!("0{}1.{}{}{}", x_char, hex, p_char, exp_str)
+        }
+        None => {
+            // Trim trailing zeros
+            let hex = all_hex.trim_end_matches('0');
+            if hex.is_empty() {
+                format!("0{}1{}{}", x_char, p_char, exp_str)
+            } else {
+                format!("0{}1.{}{}{}", x_char, hex, p_char, exp_str)
+            }
+        }
+    };
+
+    let s = format!("{}{}", sp, core);
+    pad_string(&s, w, flag_minus, flag_zero && !flag_minus)
+}
+
+fn pad_string(s: &str, width: usize, left_align: bool, zero_pad: bool) -> String {
+    if s.len() >= width {
+        return s.to_string();
+    }
+    let padding = width - s.len();
+    if left_align {
+        format!("{}{}", s, " ".repeat(padding))
+    } else if zero_pad {
+        // Insert zeros after sign and 0x prefix
+        let mut prefix_len = 0;
+        let bytes = s.as_bytes();
+        if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-' || bytes[0] == b' ') {
+            prefix_len = 1;
+        }
+        // Check for 0x/0X after sign
+        if prefix_len + 1 < bytes.len() && bytes[prefix_len] == b'0'
+            && (bytes[prefix_len + 1] == b'x' || bytes[prefix_len + 1] == b'X')
+        {
+            prefix_len += 2;
+        }
+        format!("{}{}{}", &s[..prefix_len], "0".repeat(padding), &s[prefix_len..])
+    } else {
+        format!("{}{}", " ".repeat(padding), s)
+    }
+}
+
+/// Format a float with C-style flags, width, precision for %f/%e/%E/%g/%G.
+fn sprintf_float(f: f64, spec: u8, flags: &[u8], width: &str, precision: &str) -> String {
+    let flag_plus = flags.contains(&b'+');
+    let flag_space = flags.contains(&b' ');
+    let flag_minus = flags.contains(&b'-');
+    let flag_zero = flags.contains(&b'0');
+    let flag_hash = flags.contains(&b'#');
+    let w: usize = width.parse().unwrap_or(0);
+    let prec: usize = precision.parse().unwrap_or(6);
+
+    // Generate the core number string without sign
+    let abs_f = f.abs();
+    let negative = f.is_sign_negative() && !f.is_nan();
+
+    let core = match spec {
+        b'f' => {
+            let s = format!("{:.prec$}", abs_f, prec = prec);
+            if flag_hash && prec == 0 && !s.contains('.') {
+                format!("{}.", s)
+            } else {
+                s
+            }
+        }
+        b'e' | b'E' => {
+            let raw = if spec == b'e' {
+                format!("{:.prec$e}", abs_f, prec = prec)
+            } else {
+                format!("{:.prec$E}", abs_f, prec = prec)
+            };
+            let s = fix_scientific_notation(&raw);
+            if flag_hash && prec == 0 {
+                // Insert '.' before 'e'/'E'
+                if let Some(epos) = s.find(|c: char| c == 'e' || c == 'E') {
+                    format!("{}.{}", &s[..epos], &s[epos..])
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        }
+        b'g' | b'G' => {
+            let gprec = if prec == 0 { 1 } else { prec };
+            let sci = format!("{:.prec$e}", abs_f, prec = gprec.saturating_sub(1));
+            let exp = sci.rfind('e')
+                .and_then(|pos| sci[pos + 1..].parse::<i32>().ok())
+                .unwrap_or(0);
+            let s = if exp < -4 || exp >= gprec as i32 {
+                let raw = if spec == b'G' {
+                    format!("{:.prec$E}", abs_f, prec = gprec.saturating_sub(1))
+                } else {
+                    sci
+                };
+                fix_scientific_notation(&raw)
+            } else {
+                let decimal_places = if gprec as i32 > exp + 1 {
+                    (gprec as i32 - exp - 1) as usize
+                } else {
+                    0
+                };
+                let s = format!("{:.prec$}", abs_f, prec = decimal_places);
+                if spec == b'G' { s.to_uppercase() } else { s }
+            };
+            // Trim trailing zeros unless # flag
+            if !flag_hash {
+                if s.contains('.') {
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        }
+        _ => unreachable!(),
+    };
+
+    // Build sign prefix
+    let sign = if negative {
+        "-"
+    } else if flag_plus {
+        "+"
+    } else if flag_space {
+        " "
+    } else {
+        ""
+    };
+
+    let full = format!("{}{}", sign, core);
+    if full.len() >= w {
+        return full;
+    }
+    let padding = w - full.len();
+    if flag_minus {
+        format!("{}{}", full, " ".repeat(padding))
+    } else if flag_zero {
+        // Insert zeros after sign
+        format!("{}{}{}", sign, "0".repeat(padding), core)
+    } else {
+        format!("{}{}", " ".repeat(padding), full)
+    }
 }
 
 /// Convert Rust's scientific notation (e.g. "1.000000e5") to C printf style ("1.000000e+05").
@@ -104,10 +567,157 @@ fn get_string_arg<'a>(
         Ok((ctx.strings.get_bytes(sid), sid))
     } else {
         Err(NativeError::String(format!(
-            "bad argument #{} to '{}' (string expected)",
+            "bad argument #{} to '{}' (string expected, got {})",
             idx + 1,
             fname,
+            type_name_of(val),
         )))
+    }
+}
+
+/// Get string argument with number-to-string coercion (Lua 5.4 behavior).
+/// Returns owned bytes since coerced strings are newly created.
+/// Check an argument is an integer (luaL_checkinteger equivalent).
+/// Tries float→int conversion. Errors with "number has no integer representation".
+fn check_integer_arg(ctx: &mut NativeContext, idx: usize, fname: &str) -> Result<i64, NativeError> {
+    let val = ctx.args.get(idx).copied().unwrap_or(TValue::nil());
+    if let Some(i) = val.as_full_integer(ctx.gc) {
+        return Ok(i);
+    }
+    if let Some(f) = val.as_float() {
+        if f.is_finite() && f.floor() == f && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Ok(f as i64);
+        }
+        return Err(NativeError::String(format!(
+            "bad argument #{} to '{}' (number has no integer representation)",
+            idx + 1,
+            fname,
+        )));
+    }
+    // Try string coercion
+    if let Some(sid) = val.as_string_id() {
+        let s = std::str::from_utf8(ctx.strings.get_bytes(sid)).unwrap_or("");
+        let s = s.trim();
+        if let Ok(i) = s.parse::<i64>() {
+            return Ok(i);
+        }
+        if let Ok(f) = s.parse::<f64>() {
+            if f.is_finite() && f.floor() == f && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                return Ok(f as i64);
+            }
+            return Err(NativeError::String(format!(
+                "bad argument #{} to '{}' (number has no integer representation)",
+                idx + 1,
+                fname,
+            )));
+        }
+    }
+    Err(NativeError::String(format!(
+        "bad argument #{} to '{}' (number expected, got {})",
+        idx + 1,
+        fname,
+        type_name_of(val),
+    )))
+}
+
+/// Like check_integer_arg but returns a default if the argument is absent/nil.
+fn opt_integer_arg(ctx: &mut NativeContext, idx: usize, fname: &str, default: i64) -> Result<i64, NativeError> {
+    let val = ctx.args.get(idx).copied().unwrap_or(TValue::nil());
+    if val.is_nil() {
+        return Ok(default);
+    }
+    check_integer_arg(ctx, idx, fname)
+}
+
+fn get_string_arg_coerce(
+    ctx: &mut NativeContext,
+    idx: usize,
+    fname: &str,
+) -> Result<(Vec<u8>, selune_core::string::StringId), NativeError> {
+    let val = ctx.args.get(idx).copied().unwrap_or(TValue::nil());
+    if let Some(sid) = val.as_string_id() {
+        let bytes = ctx.strings.get_bytes(sid).to_vec();
+        return Ok((bytes, sid));
+    }
+    if let Some((bytes, sid)) = coerce_to_string(val, ctx) {
+        return Ok((bytes, sid));
+    }
+    Err(NativeError::String(format!(
+        "bad argument #{} to '{}' (string expected, got {})",
+        idx + 1,
+        fname,
+        type_name_of(val),
+    )))
+}
+
+/// Coerce a value to a string, returning owned bytes.
+/// Handles strings directly and coerces numbers (int/float) to their string representation.
+fn coerce_to_string(val: TValue, ctx: &mut NativeContext) -> Option<(Vec<u8>, selune_core::string::StringId)> {
+    if let Some(sid) = val.as_string_id() {
+        let bytes = ctx.strings.get_bytes(sid).to_vec();
+        return Some((bytes, sid));
+    }
+    // Coerce integers
+    if let Some(i) = val.as_integer() {
+        let s = format!("{}", i);
+        let sid = ctx.strings.intern(s.as_bytes());
+        let bytes = ctx.strings.get_bytes(sid).to_vec();
+        return Some((bytes, sid));
+    }
+    // Coerce floats
+    if let Some(f) = val.as_float() {
+        let s = format_float_lua(f);
+        let sid = ctx.strings.intern(s.as_bytes());
+        let bytes = ctx.strings.get_bytes(sid).to_vec();
+        return Some((bytes, sid));
+    }
+    // Coerce boxed integers
+    if let Some(i) = val.as_full_integer(ctx.gc) {
+        let s = format!("{}", i);
+        let sid = ctx.strings.intern(s.as_bytes());
+        let bytes = ctx.strings.get_bytes(sid).to_vec();
+        return Some((bytes, sid));
+    }
+    None
+}
+
+fn type_name_of(val: TValue) -> &'static str {
+    if val.is_nil() {
+        "nil"
+    } else if val.is_bool() {
+        "boolean"
+    } else if val.is_integer() || val.is_float() {
+        "number"
+    } else if val.is_string() {
+        "string"
+    } else if val.is_table() {
+        "table"
+    } else if val.is_function() {
+        "function"
+    } else {
+        "value"
+    }
+}
+
+/// Format a float for Lua string coercion (matches %.14g behavior).
+fn format_float_lua(f: f64) -> String {
+    if f.is_nan() {
+        return "-nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    // Use Lua-compatible %.14g formatting
+    let s = format!("{}", f);
+    // Ensure there's a decimal point to distinguish from integers
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        format!("{}.0", s)
+    } else {
+        s
     }
 }
 
@@ -201,20 +811,11 @@ fn native_string_char(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
 }
 
 fn native_string_sub(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let (bytes, _) = get_string_arg(ctx, 0, "sub")?;
+    let (bytes, _) = get_string_arg_coerce(ctx, 0, "sub")?;
     let len = bytes.len();
-    let bytes = bytes.to_vec(); // clone to release borrow on ctx.strings
 
-    let i = ctx
-        .args
-        .get(1)
-        .and_then(|v| v.as_full_integer(ctx.gc))
-        .unwrap_or(1);
-    let j = ctx
-        .args
-        .get(2)
-        .and_then(|v| v.as_full_integer(ctx.gc))
-        .unwrap_or(-1);
+    let i = check_integer_arg(ctx, 1, "sub")?;
+    let j = opt_integer_arg(ctx, 2, "sub", -1)?;
 
     // Lua 5.4 posrelatI for start: 1-based, clamp to [0, len]
     let start_1 = if i > 0 {
@@ -251,11 +852,25 @@ fn native_string_sub(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
 
 fn native_string_rep(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let (bytes, _) = get_string_arg(ctx, 0, "rep")?;
-    let n = ctx
-        .args
-        .get(1)
-        .and_then(|v| v.as_full_integer(ctx.gc))
-        .unwrap_or(0);
+    let n = match ctx.args.get(1) {
+        Some(v) => {
+            if let Some(i) = v.as_full_integer(ctx.gc) {
+                i
+            } else if let Some(f) = v.as_float() {
+                // Coerce float to integer if it's a whole number
+                if f == (f as i64 as f64) && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    f as i64
+                } else {
+                    return Err(NativeError::String(
+                        "bad argument #2 to 'rep' (number has no integer representation)".to_string(),
+                    ));
+                }
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
 
     if n <= 0 {
         let sid = ctx.strings.intern(b"");
@@ -351,20 +966,121 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
 
             // Parse precision
             let mut precision = String::new();
+            let mut has_dot = false;
             if i < fmt.len() && fmt[i] == b'.' {
+                has_dot = true;
                 i += 1;
                 while i < fmt.len() && fmt[i].is_ascii_digit() {
                     precision.push(fmt[i] as char);
                     i += 1;
                 }
+                // In C printf, "%.d" means "%.0d" - dot with no digits = precision 0
+                if precision.is_empty() {
+                    precision = "0".to_string();
+                }
             }
-
             if i >= fmt.len() {
                 break;
             }
 
             let spec = fmt[i];
             i += 1;
+
+            // Calculate total format item length (from % to spec)
+            let fmt_item_len = flags.len() + width.len() + if has_dot { 1 + precision.len() } else { 0 } + 1;
+
+            // Check for "too long" format item (Lua 5.4 MAX_ITEM ~ 120)
+            if fmt_item_len > 50 {
+                return Err(NativeError::String(
+                    format!("invalid format (too long)")
+                ));
+            }
+
+            // Validate width and precision limits (max 99 in Lua 5.4)
+            let w_val: usize = width.parse().unwrap_or(0);
+            let p_val: usize = precision.parse().unwrap_or(0);
+
+            // Validate specifier-specific constraints
+            match spec {
+                b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
+                    // Integer specifiers: '#' only valid for x/X/o
+                    if flags.contains(&b'#') && !matches!(spec, b'x' | b'X' | b'o') {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%{}'",
+                                std::str::from_utf8(&[spec]).unwrap_or("?"))
+                        ));
+                    }
+                    if w_val > 99 || p_val > 99 {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%{}'",
+                                std::str::from_utf8(&[spec]).unwrap_or("?"))
+                        ));
+                    }
+                }
+                b'f' | b'e' | b'E' | b'g' | b'G' => {
+                    if w_val > 99 || p_val > 99 {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%{}'",
+                                std::str::from_utf8(&[spec]).unwrap_or("?"))
+                        ));
+                    }
+                }
+                b'c' => {
+                    // %c: no flags (except -), no zero-padding, no precision
+                    if flags.contains(&b'0') || has_dot || flags.contains(&b'#') || flags.contains(&b'+') || flags.contains(&b' ') {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%c'")
+                        ));
+                    }
+                }
+                b's' => {
+                    // %s: '0' flag and '#' flag are invalid
+                    if flags.contains(&b'0') || flags.contains(&b'#') {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%s'")
+                        ));
+                    }
+                    if w_val > 99 || p_val > 99 {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%s'")
+                        ));
+                    }
+                }
+                b'p' => {
+                    // %p allows width and '-' flag, but not precision or other modifiers
+                    if has_dot {
+                        return Err(NativeError::String(
+                            format!("invalid conversion specification: '%p'")
+                        ));
+                    }
+                }
+                b'q' => {
+                    // Handled below (already has modifier check)
+                }
+                b'a' | b'A' => {
+                    // hex float - allow modifiers
+                }
+                b'F' => {
+                    // %F is not valid in Lua 5.4
+                    return Err(NativeError::String(
+                        format!("invalid conversion specification: '%F'")
+                    ));
+                }
+                _ => {
+                    // Unknown specifier
+                    return Err(NativeError::String(
+                        format!("invalid conversion specification: '%{}'",
+                            if spec.is_ascii() { String::from(spec as char) } else { format!("\\x{:02x}", spec) })
+                    ));
+                }
+            }
+
+            // Check "no value" - not enough arguments
+            if arg_idx >= ctx.args.len() {
+                return Err(NativeError::String(
+                    format!("bad argument #{} to 'format' (no value)", arg_idx + 1)
+                ));
+            }
 
             let val = ctx.args.get(arg_idx).copied().unwrap_or(TValue::nil());
             arg_idx += 1;
@@ -376,7 +1092,6 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                     } else if let Some(f) = val.as_float() {
                         f as i64
                     } else if let Some(sid) = val.as_string_id() {
-                        // Try string-to-number coercion
                         let s = std::str::from_utf8(ctx.strings.get_bytes(sid)).unwrap_or("");
                         let s = s.trim();
                         s.parse::<i64>().or_else(|_| s.parse::<f64>().map(|f| f as i64))
@@ -388,14 +1103,15 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                             format!("bad argument #{} to 'format' (number has no integer representation)", arg_idx)
                         ));
                     };
-                    let w: usize = width.parse().unwrap_or(0);
-                    let formatted = if flags.contains(&b'-') {
-                        format!("{:<width$}", n, width = w)
-                    } else if flags.contains(&b'0') && !flags.contains(&b'-') {
-                        format!("{:0>width$}", n, width = w)
-                    } else {
-                        format!("{:>width$}", n, width = w)
-                    };
+                    let mut fmt = String::from("%");
+                    for &f in &flags { fmt.push(f as char); }
+                    fmt.push_str(&width);
+                    if !precision.is_empty() {
+                        fmt.push('.');
+                        fmt.push_str(&precision);
+                    }
+                    fmt.push('d');
+                    let formatted = sprintf_signed(&fmt, n);
                     result.extend_from_slice(formatted.as_bytes());
                 }
                 b'u' => {
@@ -403,57 +1119,21 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                         .as_full_integer(ctx.gc)
                         .or_else(|| val.as_float().map(|f| f as i64))
                         .unwrap_or(0) as u64;
-                    result.extend_from_slice(format!("{}", n).as_bytes());
-                }
-                b'f' => {
-                    let f = val
-                        .as_number(ctx.gc)
-                        .unwrap_or(0.0);
-                    let prec: usize = precision.parse().unwrap_or(6);
-                    result.extend_from_slice(format!("{:.prec$}", f, prec = prec).as_bytes());
-                }
-                b'e' | b'E' => {
-                    let f = val.as_number(ctx.gc).unwrap_or(0.0);
-                    let prec: usize = precision.parse().unwrap_or(6);
-                    let s = if spec == b'e' {
-                        fix_scientific_notation(&format!("{:.prec$e}", f, prec = prec))
-                    } else {
-                        fix_scientific_notation(&format!("{:.prec$E}", f, prec = prec))
-                    };
-                    result.extend_from_slice(s.as_bytes());
-                }
-                b'g' | b'G' => {
-                    let f = val.as_number(ctx.gc).unwrap_or(0.0);
-                    let prec: usize = precision.parse().unwrap_or(6).max(1);
-                    // C %g: use %e if exponent < -4 or >= precision, else %f
-                    // significant digits = prec (not decimal places)
-                    let sci = format!("{:.prec$e}", f, prec = prec.saturating_sub(1));
-                    // Parse exponent from sci notation to decide format
-                    let exp = sci.rfind('e')
-                        .and_then(|pos| sci[pos + 1..].parse::<i32>().ok())
-                        .unwrap_or(0);
-                    let s = if exp < -4 || exp >= prec as i32 {
-                        fix_scientific_notation(&sci)
-                    } else {
-                        // Use fixed notation with enough decimal places
-                        let decimal_places = if prec as i32 > exp + 1 {
-                            (prec as i32 - exp - 1) as usize
-                        } else {
-                            0
-                        };
-                        format!("{:.prec$}", f, prec = decimal_places)
-                    };
-                    // Trim trailing zeros after decimal point (C %g behavior)
-                    let s = if s.contains('.') {
-                        s.trim_end_matches('0').trim_end_matches('.').to_string()
-                    } else {
-                        s.to_string()
-                    };
-                    if spec == b'G' {
-                        result.extend_from_slice(s.to_uppercase().as_bytes());
-                    } else {
-                        result.extend_from_slice(s.as_bytes());
+                    let mut fmt = String::from("%");
+                    for &f in &flags { fmt.push(f as char); }
+                    fmt.push_str(&width);
+                    if !precision.is_empty() {
+                        fmt.push('.');
+                        fmt.push_str(&precision);
                     }
+                    fmt.push('u');
+                    let formatted = sprintf_int(&fmt, n, b'u');
+                    result.extend_from_slice(formatted.as_bytes());
+                }
+                b'f' | b'e' | b'E' | b'g' | b'G' => {
+                    let f = val.as_number(ctx.gc).unwrap_or(0.0);
+                    let formatted = sprintf_float(f, spec, &flags, &width, &precision);
+                    result.extend_from_slice(formatted.as_bytes());
                 }
                 b's' => {
                     let s = if let Some(sid) = val.as_string_id() {
@@ -467,8 +1147,17 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                     } else if let Some(b) = val.as_bool() {
                         if b { b"true".to_vec() } else { b"false".to_vec() }
                     } else {
-                        b"?".to_vec()
+                        // Try __tostring metamethod for tables/userdata
+                        tostring_via_meta(val, ctx)?
                     };
+                    // When %s has modifiers (width/precision/flags), NUL bytes
+                    // would cause C sprintf to truncate. Error like Lua 5.4.
+                    let has_modifiers = !width.is_empty() || !precision.is_empty() || !flags.is_empty();
+                    if has_modifiers && s.contains(&0u8) {
+                        return Err(NativeError::String(
+                            "string contains zeros".to_string(),
+                        ));
+                    }
                     if !precision.is_empty() {
                         let max_len: usize = precision.parse().unwrap_or(usize::MAX);
                         let truncated = &s[..s.len().min(max_len)];
@@ -542,7 +1231,16 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                         }
                         result.push(b'"');
                     } else if let Some(n) = val.as_full_integer(ctx.gc) {
-                        result.extend_from_slice(format!("{}", n).as_bytes());
+                        // For negative numbers, the Lua parser treats them as
+                        // -(positive_literal), so if the absolute value overflows
+                        // i64 (i.e. n == i64::MIN), we must use hex format.
+                        if n == i64::MIN {
+                            result.extend_from_slice(
+                                format!("0x{:x}", n as u64).as_bytes(),
+                            );
+                        } else {
+                            result.extend_from_slice(format!("{}", n).as_bytes());
+                        }
                     } else if let Some(f) = val.as_float() {
                         if f.is_nan() {
                             result.extend_from_slice(b"(0/0)");
@@ -584,25 +1282,38 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                     let n = val
                         .as_full_integer(ctx.gc)
                         .unwrap_or(0);
-                    result.push((n & 0xFF) as u8);
-                }
-                b'x' | b'X' => {
-                    let n = val
-                        .as_full_integer(ctx.gc)
-                        .or_else(|| val.as_float().map(|f| f as i64))
-                        .unwrap_or(0);
-                    if spec == b'x' {
-                        result.extend_from_slice(format!("{:x}", n).as_bytes());
+                    let ch = (n & 0xFF) as u8;
+                    let w: usize = width.parse().unwrap_or(0);
+                    if w <= 1 {
+                        result.push(ch);
+                    } else if flags.contains(&b'-') {
+                        result.push(ch);
+                        for _ in 1..w {
+                            result.push(b' ');
+                        }
                     } else {
-                        result.extend_from_slice(format!("{:X}", n).as_bytes());
+                        for _ in 1..w {
+                            result.push(b' ');
+                        }
+                        result.push(ch);
                     }
                 }
-                b'o' => {
+                b'x' | b'X' | b'o' => {
                     let n = val
                         .as_full_integer(ctx.gc)
                         .or_else(|| val.as_float().map(|f| f as i64))
                         .unwrap_or(0);
-                    result.extend_from_slice(format!("{:o}", n).as_bytes());
+                    // Build the C-style format string and delegate to sprintf_int
+                    let mut fmt = String::from("%");
+                    for &f in &flags { fmt.push(f as char); }
+                    fmt.push_str(&width);
+                    if !precision.is_empty() {
+                        fmt.push('.');
+                        fmt.push_str(&precision);
+                    }
+                    fmt.push(spec as char);
+                    let formatted = sprintf_int(&fmt, n as u64, spec);
+                    result.extend_from_slice(formatted.as_bytes());
                 }
                 b'p' => {
                     // %p: pointer format
@@ -628,6 +1339,16 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                         }
                         result.extend_from_slice(ptr_str.as_bytes());
                     }
+                }
+                b'a' | b'A' => {
+                    let f = val.as_number(ctx.gc).unwrap_or(0.0);
+                    let prec: Option<usize> = if precision.is_empty() {
+                        None
+                    } else {
+                        Some(precision.parse().unwrap_or(0))
+                    };
+                    let formatted = format_hex_float(f, spec == b'A', prec, &flags, &width);
+                    result.extend_from_slice(formatted.as_bytes());
                 }
                 _ => {
                     result.push(b'%');
@@ -670,6 +1391,11 @@ fn native_string_find(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         if back > subject.len() { 0 } else { subject.len() - back }
     };
 
+    // If init position is past the end of the string + 1, return nil
+    if start > subject.len() {
+        return Ok(vec![TValue::nil()]);
+    }
+
     if plain {
         // Plain string search
         if let Some(pos) = find_plain(&subject, &pat, start) {
@@ -688,7 +1414,7 @@ fn native_string_find(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
 
     // Pattern search
     match pattern::pattern_find(&subject, &pat, start) {
-        Some(ms) => {
+        Ok(Some(ms)) => {
             let (match_start, match_end) = ms.captures[0];
             let mut results = vec![
                 TValue::from_full_integer((match_start + 1) as i64, ctx.gc),
@@ -707,7 +1433,8 @@ fn native_string_find(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
             }
             Ok(results)
         }
-        None => Ok(vec![TValue::nil()]),
+        Ok(None) => Ok(vec![TValue::nil()]),
+        Err(e) => Err(NativeError::String(e)),
     }
 }
 
@@ -748,7 +1475,7 @@ fn native_string_match(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
         .map_err(|e| NativeError::String(format!("bad argument #2 to 'match' ({e})")))?;
 
     match pattern::pattern_find(&subject, &pat, start) {
-        Some(ms) => {
+        Ok(Some(ms)) => {
             if ms.captures.len() <= 1 {
                 // No explicit captures — return full match
                 let (s, e) = ms.captures[0];
@@ -771,7 +1498,8 @@ fn native_string_match(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
                 Ok(results)
             }
         }
-        None => Ok(vec![TValue::nil()]),
+        Ok(None) => Ok(vec![TValue::nil()]),
+        Err(e) => Err(NativeError::String(e)),
     }
 }
 
@@ -782,7 +1510,26 @@ fn native_string_gmatch(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
     let pat_bytes = pat_bytes.to_vec();
     pattern::validate_pattern(&pat_bytes)
         .map_err(|e| NativeError::String(format!("bad argument #2 to 'gmatch' ({e})")))?;
-    let (_, subj_sid) = get_string_arg(ctx, 0, "gmatch")?;
+    let (subj_bytes, subj_sid) = get_string_arg(ctx, 0, "gmatch")?;
+    let subj_len = subj_bytes.len();
+
+    // Handle optional init parameter (3rd arg, default 1)
+    let init = ctx
+        .args
+        .get(2)
+        .and_then(|v| v.as_full_integer(ctx.gc))
+        .unwrap_or(1);
+    let start_pos = if init >= 1 {
+        init
+    } else {
+        // Negative index: count from end
+        let back = (-init) as usize;
+        if back > subj_len {
+            1
+        } else {
+            (subj_len - back + 1) as i64
+        }
+    };
 
     // Create state table: {subject_sid, pattern_sid, position}
     let state_table = ctx.gc.alloc_table(4, 0);
@@ -794,17 +1541,25 @@ fn native_string_gmatch(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
         .raw_seti(2, TValue::from_string_id(pat_sid));
     ctx.gc
         .get_table_mut(state_table)
-        .raw_seti(3, TValue::from_integer(1)); // 1-based position
+        .raw_seti(3, TValue::from_integer(start_pos)); // 1-based position
 
-    // Return (gmatch_iter, state_table)
-    let iter_idx = ctx.gc.alloc_native(native_gmatch_iter, "gmatch_iter");
+    // Return gmatch_iter with state stored as upvalue
+    let state_val = TValue::from_table(state_table);
+    let iter_idx = ctx.gc.alloc_native_with_upvalue(native_gmatch_iter, "gmatch_iter", state_val);
     let iter_val = TValue::from_native(iter_idx);
-    Ok(vec![iter_val, TValue::from_table(state_table)])
+    Ok(vec![iter_val, state_val])
 }
 
 fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    // First arg is the state table
-    let state_idx = ctx.args[0]
+    // State table is stored as upvalue (also passed as arg by generic-for, but upvalue is reliable)
+    let state_val = if !ctx.upvalue.is_nil() {
+        ctx.upvalue
+    } else if !ctx.args.is_empty() {
+        ctx.args[0]
+    } else {
+        return Err(NativeError::String("gmatch: no state available".to_string()));
+    };
+    let state_idx = state_val
         .as_table_idx()
         .ok_or_else(|| NativeError::String("gmatch: invalid state".to_string()))?;
 
@@ -815,35 +1570,55 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
     let pos = ctx.gc.get_table(state_idx).raw_geti(3)
         .as_full_integer(ctx.gc)
         .unwrap_or(1);
+    // lastmatch stored in slot 4 (0 = none, positive = 1-based position)
+    let lastmatch_val = ctx.gc.get_table(state_idx).raw_geti(4)
+        .as_full_integer(ctx.gc)
+        .unwrap_or(0);
 
     let subject = ctx.strings.get_bytes(subj_sid).to_vec();
     let pat = ctx.strings.get_bytes(pat_sid).to_vec();
 
-    let start = if pos >= 1 { (pos as usize) - 1 } else { 0 };
+    let mut src = if pos >= 1 { (pos as usize) - 1 } else { 0 };
+    let lastmatch: Option<usize> = if lastmatch_val > 0 { Some((lastmatch_val - 1) as usize) } else { None };
 
-    if start > subject.len() {
-        return Ok(vec![TValue::nil()]);
-    }
+    let anchor = !pat.is_empty() && pat[0] == b'^';
+    let match_pat = if anchor { &pat[1..] } else { &pat };
 
-    match pattern::pattern_find(&subject, &pat, start) {
-        Some(ms) => {
-            let (match_start, match_end) = ms.captures[0];
-            // Update position in state
-            let new_pos = if match_end == match_start {
-                match_end + 2 // 1-based, skip past empty match
-            } else {
-                match_end + 1 // 1-based
-            };
-            let pos_val = TValue::from_full_integer(new_pos as i64, ctx.gc);
-            ctx.gc
-                .get_table_mut(state_idx)
-                .raw_seti(3, pos_val);
+    // Search forward from src, using lastmatch to avoid repeated empty matches
+    loop {
+        if src > subject.len() {
+            return Ok(vec![TValue::nil()]);
+        }
+
+        // Try to match at position src
+        let mut matcher = pattern::PatternMatcher::new(&subject, match_pat);
+        let ms = matcher.try_match_at(src)
+            .map_err(|e| NativeError::String(e))?;
+        if let Some(ms) = ms {
+            let (_match_start, match_end) = ms.captures[0];
+
+            // Guard against repeated empty match at same position
+            if match_end == src && lastmatch == Some(match_end) {
+                // Skip: advance past this position
+                if src < subject.len() {
+                    src += 1;
+                    if anchor { return Ok(vec![TValue::nil()]); }
+                    continue;
+                } else {
+                    return Ok(vec![TValue::nil()]);
+                }
+            }
+
+            // Update state: new pos (1-based) and lastmatch (1-based)
+            let new_pos = TValue::from_full_integer((match_end + 1) as i64, ctx.gc);
+            ctx.gc.get_table_mut(state_idx).raw_seti(3, new_pos);
+            let new_lastmatch = TValue::from_full_integer((match_end + 1) as i64, ctx.gc);
+            ctx.gc.get_table_mut(state_idx).raw_seti(4, new_lastmatch);
 
             if ms.captures.len() <= 1 {
-                // No explicit captures — return full match
-                let slice = &subject[match_start..match_end];
+                let slice = &subject[src..match_end];
                 let sid = ctx.strings.intern_or_create(slice);
-                Ok(vec![TValue::from_string_id(sid)])
+                return Ok(vec![TValue::from_string_id(sid)]);
             } else {
                 let mut results = Vec::new();
                 for i in 1..ms.captures.len() {
@@ -856,10 +1631,15 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
                         results.push(TValue::from_string_id(sid));
                     }
                 }
-                Ok(results)
+                return Ok(results);
             }
+        } else {
+            // No match at src — advance
+            if anchor || src >= subject.len() {
+                return Ok(vec![TValue::nil()]);
+            }
+            src += 1;
         }
-        None => Ok(vec![TValue::nil()]),
     }
 }
 
@@ -867,6 +1647,12 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
 fn native_string_gsub_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     Err(NativeError::String(
         "string.gsub stub should not be called directly".to_string(),
+    ))
+}
+
+fn native_string_dump_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "string.dump stub should not be called directly".to_string(),
     ))
 }
 
@@ -1090,16 +1876,21 @@ fn parse_next_option(fmt: &[u8], pos: usize) -> Result<(PackOption, usize), Nati
 }
 
 /// Compute alignment padding needed to align `offset` to `align` (clamped by `max_align`).
-fn alignment_padding(offset: usize, natural_align: usize, max_align: usize) -> usize {
+fn alignment_padding(offset: usize, natural_align: usize, max_align: usize) -> Result<usize, NativeError> {
     let align = natural_align.min(max_align);
+    if align > 1 && !align.is_power_of_two() {
+        return Err(NativeError::String(
+            "format asks for alignment not power of 2".to_string(),
+        ));
+    }
     if align <= 1 {
-        return 0;
+        return Ok(0);
     }
     let remainder = offset % align;
     if remainder == 0 {
-        0
+        Ok(0)
     } else {
-        align - remainder
+        Ok(align - remainder)
     }
 }
 
@@ -1334,21 +2125,21 @@ fn native_string_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
             PackOption::Space => {}
             PackOption::IntSigned(n) => {
                 // Add alignment padding
-                let pad = alignment_padding(buf.len(), n, max_align);
+                let pad = alignment_padding(buf.len(), n, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
                 let val = get_int_arg(ctx, arg_idx, "pack")?;
                 arg_idx += 1;
                 pack_int_signed(val, n, endian, &mut buf)?;
             }
             PackOption::IntUnsigned(n) => {
-                let pad = alignment_padding(buf.len(), n, max_align);
+                let pad = alignment_padding(buf.len(), n, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
                 let val = get_int_arg(ctx, arg_idx, "pack")?;
                 arg_idx += 1;
                 pack_int_unsigned(val, n, endian, &mut buf)?;
             }
             PackOption::Float => {
-                let pad = alignment_padding(buf.len(), PACK_SIZE_FLOAT, max_align);
+                let pad = alignment_padding(buf.len(), PACK_SIZE_FLOAT, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
                 let val = get_number_arg(ctx, arg_idx, "pack")?;
                 arg_idx += 1;
@@ -1364,7 +2155,7 @@ fn native_string_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
                 }
             }
             PackOption::Double => {
-                let pad = alignment_padding(buf.len(), PACK_SIZE_DOUBLE, max_align);
+                let pad = alignment_padding(buf.len(), PACK_SIZE_DOUBLE, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
                 let val = get_number_arg(ctx, arg_idx, "pack")?;
                 arg_idx += 1;
@@ -1404,7 +2195,7 @@ fn native_string_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
                     }
                 }
                 // Alignment for the length prefix
-                let pad = alignment_padding(buf.len(), n, max_align);
+                let pad = alignment_padding(buf.len(), n, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
                 // Pack the length as an unsigned integer
                 pack_int_unsigned(len as i64, n, endian, &mut buf)?;
@@ -1428,7 +2219,7 @@ fn native_string_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
                 buf.push(0);
             }
             PackOption::AlignPad(align_to) => {
-                let pad = alignment_padding(buf.len(), align_to, max_align);
+                let pad = alignment_padding(buf.len(), align_to, max_align)?;
                 buf.extend(std::iter::repeat(0u8).take(pad));
             }
         }
@@ -1563,7 +2354,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
             }
             PackOption::Space => {}
             PackOption::IntSigned(n) => {
-                let pad = alignment_padding(offset, n, max_align);
+                let pad = alignment_padding(offset, n, max_align)?;
                 offset += pad;
                 if offset + n > data.len() {
                     return Err(NativeError::String(
@@ -1575,7 +2366,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                 offset += n;
             }
             PackOption::IntUnsigned(n) => {
-                let pad = alignment_padding(offset, n, max_align);
+                let pad = alignment_padding(offset, n, max_align)?;
                 offset += pad;
                 if offset + n > data.len() {
                     return Err(NativeError::String(
@@ -1587,7 +2378,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                 offset += n;
             }
             PackOption::Float => {
-                let pad = alignment_padding(offset, PACK_SIZE_FLOAT, max_align);
+                let pad = alignment_padding(offset, PACK_SIZE_FLOAT, max_align)?;
                 offset += pad;
                 if offset + 4 > data.len() {
                     return Err(NativeError::String(
@@ -1608,7 +2399,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                 offset += 4;
             }
             PackOption::Double => {
-                let pad = alignment_padding(offset, PACK_SIZE_DOUBLE, max_align);
+                let pad = alignment_padding(offset, PACK_SIZE_DOUBLE, max_align)?;
                 offset += pad;
                 if offset + 8 > data.len() {
                     return Err(NativeError::String(
@@ -1641,7 +2432,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                 offset += zpos + 1; // skip the zero terminator
             }
             PackOption::SString(n) => {
-                let pad = alignment_padding(offset, n, max_align);
+                let pad = alignment_padding(offset, n, max_align)?;
                 offset += pad;
                 if offset + n > data.len() {
                     return Err(NativeError::String(
@@ -1680,7 +2471,7 @@ fn native_string_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
                 offset += 1;
             }
             PackOption::AlignPad(align_to) => {
-                let pad = alignment_padding(offset, align_to, max_align);
+                let pad = alignment_padding(offset, align_to, max_align)?;
                 offset += pad;
             }
         }
@@ -1711,7 +2502,7 @@ fn native_string_packsize(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
             }
             PackOption::Space => {}
             PackOption::IntSigned(n) | PackOption::IntUnsigned(n) => {
-                let pad = alignment_padding(total as usize, n, max_align);
+                let pad = alignment_padding(total as usize, n, max_align)?;
                 total += pad as u64 + n as u64;
                 if total > i32::MAX as u64 {
                     return Err(NativeError::String(
@@ -1720,11 +2511,11 @@ fn native_string_packsize(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
                 }
             }
             PackOption::Float => {
-                let pad = alignment_padding(total as usize, PACK_SIZE_FLOAT, max_align);
+                let pad = alignment_padding(total as usize, PACK_SIZE_FLOAT, max_align)?;
                 total += pad as u64 + PACK_SIZE_FLOAT as u64;
             }
             PackOption::Double => {
-                let pad = alignment_padding(total as usize, PACK_SIZE_DOUBLE, max_align);
+                let pad = alignment_padding(total as usize, PACK_SIZE_DOUBLE, max_align)?;
                 total += pad as u64 + PACK_SIZE_DOUBLE as u64;
             }
             PackOption::ZString | PackOption::SString(_) => {
@@ -1744,7 +2535,7 @@ fn native_string_packsize(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
                 total += 1;
             }
             PackOption::AlignPad(align_to) => {
-                let pad = alignment_padding(total as usize, align_to, max_align);
+                let pad = alignment_padding(total as usize, align_to, max_align)?;
                 total += pad as u64;
             }
         }

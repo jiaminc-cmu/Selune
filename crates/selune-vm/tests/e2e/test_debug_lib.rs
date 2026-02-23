@@ -195,26 +195,31 @@ fn test_debug_getinfo_returns_table() {
     );
 }
 
-// ---- debug.traceback (stub) ----
+// ---- debug.traceback ----
 
 #[test]
 fn test_debug_traceback_returns_message() {
-    run_check_strings(
+    let (results, vm) = run_with_vm(
         r#"
         return debug.traceback("hello")
         "#,
-        &["hello"],
     );
+    let sid = results[0].as_string_id().expect("expected string");
+    let s = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap();
+    assert!(s.starts_with("hello"), "traceback should start with message, got: {s}");
+    assert!(s.contains("stack traceback:"), "traceback should contain stack info, got: {s}");
 }
 
 #[test]
 fn test_debug_traceback_nil_returns_empty() {
-    run_check_strings(
+    let (results, vm) = run_with_vm(
         r#"
         return debug.traceback()
         "#,
-        &[""],
     );
+    let sid = results[0].as_string_id().expect("expected string");
+    let s = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap();
+    assert!(s.contains("stack traceback:"), "traceback should contain stack info, got: {s}");
 }
 
 // ---- debug.sethook (stub, no-op) ----

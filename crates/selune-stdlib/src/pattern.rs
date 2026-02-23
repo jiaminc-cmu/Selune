@@ -43,6 +43,7 @@ struct Matcher<'a> {
     pattern: &'a [u8],
     caps: Vec<CapStatus>,
     depth: usize,
+    error: Option<String>,
 }
 
 /// Find the first match of `pattern` in `subject` starting at byte offset `init`.
@@ -54,14 +55,63 @@ struct Matcher<'a> {
 pub fn validate_pattern(pattern: &[u8]) -> Result<(), String> {
     let mut i = 0;
     let pat = if !pattern.is_empty() && pattern[0] == b'^' { &pattern[1..] } else { pattern };
+    let mut open_parens = 0i32;
     while i < pat.len() {
         match pat[i] {
+            b'(' => {
+                open_parens += 1;
+                i += 1;
+            }
+            b')' => {
+                if open_parens <= 0 {
+                    return Err("invalid pattern capture".to_string());
+                }
+                open_parens -= 1;
+                i += 1;
+            }
             b'%' => {
                 i += 1;
                 if i >= pat.len() {
                     return Err("malformed pattern (ends with '%%')".to_string());
                 }
-                i += 1;
+                if pat[i] == b'b' {
+                    // %bxy needs exactly 2 more bytes
+                    if i + 2 >= pat.len() {
+                        return Err("malformed pattern (missing arguments to '%%b')".to_string());
+                    }
+                    i += 3; // skip 'b', x, y
+                } else if pat[i] == b'f' {
+                    // %f must be followed by [
+                    i += 1;
+                    if i >= pat.len() || pat[i] != b'[' {
+                        return Err("missing '[' after '%%f' in pattern".to_string());
+                    }
+                    // Skip the set
+                    i += 1;
+                    if i < pat.len() && pat[i] == b'^' {
+                        i += 1;
+                    }
+                    if i < pat.len() && pat[i] == b']' {
+                        i += 1;
+                    }
+                    let mut found_close = false;
+                    while i < pat.len() {
+                        if pat[i] == b']' {
+                            found_close = true;
+                            i += 1;
+                            break;
+                        } else if pat[i] == b'%' && i + 1 < pat.len() {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if !found_close {
+                        return Err("malformed pattern (missing ']')".to_string());
+                    }
+                } else {
+                    i += 1;
+                }
             }
             b'[' => {
                 i += 1;
@@ -92,10 +142,13 @@ pub fn validate_pattern(pattern: &[u8]) -> Result<(), String> {
             _ => i += 1,
         }
     }
+    if open_parens > 0 {
+        return Err("unfinished capture".to_string());
+    }
     Ok(())
 }
 
-pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Option<MatchState> {
+pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Result<Option<MatchState>, String> {
     let anchor = !pattern.is_empty() && pattern[0] == b'^';
     let pat = if anchor { &pattern[1..] } else { pattern };
 
@@ -104,6 +157,7 @@ pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Option<Match
         pattern: pat,
         caps: Vec::new(),
         depth: 0,
+        error: None,
     };
 
     // Try matching at each starting position.
@@ -112,12 +166,45 @@ pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Option<Match
         m.caps.clear();
         m.depth = 0;
         if let Some(end) = m.match_pattern(pat, si) {
-            return Some(m.build_result(si, end));
+            return Ok(Some(m.build_result(si, end)));
+        }
+        if let Some(err) = m.error.take() {
+            return Err(err);
         }
         if anchor || si >= subject.len() {
-            return None;
+            return Ok(None);
         }
         si += 1;
+    }
+}
+
+/// A public matcher for gsub that tries matching at a specific position only.
+pub struct PatternMatcher<'a> {
+    subject: &'a [u8],
+    pat: &'a [u8],
+}
+
+impl<'a> PatternMatcher<'a> {
+    pub fn new(subject: &'a [u8], pat: &'a [u8]) -> Self {
+        PatternMatcher { subject, pat }
+    }
+
+    /// Try to match the pattern at exactly position `si`. Does NOT search forward.
+    pub fn try_match_at(&mut self, si: usize) -> Result<Option<MatchState>, String> {
+        let mut m = Matcher {
+            subject: self.subject,
+            pattern: self.pat,
+            caps: Vec::new(),
+            depth: 0,
+            error: None,
+        };
+        if let Some(end) = m.match_pattern(self.pat, si) {
+            Ok(Some(m.build_result(si, end)))
+        } else if let Some(err) = m.error.take() {
+            Err(err)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -135,6 +222,7 @@ pub fn pattern_gmatch<'a>(subject: &'a [u8], pattern: &'a [u8], init: usize) -> 
         pos: init,
         anchor,
         finished: false,
+        lastmatch: None,
     }
 }
 
@@ -146,6 +234,7 @@ pub struct GmatchIter<'a> {
     pos: usize,
     anchor: bool,
     finished: bool,
+    lastmatch: Option<usize>,
 }
 
 impl<'a> Iterator for GmatchIter<'a> {
@@ -162,29 +251,29 @@ impl<'a> Iterator for GmatchIter<'a> {
             pattern: pat,
             caps: Vec::new(),
             depth: 0,
+            error: None,
         };
 
         let mut si = self.pos;
         loop {
+            if si > self.subject.len() {
+                self.finished = true;
+                return None;
+            }
             m.caps.clear();
             m.depth = 0;
             if let Some(end) = m.match_pattern(pat, si) {
-                let result = m.build_result(si, end);
-                // Advance past the match. If empty match, advance by one byte
-                // to avoid infinite loops.
-                if end == si {
-                    if si < self.subject.len() {
-                        self.pos = si + 1;
-                    } else {
+                // Guard against repeated empty match at same position (Lua 5.3.3+).
+                if end != si || self.lastmatch != Some(end) {
+                    let result = m.build_result(si, end);
+                    self.pos = end;
+                    self.lastmatch = Some(end);
+                    if self.anchor {
                         self.finished = true;
                     }
-                } else {
-                    self.pos = end;
+                    return Some(result);
                 }
-                if self.anchor {
-                    self.finished = true;
-                }
-                return Some(result);
+                // Repeated empty match — fall through to advance.
             }
             if self.anchor || si >= self.subject.len() {
                 self.finished = true;
@@ -206,12 +295,14 @@ fn match_class(ch: u8, class: u8) -> bool {
         b'a' => ch.is_ascii_alphabetic(),
         b'c' => ch.is_ascii_control(),
         b'd' => ch.is_ascii_digit(),
+        b'g' => ch.is_ascii_graphic(),
         b'l' => ch.is_ascii_lowercase(),
         b'p' => ch.is_ascii_punctuation(),
         b's' => ch.is_ascii_whitespace(),
         b'u' => ch.is_ascii_uppercase(),
         b'w' => ch.is_ascii_alphanumeric(),
         b'x' => ch.is_ascii_hexdigit(),
+        b'z' => ch == 0,
         _ => return ch == class,
     };
     // If the class letter was uppercase, negate the result.
@@ -426,6 +517,49 @@ impl<'a> Matcher<'a> {
                 return self.match_frontier(pattern, pp, si);
             }
 
+            // Handle %0-%9 back-references.
+            if pattern[pp] == b'%'
+                && pp + 1 < pattern.len()
+                && pattern[pp + 1] >= b'0'
+                && pattern[pp + 1] <= b'9'
+            {
+                let n = (pattern[pp + 1] - b'0') as usize;
+                // %0 is not valid as a back-reference in patterns
+                if n == 0 {
+                    self.error = Some("invalid capture index %0".to_string());
+                    return None;
+                }
+                let cap_idx = n - 1; // %1 = index 0, etc.
+                // Check if this capture exists and is closed
+                if cap_idx >= self.caps.len() {
+                    self.error = Some(format!("invalid capture index %{}", n));
+                    return None;
+                }
+                match self.caps[cap_idx] {
+                    CapStatus::Open(_) => {
+                        self.error = Some(format!("invalid capture index %{}", n));
+                        return None;
+                    }
+                    CapStatus::Closed(start, end) => {
+                        let captured = &self.subject[start..end];
+                        let cap_len = captured.len();
+                        if si + cap_len <= self.subject.len()
+                            && &self.subject[si..si + cap_len] == captured
+                        {
+                            pp += 2;
+                            si += cap_len;
+                            continue;
+                        }
+                        return None;
+                    }
+                    CapStatus::Position(_) => {
+                        // Position captures can't be used as back-references
+                        self.error = Some(format!("invalid capture index %{}", n));
+                        return None;
+                    }
+                }
+            }
+
             // Determine the current element length and check for quantifiers.
             let elen = element_len(pattern, pp);
             let after_elem = pp + elen;
@@ -552,13 +686,14 @@ impl<'a> Matcher<'a> {
         let mut count = 1i32;
         let mut pos = si + 1;
         while pos < self.subject.len() {
-            if self.subject[pos] == open {
-                count += 1;
-            } else if self.subject[pos] == close {
+            // Check close FIRST (important when open == close, e.g., %b'')
+            if self.subject[pos] == close {
                 count -= 1;
                 if count == 0 {
                     return self.match_inner(pattern, rest_pp, pos + 1);
                 }
+            } else if self.subject[pos] == open {
+                count += 1;
             }
             pos += 1;
         }
@@ -594,6 +729,20 @@ impl<'a> Matcher<'a> {
 
         if !prev_matches && curr_matches {
             self.match_inner(pattern, rest_pp, si)
+        } else {
+            None
+        }
+    }
+
+    /// Get the byte slice for a closed capture by index (0-based among user captures).
+    fn get_closed_capture(&self, idx: usize) -> Option<&[u8]> {
+        // Find the idx-th capture (skipping open/position captures for counting purposes).
+        // In Lua, captures are numbered in order of their opening parenthesis.
+        if idx < self.caps.len() {
+            match self.caps[idx] {
+                CapStatus::Closed(start, end) => Some(&self.subject[start..end]),
+                _ => None,
+            }
         } else {
             None
         }
@@ -702,41 +851,54 @@ impl<'a> Matcher<'a> {
 /// `ms` is the match state from a successful match.
 /// `subject` is the original subject string.
 /// Returns the expanded replacement string.
-pub fn expand_replacement(replacement: &[u8], ms: &MatchState, subject: &[u8]) -> Vec<u8> {
+pub fn expand_replacement(replacement: &[u8], ms: &MatchState, subject: &[u8]) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     let mut i = 0;
+    // Number of user captures (excluding capture 0 = full match).
+    let num_user_captures = ms.captures.len() - 1;
     while i < replacement.len() {
         if replacement[i] == b'%' && i + 1 < replacement.len() {
             let next = replacement[i + 1];
             if next >= b'0' && next <= b'9' {
-                let idx = (next - b'0') as usize;
-                if idx < ms.captures.len() {
-                    let (start, end) = ms.captures[idx];
-                    if end == CAP_POSITION {
-                        // Position capture: convert to string representation of position.
-                        // (1-based, as Lua uses)
-                        let pos_str = (start + 1).to_string();
-                        result.extend_from_slice(pos_str.as_bytes());
+                let n = (next - b'0') as usize;
+                // PUC Lua: %0 = whole match. %1..%9 = explicit captures.
+                // When no explicit captures, %1 = whole match (capture index 0).
+                // But %2..%9 with no explicit captures should error.
+                let idx = if n == 0 {
+                    0 // %0 always = full match
+                } else if num_user_captures == 0 {
+                    // No explicit captures: %1 = whole match, %2+ = error
+                    if n == 1 {
+                        0
                     } else {
-                        result.extend_from_slice(&subject[start..end]);
+                        return Err(format!("invalid capture index %{}", n));
                     }
+                } else {
+                    if n > num_user_captures {
+                        return Err(format!("invalid capture index %{}", n));
+                    }
+                    n
+                };
+                let (start, end) = ms.captures[idx];
+                if end == CAP_POSITION {
+                    let pos_str = (start + 1).to_string();
+                    result.extend_from_slice(pos_str.as_bytes());
+                } else {
+                    result.extend_from_slice(&subject[start..end]);
                 }
                 i += 2;
             } else if next == b'%' {
                 result.push(b'%');
                 i += 2;
             } else {
-                // Invalid escape in replacement -- keep as-is per Lua behavior.
-                result.push(replacement[i]);
-                result.push(replacement[i + 1]);
-                i += 2;
+                return Err("invalid use of '%' in replacement string".to_string());
             }
         } else {
             result.push(replacement[i]);
             i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -749,16 +911,19 @@ mod tests {
 
     fn find(subject: &str, pattern: &str) -> Option<(usize, usize)> {
         pattern_find(subject.as_bytes(), pattern.as_bytes(), 0)
+            .unwrap()
             .map(|ms| ms.captures[0])
     }
 
     fn find_at(subject: &str, pattern: &str, init: usize) -> Option<(usize, usize)> {
         pattern_find(subject.as_bytes(), pattern.as_bytes(), init)
+            .unwrap()
             .map(|ms| ms.captures[0])
     }
 
     fn captures(subject: &str, pattern: &str) -> Option<Vec<(usize, usize)>> {
         pattern_find(subject.as_bytes(), pattern.as_bytes(), 0)
+            .unwrap()
             .map(|ms| ms.captures)
     }
 
@@ -937,7 +1102,7 @@ mod tests {
             captures: vec![(0, 5), (0, 3), (3, 5)],
         };
         let subject = b"hello";
-        let result = expand_replacement(b"%2-%1", &ms, subject);
+        let result = expand_replacement(b"%2-%1", &ms, subject).unwrap();
         assert_eq!(result, b"lo-hel");
     }
 
@@ -947,7 +1112,7 @@ mod tests {
             captures: vec![(0, 5)],
         };
         let subject = b"hello";
-        let result = expand_replacement(b"100%%", &ms, subject);
+        let result = expand_replacement(b"100%%", &ms, subject).unwrap();
         assert_eq!(result, b"100%");
     }
 
@@ -1005,7 +1170,7 @@ mod tests {
             captures: vec![(2, 5)],
         };
         let subject = b"xxhello";
-        let result = expand_replacement(b"[%0]", &ms, subject);
+        let result = expand_replacement(b"[%0]", &ms, subject).unwrap();
         assert_eq!(result, b"[hel]");
     }
 
@@ -1032,7 +1197,7 @@ mod tests {
     fn test_frontier_at_boundary() {
         // Frontier between digit and non-digit.
         let subject = "abc123def";
-        let ms = pattern_find(subject.as_bytes(), b"%f[%d]", 0).unwrap();
+        let ms = pattern_find(subject.as_bytes(), b"%f[%d]", 0).unwrap().unwrap();
         assert_eq!(ms.captures[0], (3, 3)); // zero-width at pos 3
     }
 
@@ -1040,7 +1205,7 @@ mod tests {
     fn test_frontier_at_end_boundary() {
         // Frontier from digit back to letter.
         let subject = "123abc";
-        let ms = pattern_find(subject.as_bytes(), b"%f[%a]", 0).unwrap();
+        let ms = pattern_find(subject.as_bytes(), b"%f[%a]", 0).unwrap().unwrap();
         assert_eq!(ms.captures[0], (3, 3));
     }
 }

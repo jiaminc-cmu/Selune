@@ -51,8 +51,17 @@ fn register_fn(
 // UTF-8 encoding/decoding helpers
 // ---------------------------------------------------------------------------
 
-/// Encode a single code point into UTF-8 bytes. Returns the number of bytes written.
-fn encode_utf8(codepoint: u32, buf: &mut [u8; 4]) -> usize {
+/// Maximum codepoint in lax/non-strict mode (original UTF-8).
+const MAX_LAX: u32 = 0x7FFFFFFF;
+
+/// Check if a codepoint is a surrogate (U+D800..U+DFFF).
+fn is_surrogate(cp: u32) -> bool {
+    cp >= 0xD800 && cp <= 0xDFFF
+}
+
+/// Encode a single code point into UTF-8 bytes (up to 6 bytes for lax mode).
+/// Returns the number of bytes written.
+fn encode_utf8(codepoint: u32, buf: &mut [u8; 6]) -> usize {
     if codepoint <= 0x7F {
         buf[0] = codepoint as u8;
         1
@@ -65,83 +74,114 @@ fn encode_utf8(codepoint: u32, buf: &mut [u8; 4]) -> usize {
         buf[1] = 0x80 | (((codepoint >> 6) & 0x3F) as u8);
         buf[2] = 0x80 | ((codepoint & 0x3F) as u8);
         3
-    } else if codepoint <= 0x10FFFF {
+    } else if codepoint <= 0x1FFFFF {
         buf[0] = 0xF0 | ((codepoint >> 18) as u8);
         buf[1] = 0x80 | (((codepoint >> 12) & 0x3F) as u8);
         buf[2] = 0x80 | (((codepoint >> 6) & 0x3F) as u8);
         buf[3] = 0x80 | ((codepoint & 0x3F) as u8);
         4
+    } else if codepoint <= 0x3FFFFFF {
+        buf[0] = 0xF8 | ((codepoint >> 24) as u8);
+        buf[1] = 0x80 | (((codepoint >> 18) & 0x3F) as u8);
+        buf[2] = 0x80 | (((codepoint >> 12) & 0x3F) as u8);
+        buf[3] = 0x80 | (((codepoint >> 6) & 0x3F) as u8);
+        buf[4] = 0x80 | ((codepoint & 0x3F) as u8);
+        5
+    } else if codepoint <= 0x7FFFFFFF {
+        buf[0] = 0xFC | ((codepoint >> 30) as u8);
+        buf[1] = 0x80 | (((codepoint >> 24) & 0x3F) as u8);
+        buf[2] = 0x80 | (((codepoint >> 18) & 0x3F) as u8);
+        buf[3] = 0x80 | (((codepoint >> 12) & 0x3F) as u8);
+        buf[4] = 0x80 | (((codepoint >> 6) & 0x3F) as u8);
+        buf[5] = 0x80 | ((codepoint & 0x3F) as u8);
+        6
     } else {
-        // Beyond standard Unicode but allowed in lax mode (up to 6 bytes)
-        // For simplicity we only support up to 4-byte sequences (U+10FFFF)
-        // since lax mode beyond that is extremely rare.
         0
     }
 }
 
-/// Decode one UTF-8 character starting at `bytes[pos]`.
+/// Decode one UTF-8 character starting at `bytes[pos]` in strict mode.
+/// Rejects surrogates (D800-DFFF) and codepoints > 10FFFF.
 /// Returns `(codepoint, next_position)` or `None` if invalid.
 fn decode_utf8(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
+    let (cp, next) = decode_utf8_raw(bytes, pos)?;
+    // Strict mode: reject surrogates and values > MAX_UNICODE
+    if is_surrogate(cp) || cp > MAX_UNICODE {
+        return None;
+    }
+    Some((cp, next))
+}
+
+/// Decode one UTF-8 character in lax mode (allows surrogates, 5/6 byte sequences).
+fn decode_utf8_lax(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
+    decode_utf8_raw(bytes, pos)
+}
+
+/// Raw UTF-8 decoder supporting up to 6-byte sequences.
+/// Does NOT reject surrogates or out-of-range values.
+/// Rejects overlong encodings.
+fn decode_utf8_raw(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
     if pos >= bytes.len() {
         return None;
     }
     let b0 = bytes[pos];
     if b0 <= 0x7F {
-        // 1-byte: 0xxxxxxx
         Some((b0 as u32, pos + 1))
     } else if b0 & 0xE0 == 0xC0 {
-        // 2-byte: 110xxxxx 10xxxxxx
-        if pos + 1 >= bytes.len() {
-            return None;
-        }
+        if pos + 1 >= bytes.len() { return None; }
         let b1 = bytes[pos + 1];
-        if b1 & 0xC0 != 0x80 {
-            return None;
-        }
+        if b1 & 0xC0 != 0x80 { return None; }
         let cp = ((b0 as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F);
-        // Reject overlong encoding
-        if cp < 0x80 {
-            return None;
-        }
+        if cp < 0x80 { return None; }
         Some((cp, pos + 2))
     } else if b0 & 0xF0 == 0xE0 {
-        // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
-        if pos + 2 >= bytes.len() {
-            return None;
-        }
+        if pos + 2 >= bytes.len() { return None; }
         let b1 = bytes[pos + 1];
         let b2 = bytes[pos + 2];
-        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) {
-            return None;
-        }
+        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) { return None; }
         let cp = ((b0 as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
-        // Reject overlong encoding
-        if cp < 0x800 {
-            return None;
-        }
+        if cp < 0x800 { return None; }
         Some((cp, pos + 3))
     } else if b0 & 0xF8 == 0xF0 {
-        // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-        if pos + 3 >= bytes.len() {
-            return None;
-        }
+        if pos + 3 >= bytes.len() { return None; }
         let b1 = bytes[pos + 1];
         let b2 = bytes[pos + 2];
         let b3 = bytes[pos + 3];
-        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) {
-            return None;
-        }
+        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) { return None; }
         let cp = ((b0 as u32 & 0x07) << 18)
             | ((b1 as u32 & 0x3F) << 12)
             | ((b2 as u32 & 0x3F) << 6)
             | (b3 as u32 & 0x3F);
-        // Reject overlong encoding and out-of-range
-        if cp < 0x10000 || cp > MAX_UNICODE {
-            return None;
-        }
+        if cp < 0x10000 { return None; }
         Some((cp, pos + 4))
+    } else if b0 & 0xFC == 0xF8 {
+        // 5-byte: 111110xx
+        if pos + 4 >= bytes.len() { return None; }
+        for k in 1..5 {
+            if bytes[pos + k] & 0xC0 != 0x80 { return None; }
+        }
+        let cp = ((b0 as u32 & 0x03) << 24)
+            | ((bytes[pos + 1] as u32 & 0x3F) << 18)
+            | ((bytes[pos + 2] as u32 & 0x3F) << 12)
+            | ((bytes[pos + 3] as u32 & 0x3F) << 6)
+            | (bytes[pos + 4] as u32 & 0x3F);
+        if cp < 0x200000 { return None; }
+        Some((cp, pos + 5))
+    } else if b0 & 0xFE == 0xFC {
+        // 6-byte: 1111110x
+        if pos + 5 >= bytes.len() { return None; }
+        for k in 1..6 {
+            if bytes[pos + k] & 0xC0 != 0x80 { return None; }
+        }
+        let cp = ((b0 as u32 & 0x01) << 30)
+            | ((bytes[pos + 1] as u32 & 0x3F) << 24)
+            | ((bytes[pos + 2] as u32 & 0x3F) << 18)
+            | ((bytes[pos + 3] as u32 & 0x3F) << 12)
+            | ((bytes[pos + 4] as u32 & 0x3F) << 6)
+            | (bytes[pos + 5] as u32 & 0x3F);
+        if cp < 0x4000000 { return None; }
+        Some((cp, pos + 6))
     } else {
-        // Invalid leading byte (continuation byte or 5/6-byte sequence)
         None
     }
 }
@@ -149,6 +189,26 @@ fn decode_utf8(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
 /// Check if byte at `pos` is a continuation byte (10xxxxxx).
 fn is_continuation_byte(b: u8) -> bool {
     b & 0xC0 == 0x80
+}
+
+/// Get expected byte length of a UTF-8 character from its leading byte.
+fn utf8_char_len(b: u8) -> usize {
+    if b <= 0x7F {
+        1
+    } else if b & 0xE0 == 0xC0 {
+        2
+    } else if b & 0xF0 == 0xE0 {
+        3
+    } else if b & 0xF8 == 0xF0 {
+        4
+    } else if b & 0xFC == 0xF8 {
+        5
+    } else if b & 0xFE == 0xFC {
+        6
+    } else {
+        // Continuation byte or invalid - treat as 1 byte
+        1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,13 +224,13 @@ fn native_utf8_char(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
                 i + 1
             ))
         })?;
-        if cp < 0 || cp > MAX_UNICODE as i64 {
+        if cp < 0 || cp > MAX_LAX as i64 {
             return Err(NativeError::String(format!(
                 "bad argument #{} to 'utf8.char' (value out of range)",
                 i + 1
             )));
         }
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 6];
         let n = encode_utf8(cp as u32, &mut buf);
         result.extend_from_slice(&buf[..n]);
     }
@@ -191,8 +251,19 @@ fn native_utf8_codes(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
         ));
     }
 
-    // Return (iterator_function, s, 0)
-    let iter_idx = ctx.gc.alloc_native(native_utf8_codes_iter, "utf8.codes iterator");
+    let lax = ctx
+        .args
+        .get(1)
+        .map(|v| v.is_truthy())
+        .unwrap_or(false);
+
+    // Return (iterator_function, s, 0) — use lax or strict iterator
+    let iter_fn = if lax {
+        native_utf8_codes_iter_lax
+    } else {
+        native_utf8_codes_iter
+    };
+    let iter_idx = ctx.gc.alloc_native(iter_fn, "utf8.codes iterator");
     Ok(vec![
         TValue::from_native(iter_idx),
         val,
@@ -200,57 +271,71 @@ fn native_utf8_codes(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
     ])
 }
 
-/// Iterator function for utf8.codes.
-/// Receives (s, n) where n is the control variable (starts at 0).
-/// Algorithm matches PUC-Rio Lua 5.4:
-///   1. Skip continuation bytes at position n
-///   2. If n >= len, return nil (done)
-///   3. Decode UTF-8 at position n
-///   4. Return (n+1, codepoint) -- n+1 converts 0-based to 1-based
+/// Strict iterator for utf8.codes.
 fn native_utf8_codes_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    utf8_codes_iter_impl(ctx, false)
+}
+
+/// Lax iterator for utf8.codes.
+fn native_utf8_codes_iter_lax(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    utf8_codes_iter_impl(ctx, true)
+}
+
+/// Iterator implementation for utf8.codes.
+/// Receives (s, n) where n is the control variable.
+/// n starts at 0 (before the string).
+fn utf8_codes_iter_impl(ctx: &mut NativeContext, lax: bool) -> Result<Vec<TValue>, NativeError> {
     let s_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let sid = s_val.as_string_id().ok_or_else(|| {
         NativeError::String("bad argument #1 to 'utf8.codes iterator' (string expected)".to_string())
     })?;
     let bytes = ctx.strings.get_bytes(sid).to_vec();
+    let len = bytes.len();
 
-    let idx = ctx
+    let n = ctx
         .args
         .get(1)
         .and_then(|v| v.as_full_integer(ctx.gc))
         .unwrap_or(0);
 
-    let pos = idx; // 0-based byte offset
-    if pos < 0 {
-        // Shouldn't happen, but handle gracefully
-        return Ok(vec![TValue::nil()]);
-    }
-    let mut pos = pos as usize;
-
-    // Skip continuation bytes
-    while pos < bytes.len() && is_continuation_byte(bytes[pos]) {
-        pos += 1;
-    }
-
-    if pos >= bytes.len() {
+    // n is the 1-based position of the previous character (or 0 at start)
+    if n < 0 || (n > 0 && n as usize > len) {
         return Ok(vec![TValue::nil()]);
     }
 
-    match decode_utf8(&bytes, pos) {
+    let next_pos_0based = if n == 0 {
+        0usize
+    } else {
+        let prev_0 = (n as usize) - 1;
+        if prev_0 >= len {
+            return Ok(vec![TValue::nil()]);
+        }
+        let char_len = utf8_char_len(bytes[prev_0]);
+        prev_0 + char_len
+    };
+
+    if next_pos_0based >= len {
+        return Ok(vec![TValue::nil()]);
+    }
+
+    let decoded = if lax {
+        decode_utf8_lax(&bytes, next_pos_0based)
+    } else {
+        decode_utf8(&bytes, next_pos_0based)
+    };
+
+    match decoded {
         Some((codepoint, _next)) => {
-            // Return (1-based byte position, codepoint)
-            let lua_pos = (pos + 1) as i64;
+            let lua_pos = (next_pos_0based + 1) as i64;
             Ok(vec![
                 TValue::from_full_integer(lua_pos, ctx.gc),
                 TValue::from_full_integer(codepoint as i64, ctx.gc),
             ])
         }
-        None => {
-            Err(NativeError::String(format!(
-                "invalid UTF-8 code at byte position {}",
-                pos + 1
-            )))
-        }
+        None => Err(NativeError::String(format!(
+            "invalid UTF-8 code at byte position {}",
+            next_pos_0based + 1
+        ))),
     }
 }
 
@@ -277,21 +362,68 @@ fn native_utf8_codepoint(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
         .and_then(|v| v.as_full_integer(ctx.gc))
         .unwrap_or(i);
 
-    // Convert 1-based Lua positions to 0-based
-    let start = lua_byte_index(i, len);
-    let end = lua_byte_index(j, len);
-
-    if start > len || end > len {
+    // Convert 1-based Lua positions to 0-based, with bounds checking.
+    // Use posrelatI semantics: positive i means i-1 (0-based), clamped to [0, len].
+    // Negative i means len + i (wrapping from end).
+    let start_raw = if i >= 1 {
+        (i as isize) - 1
+    } else if i < 0 {
+        (len as isize) + (i as isize)
+    } else {
+        -1 // i == 0, will be caught by bounds check
+    };
+    // Bounds check: start must be in [0, len-1] for codepoint
+    if start_raw < 0 || start_raw as usize >= len {
+        // But if j would result in end < start, it's just an empty range
+        let end_raw = if j >= 1 { (j as isize) - 1 } else if j < 0 { (len as isize) + (j as isize) } else { -1 };
+        if end_raw < start_raw {
+            return Ok(vec![]); // empty range
+        }
         return Err(NativeError::String(
-            "bad argument to 'utf8.codepoint' (out of bounds)".to_string(),
+            "bad argument #2 to 'utf8.codepoint' (out of bounds)".to_string(),
         ));
     }
+    let start = start_raw as usize;
+
+    let end_raw = if j >= 1 {
+        (j as isize) - 1
+    } else if j < 0 {
+        (len as isize) + (j as isize)
+    } else {
+        -1 // j == 0
+    };
+    if end_raw < 0 || end_raw as usize >= len {
+        if end_raw < start_raw {
+            return Ok(vec![]); // empty range
+        }
+        return Err(NativeError::String(
+            "bad argument #3 to 'utf8.codepoint' (out of bounds)".to_string(),
+        ));
+    }
+    let end = end_raw as usize;
+
+    // If start > end, empty range
+    if start > end {
+        return Ok(vec![]);
+    }
+
+    // 4th argument: lax/nonstrict mode
+    let lax = ctx
+        .args
+        .get(3)
+        .map(|v| v.is_truthy())
+        .unwrap_or(false);
 
     let mut results = Vec::new();
     let mut pos = start;
     // We need to decode all characters whose start byte is in [start, end]
     while pos <= end && pos < len {
-        match decode_utf8(&bytes, pos) {
+        let decoded = if lax {
+            decode_utf8_lax(&bytes, pos)
+        } else {
+            decode_utf8(&bytes, pos)
+        };
+        match decoded {
             Some((codepoint, next)) => {
                 results.push(TValue::from_full_integer(codepoint as i64, ctx.gc));
                 pos = next;
@@ -331,16 +463,63 @@ fn native_utf8_len(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         .and_then(|v| v.as_full_integer(ctx.gc))
         .unwrap_or(-1);
 
+    // Validate bounds: i must be in [1, #s+1], j must be in [-#s, #s]
+    // (Lua 5.4 reference: initial position out of bounds, final position out of bounds)
     // Convert 1-based Lua positions to 0-based byte indices
-    let start = lua_byte_index(i, len);
-    // For j, in Lua utf8.len, j=-1 means the last byte (inclusive)
-    let end_inclusive = lua_byte_index(j, len);
-
-    if start > len {
+    let start = if i >= 1 {
+        let s = (i as usize) - 1;
+        if s > len {
+            return Err(NativeError::String(
+                "bad argument #2 to 'utf8.len' (initial position out of bounds)".to_string(),
+            ));
+        }
+        s
+    } else if i < 0 {
+        let back = (-i) as usize;
+        if back > len {
+            return Err(NativeError::String(
+                "bad argument #2 to 'utf8.len' (initial position out of bounds)".to_string(),
+            ));
+        }
+        len - back
+    } else {
+        // i == 0 is out of bounds
         return Err(NativeError::String(
             "bad argument #2 to 'utf8.len' (initial position out of bounds)".to_string(),
         ));
+    };
+
+    let end_inclusive_raw = if j >= 1 {
+        let e = (j as usize) - 1;
+        if e >= len {
+            return Err(NativeError::String(
+                "bad argument #3 to 'utf8.len' (final position out of bounds)".to_string(),
+            ));
+        }
+        e as isize
+    } else if j < 0 {
+        // Negative index: j=-1 means last byte
+        // For empty string (len=0): -1 maps to index -1 (before start), range is empty
+        (len as isize) + (j as isize)
+    } else {
+        // j == 0 is out of bounds
+        return Err(NativeError::String(
+            "bad argument #3 to 'utf8.len' (final position out of bounds)".to_string(),
+        ));
+    };
+
+    // If end < start, the range is empty → return 0
+    if end_inclusive_raw < 0 || (end_inclusive_raw as usize) < start {
+        return Ok(vec![TValue::from_full_integer(0, ctx.gc)]);
     }
+    let end_inclusive = end_inclusive_raw as usize;
+
+    // 4th argument: lax/nonstrict mode
+    let lax = ctx
+        .args
+        .get(3)
+        .map(|v| v.is_truthy())
+        .unwrap_or(false);
 
     // Count UTF-8 characters in the range [start, end_inclusive]
     let mut count: i64 = 0;
@@ -352,7 +531,12 @@ fn native_utf8_len(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     };
 
     while pos < limit {
-        match decode_utf8(&bytes, pos) {
+        let decoded = if lax {
+            decode_utf8_lax(&bytes, pos)
+        } else {
+            decode_utf8(&bytes, pos)
+        };
+        match decoded {
             Some((_cp, next)) => {
                 count += 1;
                 pos = next;
@@ -401,8 +585,15 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         .unwrap_or(default_i);
 
     // Convert to 0-based
+    // Valid range for i: 1 to #s+1 (positive), -#s to -1 (negative), and 0 is invalid.
     let mut pos = if i > 0 {
-        (i as usize).saturating_sub(1)
+        let p = (i as usize).saturating_sub(1);
+        if p > len {
+            return Err(NativeError::String(
+                "bad argument #3 to 'utf8.offset' (position out of bounds)".to_string(),
+            ));
+        }
+        p
     } else if i < 0 {
         let back = (-i) as usize;
         if back > len {
@@ -417,7 +608,16 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         ));
     };
 
-    // pos must be at a valid position: either at len (one past end) or at a non-continuation byte
+    if n == 0 {
+        // n=0: find the start of the character containing byte at position i.
+        // The initial position CAN be a continuation byte; scan backward.
+        while pos > 0 && pos < len && is_continuation_byte(bytes[pos]) {
+            pos -= 1;
+        }
+        return Ok(vec![TValue::from_full_integer((pos + 1) as i64, ctx.gc)]);
+    }
+
+    // For n != 0, pos must be at a valid position: either at len or at a non-continuation byte
     if pos < len && is_continuation_byte(bytes[pos]) {
         return Err(NativeError::String(
             "bad argument #3 to 'utf8.offset' (initial position is a continuation byte)"
@@ -425,13 +625,7 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         ));
     }
 
-    if n == 0 {
-        // n=0: find the start of the character at byte position i
-        // pos is already at a non-continuation byte or at len
-        // Just back up over any continuation bytes (but we verified it's not one)
-        // Return 1-based position
-        return Ok(vec![TValue::from_full_integer((pos + 1) as i64, ctx.gc)]);
-    } else if n > 0 {
+    if n > 0 {
         // Move forward n characters from position pos
         // n=1 means the character at pos, n=2 means the next one, etc.
         let mut remaining = n;
@@ -442,15 +636,9 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         // n=2 means skip one character forward from pos.
         remaining -= 1; // The character at pos counts as #1
         while remaining > 0 && pos < len {
-            // Skip current character
-            match decode_utf8(&bytes, pos) {
-                Some((_cp, next)) => {
-                    pos = next;
-                }
-                None => {
-                    return Ok(vec![TValue::nil()]);
-                }
-            }
+            // Skip current character using leading byte to determine length
+            let char_len = utf8_char_len(bytes[pos]);
+            pos += char_len;
             remaining -= 1;
         }
         if remaining > 0 {

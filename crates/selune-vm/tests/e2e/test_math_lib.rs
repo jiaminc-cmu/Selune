@@ -145,12 +145,15 @@ fn test_math_rad() {
 
 #[test]
 fn test_math_fmod_basic() {
-    run_check_floats("return math.fmod(7, 3)", &[1.0]);
+    // When both args are integers, fmod returns integer (Lua 5.4 spec)
+    let results = run_lua("return math.fmod(7, 3)");
+    assert_int(&results, 0, 1);
 }
 
 #[test]
 fn test_math_fmod_negative() {
-    run_check_floats("return math.fmod(-7, 3)", &[-1.0]);
+    let results = run_lua("return math.fmod(-7, 3)");
+    assert_int(&results, 0, -1);
 }
 
 // ---- math.modf ----

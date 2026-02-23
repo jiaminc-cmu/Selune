@@ -19,6 +19,8 @@ pub fn to_number(v: TValue, gc: &GcHeap, strings: &StringInterner) -> Option<f64
             Some(f)
         } else if let Some(result) = parse_hex_number(s) {
             Some(result as f64)
+        } else if let Some(f) = parse_hex_float(s) {
+            Some(f)
         } else {
             None
         }
@@ -137,9 +139,15 @@ pub fn tonumber_from_str(s: &str, gc: &mut GcHeap) -> Option<TValue> {
         return Some(TValue::from_full_integer(i, gc));
     }
     
-    // Try float
-    if let Ok(f) = trimmed.parse::<f64>() {
-        return Some(TValue::from_float(f));
+    // Try float (but reject "inf", "nan", "infinity" which Rust accepts but Lua doesn't)
+    {
+        let lower = trimmed.to_ascii_lowercase();
+        let stripped = lower.trim_start_matches(['+', '-']);
+        if !stripped.starts_with("inf") && !stripped.starts_with("nan") {
+            if let Ok(f) = trimmed.parse::<f64>() {
+                return Some(TValue::from_float(f));
+            }
+        }
     }
     
     None
