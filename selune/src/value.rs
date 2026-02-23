@@ -2,8 +2,9 @@
 #[repr(u8)]
 pub enum Tag {
     Nil = 0,
-    Int = 1,
-    Float = 2,
+    Bool = 1,
+    Int = 2,
+    Float = 3,
 }
 
 #[derive(Clone, Copy)]
@@ -11,6 +12,7 @@ pub enum Tag {
 pub union Payload {
     pub i: i64,
     pub f: f64,
+    pub b: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +36,13 @@ impl TValue {
             tag: Tag::Float,
             _pad: [0; 7],
             payload: Payload { f },
+        }
+    }
+    pub fn boolean(b: bool) -> Self {
+        TValue {
+            tag: Tag::Bool,
+            _pad: [0; 7],
+            payload: Payload { b },
         }
     }
     pub fn nil() -> Self {
