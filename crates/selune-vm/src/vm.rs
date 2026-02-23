@@ -64,6 +64,8 @@ pub struct Vm {
     pub xpcall_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for table.sort (needs special VM dispatch for Lua comparator).
     pub table_sort_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for table.move (needs VM dispatch for metamethods).
+    pub table_move_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for string.gsub (needs special VM dispatch for function replacement).
     pub string_gsub_idx: Option<GcIdx<NativeFunction>>,
     /// Coroutine storage: suspended thread states, indexed by coroutine ID.
@@ -107,6 +109,14 @@ pub struct Vm {
     pub debug_getupvalue_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for debug.setupvalue (needs VM access for Proto upvalue names + open upvals).
     pub debug_setupvalue_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.getinfo (needs VM access for call stack / proto info).
+    pub debug_getinfo_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for coroutine.running (needs VM access to know current coroutine).
+    pub coro_running_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for string.format (needs VM access for __tostring metamethod).
+    pub string_format_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for string.dump (needs VM access to read protos from closures).
+    pub string_dump_idx: Option<GcIdx<NativeFunction>>,
 }
 
 impl Vm {
@@ -126,6 +136,7 @@ impl Vm {
             pcall_idx: None,
             xpcall_idx: None,
             table_sort_idx: None,
+            table_move_idx: None,
             string_gsub_idx: None,
             coroutines: Vec::new(),
             running_coro: None,
@@ -147,6 +158,10 @@ impl Vm {
             error_idx: None,
             debug_getupvalue_idx: None,
             debug_setupvalue_idx: None,
+            debug_getinfo_idx: None,
+            coro_running_idx: None,
+            string_format_idx: None,
+            string_dump_idx: None,
         }
     }
 
@@ -191,6 +206,7 @@ impl Vm {
         // Register standard library modules
         let stdlib_indices = selune_stdlib::register_all(env_idx, &mut self.gc, &mut self.strings);
         self.table_sort_idx = Some(stdlib_indices.table_sort_idx);
+        self.table_move_idx = Some(stdlib_indices.table_move_idx);
         self.string_gsub_idx = Some(stdlib_indices.string_gsub_idx);
         self.coro_resume_idx = Some(stdlib_indices.coro_resume_idx);
         self.coro_yield_idx = Some(stdlib_indices.coro_yield_idx);
@@ -201,6 +217,10 @@ impl Vm {
         self.package_preload_idx = Some(stdlib_indices.package_preload_idx);
         self.debug_getupvalue_idx = Some(stdlib_indices.debug_getupvalue_idx);
         self.debug_setupvalue_idx = Some(stdlib_indices.debug_setupvalue_idx);
+        self.debug_getinfo_idx = Some(stdlib_indices.debug_getinfo_idx);
+        self.coro_running_idx = Some(stdlib_indices.coro_running_idx);
+        self.string_format_idx = Some(stdlib_indices.string_format_idx);
+        self.string_dump_idx = Some(stdlib_indices.string_dump_idx);
 
         // Create string metatable with __index = string library table
         let string_mt = self.gc.alloc_table(0, 4);
@@ -269,6 +289,44 @@ impl Vm {
         });
         let env_upval_idx = self.gc.alloc_upval(UpValLocation::Closed(env_val));
         let closure_idx = self.gc.alloc_closure(proto_idx, vec![env_upval_idx]);
+        Ok(TValue::from_closure(closure_idx))
+    }
+
+    /// Load a binary chunk (from string.dump) into the VM.
+    pub fn load_binary_chunk(
+        &mut self,
+        data: &[u8],
+        name: &str,
+        env: Option<TValue>,
+    ) -> Result<TValue, String> {
+        let proto = crate::binary_chunk::undump(data, name, &mut self.strings)
+            .map_err(|e| e.message)?;
+
+        // Store the proto
+        let proto_idx = self.protos.len();
+        self.protos.push(proto);
+
+        // Create upvalues — for the main chunk, first upvalue is _ENV
+        let num_upvalues = self.protos[proto_idx].upvalues.len();
+        let mut upval_indices = Vec::with_capacity(num_upvalues);
+        for i in 0..num_upvalues {
+            if i == 0 {
+                // First upvalue is _ENV
+                let env_val = env.unwrap_or_else(|| {
+                    self.env_idx
+                        .map(TValue::from_table)
+                        .unwrap_or(TValue::nil())
+                });
+                let uv_idx = self.gc.alloc_upval(UpValLocation::Closed(env_val));
+                upval_indices.push(uv_idx);
+            } else {
+                // Other upvalues start as nil
+                let uv_idx = self.gc.alloc_upval(UpValLocation::Closed(TValue::nil()));
+                upval_indices.push(uv_idx);
+            }
+        }
+
+        let closure_idx = self.gc.alloc_closure(proto_idx, upval_indices);
         Ok(TValue::from_closure(closure_idx))
     }
 
@@ -705,6 +763,18 @@ impl Vm {
         if let Some(idx) = self.gc.string_metatable {
             self.gc.gc_mark_value(TValue::from_table(idx));
         }
+        // Mark number metatable
+        if let Some(idx) = self.gc.number_metatable {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark boolean metatable
+        if let Some(idx) = self.gc.boolean_metatable {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark nil metatable
+        if let Some(idx) = self.gc.nil_metatable {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
 
         // Mark registered native function indices (these are always roots)
         if let Some(idx) = self.pcall_idx {
@@ -807,7 +877,12 @@ fn native_print(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
 }
 
 fn native_type(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if ctx.args.is_empty() {
+        return Err(NativeError::String(
+            "bad argument #1 to 'type' (value expected)".to_string(),
+        ));
+    }
+    let val = ctx.args[0];
     let type_name = selune_core::object::lua_type_name(val, ctx.gc);
     let sid = ctx.strings.intern(type_name.as_bytes());
     Ok(vec![TValue::from_string_id(sid)])
@@ -820,7 +895,12 @@ fn native_tostring_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
 }
 
 fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    if ctx.args.is_empty() {
+        return Err(NativeError::String(
+            "bad argument #1 to 'tonumber' (value expected)".to_string(),
+        ));
+    }
+    let val = ctx.args[0];
     let base_arg = ctx.args.get(1).copied();
 
     // tonumber(s, base) — base conversion
@@ -953,7 +1033,7 @@ fn native_rawget(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = table_val.as_table_idx().ok_or_else(|| {
         NativeError::String("bad argument #1 to 'rawget' (table expected)".to_string())
     })?;
-    Ok(vec![ctx.gc.get_table(table_idx).raw_get(key)])
+    Ok(vec![ctx.gc.table_raw_get(table_idx, key)])
 }
 
 fn native_rawset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
@@ -964,8 +1044,7 @@ fn native_rawset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         NativeError::String("bad argument #1 to 'rawset' (table expected)".to_string())
     })?;
     ctx.gc
-        .get_table_mut(table_idx)
-        .raw_set(key, val)
+        .table_raw_set(table_idx, key, val)
         .map_err(|e: &str| NativeError::String(e.to_string()))?;
     Ok(vec![table_val])
 }
@@ -1048,6 +1127,24 @@ fn native_getmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
         }
     } else if let Some(ud_idx) = val.as_userdata_idx() {
         if let Some(mt_idx) = ctx.gc.get_userdata(ud_idx).metatable {
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else if val.is_number() || val.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT) {
+        if let Some(mt_idx) = ctx.gc.number_metatable {
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else if val.is_bool() {
+        if let Some(mt_idx) = ctx.gc.boolean_metatable {
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else if val.is_nil() {
+        if let Some(mt_idx) = ctx.gc.nil_metatable {
             Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
         } else {
             Ok(vec![TValue::nil()])

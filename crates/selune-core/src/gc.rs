@@ -80,6 +80,8 @@ pub struct NativeFunction {
     /// We store it as a raw fn pointer; the Vm reference is passed separately.
     pub func: fn(&mut NativeContext) -> Result<Vec<TValue>, NativeError>,
     pub name: &'static str,
+    /// Optional upvalue for closures (e.g., gmatch iterators).
+    pub upvalue: TValue,
 }
 
 /// Context passed to native functions.
@@ -87,6 +89,8 @@ pub struct NativeContext<'a> {
     pub args: &'a [TValue],
     pub gc: &'a mut GcHeap,
     pub strings: &'a mut crate::string::StringInterner,
+    /// Optional upvalue from the NativeFunction.
+    pub upvalue: TValue,
 }
 
 /// An upvalue: either open (pointing to a stack slot) or closed (holding a value).
@@ -231,6 +235,12 @@ pub struct GcHeap {
     pub gc_state: GcState,
     /// Shared string metatable (for string:method() calls and getmetatable("")).
     pub string_metatable: Option<GcIdx<Table>>,
+    /// Shared number metatable (for type-wide metamethods on numbers).
+    pub number_metatable: Option<GcIdx<Table>>,
+    /// Shared boolean metatable (for type-wide metamethods on booleans).
+    pub boolean_metatable: Option<GcIdx<Table>>,
+    /// Shared nil metatable (for type-wide metamethods on nil).
+    pub nil_metatable: Option<GcIdx<Table>>,
 }
 
 impl GcHeap {
@@ -250,6 +260,9 @@ impl GcHeap {
             userdata_free: Vec::new(),
             gc_state: GcState::new(),
             string_metatable: None,
+            number_metatable: None,
+            boolean_metatable: None,
+            nil_metatable: None,
         }
     }
 
@@ -283,6 +296,37 @@ impl GcHeap {
             self.tables.push(Some(table));
             GcIdx(idx, PhantomData)
         }
+    }
+
+    /// Raw get from a table, handling boxed integer keys correctly.
+    /// This resolves boxed ints to their i64 value before lookup.
+    pub fn table_raw_get(&self, table_idx: GcIdx<Table>, key: TValue) -> TValue {
+        // Check if the key is a boxed integer
+        if key.gc_sub_tag() == Some(GC_SUB_BOXED_INT) {
+            if let Some(gc_idx) = key.gc_index() {
+                let int_val = self.boxed_ints[gc_idx as usize].expect("boxed int was freed");
+                return self.get_table(table_idx).raw_geti(int_val);
+            }
+        }
+        self.get_table(table_idx).raw_get(key)
+    }
+
+    /// Raw set on a table, handling boxed integer keys correctly.
+    pub fn table_raw_set(
+        &mut self,
+        table_idx: GcIdx<Table>,
+        key: TValue,
+        value: TValue,
+    ) -> Result<(), &'static str> {
+        // Check if the key is a boxed integer
+        if key.gc_sub_tag() == Some(GC_SUB_BOXED_INT) {
+            if let Some(gc_idx) = key.gc_index() {
+                let int_val = self.boxed_ints[gc_idx as usize].expect("boxed int was freed");
+                self.get_table_mut(table_idx).raw_seti(int_val, value);
+                return Ok(());
+            }
+        }
+        self.get_table_mut(table_idx).raw_set(key, value)
     }
 
     pub fn get_table(&self, idx: GcIdx<Table>) -> &Table {
@@ -332,7 +376,26 @@ impl GcHeap {
     ) -> GcIdx<NativeFunction> {
         self.gc_state.total_alloc += 24;
         self.gc_state.debt += 24;
-        let native = NativeFunction { func, name };
+        let native = NativeFunction { func, name, upvalue: TValue::nil() };
+        if let Some(idx) = self.native_free.pop() {
+            self.natives[idx as usize] = Some(native);
+            GcIdx(idx, PhantomData)
+        } else {
+            let idx = self.natives.len() as u32;
+            self.natives.push(Some(native));
+            GcIdx(idx, PhantomData)
+        }
+    }
+
+    pub fn alloc_native_with_upvalue(
+        &mut self,
+        func: fn(&mut NativeContext) -> Result<Vec<TValue>, NativeError>,
+        name: &'static str,
+        upvalue: TValue,
+    ) -> GcIdx<NativeFunction> {
+        self.gc_state.total_alloc += 32;
+        self.gc_state.debt += 32;
+        let native = NativeFunction { func, name, upvalue };
         if let Some(idx) = self.native_free.pop() {
             self.natives[idx as usize] = Some(native);
             GcIdx(idx, PhantomData)

@@ -145,10 +145,11 @@ fn lua_imod(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Lua float modulo.
+/// Lua float modulo: a % b = a - floor(a/b)*b
+/// Uses sign comparison instead of r*b to avoid underflow with very small numbers.
 fn lua_fmod(a: f64, b: f64) -> f64 {
-    let r = a % b;
-    if r != 0.0 && (r * b) < 0.0 {
+    let r = a % b;  // IEEE 754 fmod (truncated remainder)
+    if r != 0.0 && ((r > 0.0) != (b > 0.0)) {
         r + b
     } else {
         r
@@ -196,10 +197,6 @@ pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Arith
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
-    } else if v.is_float() {
-        ArithResult::Error(LuaError::Runtime(
-            "number has no integer representation".to_string(),
-        ))
     } else {
         ArithResult::NeedMetamethod
     }
@@ -238,8 +235,11 @@ pub fn bitwise_op(
     let ia = match coerce::to_integer(a, gc, strings) {
         Some(i) => i,
         None => {
-            // If the value is a number that can't convert to integer, error
-            if a.is_float() || a.as_full_integer(gc).is_some() {
+            // If `a` is a float that can't convert to int, only error
+            // immediately when the other operand (`b`) can't possibly
+            // have a metamethod (is number/string). Otherwise return
+            // NeedMetamethod so dispatch can try `b`'s metamethod.
+            if a.is_float() && !could_have_metamethod(b, gc) {
                 return ArithResult::Error(LuaError::Runtime(
                     "number has no integer representation".to_string(),
                 ));
@@ -250,7 +250,7 @@ pub fn bitwise_op(
     let ib = match coerce::to_integer(b, gc, strings) {
         Some(i) => i,
         None => {
-            if b.is_float() || b.as_full_integer(gc).is_some() {
+            if b.is_float() && !could_have_metamethod(a, gc) {
                 return ArithResult::Error(LuaError::Runtime(
                     "number has no integer representation".to_string(),
                 ));
@@ -262,6 +262,30 @@ pub fn bitwise_op(
         Ok(v) => ArithResult::Ok(v),
         Err(e) => ArithResult::Error(e),
     }
+}
+
+/// Check if a value could possibly have metamethods (table, userdata,
+/// or a type with a type-wide metatable set).
+fn could_have_metamethod(v: TValue, gc: &GcHeap) -> bool {
+    if v.is_table() || v.is_userdata() {
+        return true;
+    }
+    // Check for type-wide metatables
+    if (v.is_number() || v.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT))
+        && gc.number_metatable.is_some()
+    {
+        return true;
+    }
+    if v.is_bool() && gc.boolean_metatable.is_some() {
+        return true;
+    }
+    if v.is_nil() && gc.nil_metatable.is_some() {
+        return true;
+    }
+    if v.is_string() && gc.string_metatable.is_some() {
+        return true;
+    }
+    false
 }
 
 /// Arithmetic operation enum.

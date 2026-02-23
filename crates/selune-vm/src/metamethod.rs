@@ -112,5 +112,35 @@ pub fn get_metamethod(val: TValue, mm_name: StringId, gc: &GcHeap) -> Option<TVa
         }
         return Some(mm_val);
     }
+    // Check numbers (inline int, float, or boxed int)
+    if val.is_number() || val.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT) {
+        if let Some(mt_idx) = gc.number_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
+    // Check booleans
+    if val.is_bool() {
+        if let Some(mt_idx) = gc.boolean_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
+    // Check nil
+    if val.is_nil() {
+        if let Some(mt_idx) = gc.nil_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
     None
 }

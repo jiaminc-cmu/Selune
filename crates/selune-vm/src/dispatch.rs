@@ -81,6 +81,84 @@ fn get_error_prefix(vm: &Vm, level: usize) -> String {
     String::new()
 }
 
+/// Try to find a descriptive name for the value in the given register
+/// by scanning backwards through instructions. Returns something like
+/// "(field 'huge')" or "(local 'x')" or empty string if unknown.
+fn get_obj_name(vm: &Vm, ci_idx: usize, reg: usize) -> String {
+    let ci = &vm.call_stack[ci_idx];
+    let proto = &vm.protos[ci.proto_idx];
+    let pc = if ci.pc > 0 { ci.pc - 1 } else { return String::new() };
+
+    // Scan backwards from current PC to find instruction that wrote to `reg`
+    for i in (0..=pc).rev() {
+        let inst = proto.code[i];
+        let op = inst.opcode();
+        let a = inst.a() as usize;
+
+        // Only interested in instructions that write to our register
+        if a != reg {
+            continue;
+        }
+
+        match op {
+            OpCode::GetField => {
+                // C is the constant index with the field name
+                let c = inst.c() as usize;
+                if c < proto.constants.len() {
+                    if let Constant::String(sid) = &proto.constants[c] {
+                        let name = String::from_utf8_lossy(vm.strings.get_bytes(*sid));
+                        return format!(" (field '{}')", name);
+                    }
+                }
+                return String::new();
+            }
+            OpCode::GetTabUp => {
+                // B is upvalue index, C is constant index (key name)
+                let c = inst.c() as usize;
+                if c < proto.constants.len() {
+                    if let Constant::String(sid) = &proto.constants[c] {
+                        let name = String::from_utf8_lossy(vm.strings.get_bytes(*sid));
+                        return format!(" (global '{}')", name);
+                    }
+                }
+                return String::new();
+            }
+            OpCode::Move => {
+                // The value came from another register; recurse (but limited)
+                return String::new();
+            }
+            _ => {
+                // This instruction wrote to our register but we don't know how to describe it
+                return String::new();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Enhance a bitwise operation error with source info about which operand failed.
+/// `b_reg` and `c_reg` are the register indices of the two operands (c_reg may be None for immediate ops).
+fn enhance_bitwise_error(vm: &Vm, ci_idx: usize, e: LuaError, b_reg: usize, c_reg: Option<usize>, vb: TValue, vc: TValue) -> LuaError {
+    match e {
+        LuaError::Runtime(msg) if msg.contains("no integer representation") => {
+            // Determine which operand caused the error
+            let obj_name = if vb.is_float() {
+                get_obj_name(vm, ci_idx, b_reg)
+            } else if let Some(c) = c_reg {
+                if vc.is_float() {
+                    get_obj_name(vm, ci_idx, c)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            LuaError::Runtime(format!("{}{}", msg, obj_name))
+        }
+        other => other,
+    }
+}
+
 /// Get a constant from the current proto, cloned to avoid borrow issues.
 #[inline]
 fn get_k(vm: &Vm, ci_idx: usize, idx: usize) -> Constant {
@@ -228,7 +306,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         vm.call_stack[ci_idx].pc += 1; // skip MMBin
                     }
                     arith::ArithResult::NeedMetamethod => {} // fall through to MMBin
-                    arith::ArithResult::Error(e) => return Err(e),
+                    arith::ArithResult::Error(e) => {
+                        return Err(enhance_bitwise_error(vm, ci_idx, e, b, Some(c), vb, vc));
+                    }
                 }
             }
 
@@ -280,7 +360,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         vm.call_stack[ci_idx].pc += 1; // skip MMBinK
                     }
                     arith::ArithResult::NeedMetamethod => {} // fall through to MMBinK
-                    arith::ArithResult::Error(e) => return Err(e),
+                    arith::ArithResult::Error(e) => {
+                        return Err(enhance_bitwise_error(vm, ci_idx, e, b, None, vb, vc));
+                    }
                 }
             }
 
@@ -322,7 +404,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             )));
                         }
                     }
-                    arith::ArithResult::Error(e) => return Err(e),
+                    arith::ArithResult::Error(e) => {
+                        return Err(enhance_bitwise_error(vm, ci_idx, e, b, None, vb, imm));
+                    }
                 }
             }
             OpCode::ShlI => {
@@ -348,7 +432,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             )));
                         }
                     }
-                    arith::ArithResult::Error(e) => return Err(e),
+                    arith::ArithResult::Error(e) => {
+                        return Err(enhance_bitwise_error(vm, ci_idx, e, b, None, vb, imm));
+                    }
                 }
             }
 
@@ -363,7 +449,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     arith::ArithResult::NeedMetamethod => {
                         let mm_name = vm.mm_names.as_ref().unwrap().unm;
                         if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
-                            let result = call_function(vm, mm, &[vb])?;
+                            let result = call_function(vm, mm, &[vb, vb])?;
                             vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
@@ -385,7 +471,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     arith::ArithResult::NeedMetamethod => {
                         let mm_name = vm.mm_names.as_ref().unwrap().bnot;
                         if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
-                            let result = call_function(vm, mm, &[vb])?;
+                            let result = call_function(vm, mm, &[vb, vb])?;
                             vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                         } else {
                             return Err(LuaError::Runtime(format!(
@@ -411,7 +497,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     // Check for __len metamethod first
                     let mm_name = vm.mm_names.as_ref().unwrap().len;
                     if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
-                        let result = call_function(vm, mm, &[vb])?;
+                        let result = call_function(vm, mm, &[vb, vb])?;
                         vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
                     } else {
                         let table_idx = vb.as_table_idx().unwrap();
@@ -419,10 +505,17 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         vm.stack[base + a] = TValue::from_full_integer(len, &mut vm.gc);
                     }
                 } else {
-                    return Err(LuaError::Runtime(format!(
-                        "attempt to get length of a {} value",
-                        selune_core::object::lua_type_name(vb, &vm.gc)
-                    )));
+                    // Check for __len metamethod on non-table/non-string values
+                    let mm_name = vm.mm_names.as_ref().unwrap().len;
+                    if let Some(mm) = metamethod::get_metamethod(vb, mm_name, &vm.gc) {
+                        let result = call_function(vm, mm, &[vb, vb])?;
+                        vm.stack[base + a] = result.first().copied().unwrap_or(TValue::nil());
+                    } else {
+                        return Err(LuaError::Runtime(format!(
+                            "attempt to get length of a {} value",
+                            selune_core::object::lua_type_name(vb, &vm.gc)
+                        )));
+                    }
                 }
             }
             OpCode::Concat => {
@@ -437,35 +530,47 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         vm.stack[base + a] = result;
                     }
                     arith::ArithResult::NeedMetamethod => {
-                        // Find first non-string/non-number value and try __concat
+                        // PUC Lua concat semantics: process pairwise from end.
+                        // At each step, try to coalesce consecutive string/number
+                        // values at the end, then apply metamethod for the boundary.
                         let mm_name = vm.mm_names.as_ref().unwrap().concat;
-                        // Binary fold from left: ((a .. b) .. c) .. d
-                        let mut accum = values[0];
-                        for &val in &values[1..] {
-                            // Try raw concat of pair first
-                            match arith::lua_concat(&[accum, val], &vm.gc, &mut vm.strings) {
+                        let mut top = values.len(); // exclusive upper bound
+                        while top > 1 {
+                            // Try to concat values[top-2] and values[top-1] as raw
+                            let left = values[top - 2];
+                            let right = values[top - 1];
+                            match arith::lua_concat(&[left, right], &vm.gc, &mut vm.strings) {
                                 arith::ArithResult::Ok(result) => {
-                                    accum = result;
+                                    // Coalesce: replace values[top-2] with result, shrink
+                                    values[top - 2] = result;
+                                    top -= 1;
                                 }
                                 _ => {
-                                    // Try metamethod on left operand, then right
-                                    let mm = metamethod::get_metamethod(accum, mm_name, &vm.gc)
+                                    // Need metamethod
+                                    let mm = metamethod::get_metamethod(left, mm_name, &vm.gc)
                                         .or_else(|| {
-                                            metamethod::get_metamethod(val, mm_name, &vm.gc)
+                                            metamethod::get_metamethod(right, mm_name, &vm.gc)
                                         });
                                     if let Some(mm_func) = mm {
-                                        let result = call_function(vm, mm_func, &[accum, val])?;
-                                        accum = result.first().copied().unwrap_or(TValue::nil());
+                                        let result = call_function(vm, mm_func, &[left, right])?;
+                                        values[top - 2] = result.first().copied().unwrap_or(TValue::nil());
+                                        top -= 1;
                                     } else {
+                                        // Error: find the non-concatenable value
+                                        let bad = if coerce::to_string_for_concat(left, &vm.gc, &mut vm.strings).is_none() {
+                                            left
+                                        } else {
+                                            right
+                                        };
                                         return Err(LuaError::Runtime(format!(
                                             "attempt to concatenate a {} value",
-                                            selune_core::object::lua_type_name(accum, &vm.gc)
+                                            selune_core::object::lua_type_name(bad, &vm.gc)
                                         )));
                                     }
                                 }
                             }
                         }
-                        vm.stack[base + a] = accum;
+                        vm.stack[base + a] = values[0];
                     }
                     arith::ArithResult::Error(e) => return Err(e),
                 }
@@ -728,9 +833,13 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 let b = inst.b() as usize;
                 let k = inst.k();
                 let vb = vm.stack[base + b];
-                if vb.is_truthy() != k {
-                    vm.stack[base + a] = vb;
+                // Lua 5.4: if (l_isfalse(rb) != k) then pc++ else R[A] := R[B]
+                if vb.is_truthy() == k {
+                    // condition failed → skip next instruction
                     vm.call_stack[ci_idx].pc += 1;
+                } else {
+                    // condition passed → set R[A] = R[B]
+                    vm.stack[base + a] = vb;
                 }
             }
 
@@ -1135,10 +1244,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                             vm.stack_top = result_base + all.len();
                                         }
                                     }
-                                    Err(handler_err) => {
-                                        // Handler itself errored
-                                        let handler_err_val =
-                                            handler_err.to_tvalue(&mut vm.strings);
+                                    Err(_handler_err) => {
+                                        // Handler itself errored — PUC Lua returns fixed message
+                                        let msg_sid = vm.strings.intern(b"error in error handling");
+                                        let handler_err_val = TValue::from_string_id(msg_sid);
                                         let all = [TValue::from_bool(false), handler_err_val];
                                         let result_count = if num_results < 0 {
                                             all.len()
@@ -1157,6 +1266,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             }
                         }
                     } else if vm.table_sort_idx == Some(native_idx)
+                        || vm.table_move_idx == Some(native_idx)
                         || vm.string_gsub_idx == Some(native_idx)
                         || vm.coro_resume_idx == Some(native_idx)
                         || vm.coro_yield_idx == Some(native_idx)
@@ -1171,6 +1281,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.error_idx == Some(native_idx)
                         || vm.debug_getupvalue_idx == Some(native_idx)
                         || vm.debug_setupvalue_idx == Some(native_idx)
+                        || vm.debug_getinfo_idx == Some(native_idx)
+                        || vm.coro_running_idx == Some(native_idx)
+                        || vm.string_format_idx == Some(native_idx)
+                        || vm.string_dump_idx == Some(native_idx)
                     {
                         // Redirect through call_function for full VM access
                         let args: Vec<TValue> =
@@ -1194,11 +1308,14 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let args: Vec<TValue> =
                             (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
-                        let native_fn = vm.gc.get_native(native_idx).func;
+                        let native_ref = vm.gc.get_native(native_idx);
+                        let native_fn = native_ref.func;
+                        let native_upvalue = native_ref.upvalue;
                         let mut ctx = NativeContext {
                             args: &args,
                             gc: &mut vm.gc,
                             strings: &mut vm.strings,
+                            upvalue: native_upvalue,
                         };
                         let results = native_fn(&mut ctx).map_err(map_native_error)?;
 
@@ -1332,6 +1449,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         (0..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                     let results = if vm.table_sort_idx == Some(native_idx)
+                        || vm.table_move_idx == Some(native_idx)
                         || vm.string_gsub_idx == Some(native_idx)
                         || vm.pcall_idx == Some(native_idx)
                         || vm.xpcall_idx == Some(native_idx)
@@ -1348,14 +1466,20 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.error_idx == Some(native_idx)
                         || vm.debug_getupvalue_idx == Some(native_idx)
                         || vm.debug_setupvalue_idx == Some(native_idx)
+                        || vm.debug_getinfo_idx == Some(native_idx)
+                        || vm.coro_running_idx == Some(native_idx)
+                        || vm.string_format_idx == Some(native_idx)
                     {
                         call_function(vm, func_val, &args)?
                     } else {
-                        let native_fn = vm.gc.get_native(native_idx).func;
+                        let native_ref = vm.gc.get_native(native_idx);
+                        let native_fn = native_ref.func;
+                        let native_upvalue = native_ref.upvalue;
                         let mut ctx = NativeContext {
                             args: &args,
                             gc: &mut vm.gc,
                             strings: &mut vm.strings,
+                            upvalue: native_upvalue,
                         };
                         native_fn(&mut ctx).map_err(map_native_error)?
                     };
@@ -1366,25 +1490,88 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     }
                     return_from_call(vm, &results)?;
                 } else {
-                    // Try __call metamethod for TailCall
+                    // Try __call metamethod for TailCall — resolve iteratively
                     let mm_name = vm.mm_names.as_ref().unwrap().call;
-                    if let Some(mm) = metamethod::get_metamethod(func_val, mm_name, &vm.gc) {
-                        let mut mm_args = vec![func_val];
-                        for i in 0..num_args {
-                            mm_args.push(vm.stack[base + a + 1 + i]);
+                    let mut current = func_val;
+                    let mut extra_self_args: Vec<TValue> = Vec::new();
+                    loop {
+                        if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
+                            extra_self_args.push(current);
+                            current = mm;
+                            if current.as_closure_idx().is_some() || current.as_native_idx().is_some() {
+                                break;
+                            }
+                        } else {
+                            return Err(LuaError::Runtime(format!(
+                                "attempt to call a {} value",
+                                selune_core::object::lua_type_name(current, &vm.gc)
+                            )));
                         }
-                        let results = call_function(vm, mm, &mm_args)?;
+                    }
+                    // Build args: all the extra self args (in order) + original args
+                    let mut mm_args = extra_self_args;
+                    for i in 0..num_args {
+                        mm_args.push(vm.stack[base + a + 1 + i]);
+                    }
+                    if let Some(closure_idx) = current.as_closure_idx() {
+                        // Can do a real tail call with the resolved closure
+                        let closure = vm.gc.get_closure(closure_idx);
+                        let child_proto_idx = closure.proto_idx;
+                        let child_proto = &vm.protos[child_proto_idx];
+                        let num_params = child_proto.num_params as usize;
+                        let is_vararg = child_proto.is_vararg;
+                        let max_stack = child_proto.max_stack_size as usize;
+                        let mm_num_args = mm_args.len();
+
+                        vm.close_upvalues(base);
+                        let func_stack_pos = vm.call_stack[ci_idx].func_stack_idx;
+                        let new_base = func_stack_pos + 1;
+
+                        vm.stack[func_stack_pos] = current;
+                        for i in 0..mm_num_args {
+                            vm.stack[new_base + i] = mm_args[i];
+                        }
+
+                        if is_vararg {
+                            let actual_base = new_base + mm_num_args;
+                            vm.ensure_stack(actual_base, max_stack + 1);
+                            for i in 0..num_params.min(mm_num_args) {
+                                vm.stack[actual_base + i] = vm.stack[new_base + i];
+                            }
+                            for i in mm_num_args..num_params {
+                                vm.stack[actual_base + i] = TValue::nil();
+                            }
+                            vm.stack_top = actual_base + max_stack;
+                            let ci = &mut vm.call_stack[ci_idx];
+                            ci.base = actual_base;
+                            ci.pc = 0;
+                            ci.proto_idx = child_proto_idx;
+                            ci.closure_idx = Some(closure_idx);
+                            ci.func_stack_idx = func_stack_pos;
+                            ci.vararg_base = Some(new_base);
+                        } else {
+                            vm.ensure_stack(new_base, max_stack + 1);
+                            for i in mm_num_args..num_params {
+                                vm.stack[new_base + i] = TValue::nil();
+                            }
+                            vm.stack_top = new_base + max_stack;
+                            let ci = &mut vm.call_stack[ci_idx];
+                            ci.base = new_base;
+                            ci.pc = 0;
+                            ci.proto_idx = child_proto_idx;
+                            ci.closure_idx = Some(closure_idx);
+                            ci.func_stack_idx = func_stack_pos;
+                            ci.vararg_base = None;
+                        }
+                    } else {
+                        // Native — call it normally and return
+                        let results = call_function_resolved(vm, current, &mm_args)?;
 
                         vm.close_upvalues(base);
                         if vm.call_stack.len() <= entry_depth {
                             return Ok(results);
                         }
                         return_from_call(vm, &results)?;
-                    } else {
-                        return Err(LuaError::Runtime(format!(
-                            "attempt to call a {} value",
-                            selune_core::object::lua_type_name(func_val, &vm.gc)
-                        )));
                     }
                 }
             }
@@ -1759,91 +1946,121 @@ fn unwind_tbc(vm: &mut Vm, target_depth: usize, error_val: Option<TValue>) {
     }
 }
 
+/// Maximum number of __index/__newindex chain steps before erroring (matches PUC Lua).
+const MAXTAGLOOP: usize = 2000;
+
 /// Table index with __index metamethod support.
 /// Handles: tables (with fallback to __index), and non-table values with __index.
+/// Iterative implementation with MAXTAGLOOP guard to prevent infinite loops.
 fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, LuaError> {
-    if let Some(table_idx) = table_val.as_table_idx() {
-        // Raw get first
-        let result = vm.gc.get_table(table_idx).raw_get(key);
-        if !result.is_nil() {
-            return Ok(result);
-        }
-        // Check __index metamethod
-        let mm_name = vm.mm_names.as_ref().unwrap().index;
-        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
-            if mm.as_table_idx().is_some() {
-                // __index is a table: recurse
-                return table_index(vm, mm, key);
-            }
-            // __index is a function: call with (table, key)
-            let results = call_function(vm, mm, &[table_val, key])?;
-            Ok(results.first().copied().unwrap_or(TValue::nil()))
-        } else {
-            Ok(TValue::nil())
-        }
-    } else {
-        // Non-table: check for __index metamethod (valid for userdata)
-        let mm_name = vm.mm_names.as_ref().unwrap().index;
-        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
-            if let Some(mm_table_idx) = mm.as_table_idx() {
-                // __index is a table: look up the key in it
-                let result = vm.gc.get_table(mm_table_idx).raw_get(key);
+    let mut current = table_val;
+    for _ in 0..MAXTAGLOOP {
+        if let Some(table_idx) = current.as_table_idx() {
+            // Raw get first
+            let result = vm.gc.table_raw_get(table_idx, key);
+            if !result.is_nil() {
                 return Ok(result);
             }
-            // __index is a function: call with (object, key)
-            let results = call_function(vm, mm, &[table_val, key])?;
-            Ok(results.first().copied().unwrap_or(TValue::nil()))
+            // Check __index metamethod
+            let mm_name = vm.mm_names.as_ref().unwrap().index;
+            if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
+                if mm.as_table_idx().is_some() || mm.as_userdata_idx().is_some() {
+                    // __index is a table (or userdata): continue chain
+                    current = mm;
+                    continue;
+                }
+                // __index is a function: call with (table, key)
+                let results = call_function(vm, mm, &[current, key])?;
+                return Ok(results.first().copied().unwrap_or(TValue::nil()));
+            } else {
+                return Ok(TValue::nil());
+            }
         } else {
-            Err(LuaError::Runtime(format!(
-                "attempt to index a {} value",
-                selune_core::object::lua_type_name(table_val, &vm.gc)
-            )))
+            // Non-table: check for __index metamethod (valid for userdata, numbers, etc.)
+            let mm_name = vm.mm_names.as_ref().unwrap().index;
+            if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
+                if mm.as_table_idx().is_some() || mm.as_userdata_idx().is_some() {
+                    // __index is a table (or userdata): continue chain
+                    current = mm;
+                    continue;
+                }
+                // __index is a function: call with (object, key)
+                let results = call_function(vm, mm, &[current, key])?;
+                return Ok(results.first().copied().unwrap_or(TValue::nil()));
+            } else {
+                return Err(LuaError::Runtime(format!(
+                    "attempt to index a {} value",
+                    selune_core::object::lua_type_name(current, &vm.gc)
+                )));
+            }
         }
     }
+    Err(LuaError::Runtime(
+        "'__index' chain too long; possible loop".to_string(),
+    ))
 }
 
 /// Table newindex with __newindex metamethod support.
+/// Iterative implementation with MAXTAGLOOP guard to prevent infinite loops.
 fn table_newindex(
     vm: &mut Vm,
     table_val: TValue,
     key: TValue,
     val: TValue,
 ) -> Result<(), LuaError> {
-    if let Some(table_idx) = table_val.as_table_idx() {
-        // Check if key already exists (raw)
-        let existing = vm.gc.get_table(table_idx).raw_get(key);
-        if !existing.is_nil() {
-            // Key exists, just set it (no metamethod)
-            vm.gc
-                .get_table_mut(table_idx)
-                .raw_set(key, val)
-                .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
-            return Ok(());
-        }
-        // Key doesn't exist: check __newindex metamethod
-        let mm_name = vm.mm_names.as_ref().unwrap().newindex;
-        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
-            if mm.as_table_idx().is_some() {
-                // __newindex is a table: recurse
-                return table_newindex(vm, mm, key, val);
+    let mut current = table_val;
+    for _ in 0..MAXTAGLOOP {
+        if let Some(table_idx) = current.as_table_idx() {
+            // Check if key already exists (raw)
+            let existing = vm.gc.table_raw_get(table_idx, key);
+            if !existing.is_nil() {
+                // Key exists, just set it (no metamethod)
+                vm.gc
+                    .table_raw_set(table_idx, key, val)
+                    .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+                return Ok(());
             }
-            // __newindex is a function: call with (table, key, value)
-            call_function(vm, mm, &[table_val, key, val])?;
-            Ok(())
+            // Key doesn't exist: check __newindex metamethod
+            let mm_name = vm.mm_names.as_ref().unwrap().newindex;
+            if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
+                if mm.as_table_idx().is_some() {
+                    // __newindex is a table: continue chain
+                    current = mm;
+                    continue;
+                }
+                // __newindex is a function: call with (table, key, value)
+                call_function(vm, mm, &[current, key, val])?;
+                return Ok(());
+            } else {
+                // No __newindex: just raw set
+                vm.gc
+                    .table_raw_set(table_idx, key, val)
+                    .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
+                return Ok(());
+            }
         } else {
-            // No __newindex: just raw set
-            vm.gc
-                .get_table_mut(table_idx)
-                .raw_set(key, val)
-                .map_err(|e: &str| LuaError::Runtime(e.to_string()))?;
-            Ok(())
+            // Non-table: check __newindex metamethod
+            let mm_name = vm.mm_names.as_ref().unwrap().newindex;
+            if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
+                if mm.as_table_idx().is_some() {
+                    // __newindex is a table: continue chain
+                    current = mm;
+                    continue;
+                }
+                // __newindex is a function: call with (object, key, value)
+                call_function(vm, mm, &[current, key, val])?;
+                return Ok(());
+            } else {
+                return Err(LuaError::Runtime(format!(
+                    "attempt to index a {} value",
+                    selune_core::object::lua_type_name(current, &vm.gc)
+                )));
+            }
         }
-    } else {
-        Err(LuaError::Runtime(format!(
-            "attempt to index a {} value",
-            selune_core::object::lua_type_name(table_val, &vm.gc)
-        )))
     }
+    Err(LuaError::Runtime(
+        "'__newindex' chain too long; possible loop".to_string(),
+    ))
 }
 
 /// Return from a function call, placing results in the caller's frame.
@@ -1922,15 +2139,59 @@ fn do_table_sort(
     table_idx: GcIdx<selune_core::table::Table>,
     comp: Option<TValue>,
 ) -> Result<(), LuaError> {
-    let len = vm.gc.get_table(table_idx).length() as usize;
+    // Get length respecting __len metamethod
+    let len = {
+        let table_val = TValue::from_table(table_idx);
+        let mm_name = vm.mm_names.as_ref().unwrap().len;
+        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
+            let result = call_function(vm, mm, &[table_val])?;
+            let len_val = result.first().copied().unwrap_or(TValue::nil());
+            if let Some(i) = len_val.as_full_integer(&vm.gc) {
+                i
+            } else if let Some(f) = len_val.as_float() {
+                f as i64
+            } else {
+                return Err(LuaError::Runtime(
+                    "object length is not an integer".to_string(),
+                ));
+            }
+        } else {
+            vm.gc.get_table(table_idx).length()
+        }
+    };
+
     if len <= 1 {
         return Ok(());
     }
+
+    // Check for array too big (PUC Lua limit: INT_MAX - 1)
+    const TAB_MAXN: i64 = (i32::MAX as i64) - 1;
+    if len > TAB_MAXN {
+        return Err(LuaError::Runtime(
+            "array too big".to_string(),
+        ));
+    }
+
+    let len = len as usize;
 
     // Read all values into a Vec
     let mut values: Vec<TValue> = (1..=len)
         .map(|i| vm.gc.get_table(table_idx).raw_geti(i as i64))
         .collect();
+
+    // Check for invalid order function before sorting:
+    // PUC Lua detects this when comp(a, a) returns true (non-strict order)
+    if let Some(comp_fn) = comp {
+        if !values.is_empty() {
+            let test_val = values[0];
+            let result = call_function(vm, comp_fn, &[test_val, test_val])?;
+            if result.first().map(|v| v.is_truthy()).unwrap_or(false) {
+                return Err(LuaError::Runtime(
+                    "invalid order function for sorting".to_string(),
+                ));
+            }
+        }
+    }
 
     // Insertion sort (stable, allows Lua callbacks between comparisons)
     for i in 1..values.len() {
@@ -1941,8 +2202,8 @@ fn do_table_sort(
                 let results = call_function(vm, comp_fn, &[key, values[j - 1]])?;
                 results.first().map(|v| v.is_truthy()).unwrap_or(false)
             } else {
-                default_sort_lt(key, values[j - 1], &vm.gc, &vm.strings)
-                    .map_err(LuaError::Runtime)?
+                // Use full < operator with metamethod support
+                sort_default_lt(vm, key, values[j - 1])?
             };
 
             if should_swap {
@@ -1963,24 +2224,28 @@ fn do_table_sort(
     Ok(())
 }
 
-fn default_sort_lt(
-    a: TValue,
-    b: TValue,
-    gc: &selune_core::gc::GcHeap,
-    strings: &selune_core::string::StringInterner,
-) -> Result<bool, String> {
-    if let (Some(ai), Some(bi)) = (a.as_full_integer(gc), b.as_full_integer(gc)) {
-        return Ok(ai < bi);
+/// Handle `table.move(a1, f, e, t [, a2])` — copy elements from a1[f..e] to a2[t..].
+// do_table_move is defined later in this file (near do_debug_getinfo)
+
+/// Default < comparison for table.sort, supporting metamethods.
+fn sort_default_lt(vm: &mut Vm, va: TValue, vb: TValue) -> Result<bool, LuaError> {
+    match compare::lua_lt(va, vb, &vm.gc, &vm.strings) {
+        compare::CompareResult::Ok(v) => Ok(v),
+        compare::CompareResult::NeedMetamethod => {
+            let mm_name = vm.mm_names.as_ref().unwrap().lt;
+            if let Some(mm) = metamethod::get_metamethod(va, mm_name, &vm.gc)
+                .or_else(|| metamethod::get_metamethod(vb, mm_name, &vm.gc))
+            {
+                let res = call_function(vm, mm, &[va, vb])?;
+                Ok(!res.first().copied().unwrap_or(TValue::nil()).is_falsy())
+            } else {
+                Err(LuaError::Runtime(format!(
+                    "attempt to compare two {} values",
+                    selune_core::object::lua_type_name(va, &vm.gc)
+                )))
+            }
+        }
     }
-    if let (Some(af), Some(bf)) = (a.as_number(gc), b.as_number(gc)) {
-        return Ok(af < bf);
-    }
-    if let (Some(sa), Some(sb)) = (a.as_string_id(), b.as_string_id()) {
-        let ba = strings.get_bytes(sa);
-        let bb = strings.get_bytes(sb);
-        return Ok(ba < bb);
-    }
-    Err("attempt to compare mixed types".to_string())
 }
 
 /// string.gsub implementation — needs full VM access for function replacement.
@@ -1996,52 +2261,51 @@ fn do_string_gsub(
     let max_replacements = max_n.unwrap_or(i64::MAX);
     let mut result = Vec::new();
     let mut count = 0i64;
-    let mut pos = 0usize;
+    let mut src = 0usize;
+    // Track the end of the last successful replacement to prevent repeated empty matches
+    // at the same position (Lua 5.3.3+ semantics).
+    let mut lastmatch: Option<usize> = None;
+    let anchor = !pat.is_empty() && pat[0] == b'^';
+    let match_pat = if anchor { &pat[1..] } else { pat };
 
-    while count < max_replacements {
-        let ms = match pattern::pattern_find(subject, pat, pos) {
-            Some(ms) => ms,
-            None => break,
+    loop {
+        if count >= max_replacements || src > subject.len() {
+            break;
+        }
+
+        // Try to match at position `src`.
+        let ms = {
+            let mut matcher = pattern::PatternMatcher::new(subject, match_pat);
+            matcher.try_match_at(src)
         };
 
-        let (match_start, match_end) = ms.captures[0];
+        match ms {
+            Err(e) => return Err(LuaError::Runtime(e)),
+            Ok(Some(ms)) => {
+                let (match_start, match_end) = ms.captures[0];
+                debug_assert_eq!(match_start, src);
 
-        // Append text before match
-        result.extend_from_slice(&subject[pos..match_start]);
-
-        // Compute replacement
-        let replacement = if let Some(repl_sid) = repl.as_string_id() {
-            // String replacement with %n references
-            let repl_bytes = vm.strings.get_bytes(repl_sid).to_vec();
-            pattern::expand_replacement(&repl_bytes, &ms, subject)
-        } else if let Some(repl_table_idx) = repl.as_table_idx() {
-            // Table replacement: look up first capture (or full match)
-            let key = if ms.captures.len() > 1 {
-                let (cs, ce) = ms.captures[1];
-                if ce == CAP_POSITION {
-                    TValue::from_full_integer((cs + 1) as i64, &mut vm.gc)
-                } else {
-                    let slice = &subject[cs..ce];
-                    let sid = vm.strings.intern_or_create(slice);
-                    TValue::from_string_id(sid)
+                // Check for repeated empty match at the same position.
+                if match_end == match_start && lastmatch == Some(match_end) {
+                    // Skip this empty match; push current char and advance.
+                    if src < subject.len() {
+                        result.push(subject[src]);
+                        src += 1;
+                    } else {
+                        break;
+                    }
+                    if anchor { break; }
+                    continue;
                 }
-            } else {
-                let slice = &subject[match_start..match_end];
-                let sid = vm.strings.intern_or_create(slice);
-                TValue::from_string_id(sid)
-            };
-            let val = vm.gc.get_table(repl_table_idx).raw_get(key);
-            if val.is_falsy() {
-                subject[match_start..match_end].to_vec()
-            } else {
-                gsub_value_to_string(val, &vm.gc, &vm.strings)
-            }
-        } else if repl.is_function() {
-            // Function replacement: call with captures or full match
-            let args: Vec<TValue> = if ms.captures.len() > 1 {
-                (1..ms.captures.len())
-                    .map(|i| {
-                        let (cs, ce) = ms.captures[i];
+
+                // Compute replacement
+                let replacement = if let Some(repl_sid) = repl.as_string_id() {
+                    let repl_bytes = vm.strings.get_bytes(repl_sid).to_vec();
+                    pattern::expand_replacement(&repl_bytes, &ms, subject)
+                        .map_err(|e| LuaError::Runtime(e))?
+                } else if let Some(_repl_table_idx) = repl.as_table_idx() {
+                    let key = if ms.captures.len() > 1 {
+                        let (cs, ce) = ms.captures[1];
                         if ce == CAP_POSITION {
                             TValue::from_full_integer((cs + 1) as i64, &mut vm.gc)
                         } else {
@@ -2049,43 +2313,69 @@ fn do_string_gsub(
                             let sid = vm.strings.intern_or_create(slice);
                             TValue::from_string_id(sid)
                         }
-                    })
-                    .collect()
-            } else {
-                let slice = &subject[match_start..match_end];
-                let sid = vm.strings.intern_or_create(slice);
-                vec![TValue::from_string_id(sid)]
-            };
-            let results = call_function(vm, repl, &args)?;
-            let val = results.first().copied().unwrap_or(TValue::nil());
-            if val.is_falsy() {
-                subject[match_start..match_end].to_vec()
-            } else {
-                gsub_value_to_string(val, &vm.gc, &vm.strings)
-            }
-        } else {
-            return Err(LuaError::Runtime(
-                "bad argument #3 to 'gsub' (string/function/table expected)".to_string(),
-            ));
-        };
+                    } else {
+                        let slice = &subject[match_start..match_end];
+                        let sid = vm.strings.intern_or_create(slice);
+                        TValue::from_string_id(sid)
+                    };
+                    let val = table_index(vm, repl, key)?;
+                    if val.is_falsy() {
+                        subject[match_start..match_end].to_vec()
+                    } else {
+                        gsub_value_to_string(val, &vm.gc, &vm.strings)?
+                    }
+                } else if repl.is_function() {
+                    let args: Vec<TValue> = if ms.captures.len() > 1 {
+                        (1..ms.captures.len())
+                            .map(|i| {
+                                let (cs, ce) = ms.captures[i];
+                                if ce == CAP_POSITION {
+                                    TValue::from_full_integer((cs + 1) as i64, &mut vm.gc)
+                                } else {
+                                    let slice = &subject[cs..ce];
+                                    let sid = vm.strings.intern_or_create(slice);
+                                    TValue::from_string_id(sid)
+                                }
+                            })
+                            .collect()
+                    } else {
+                        let slice = &subject[match_start..match_end];
+                        let sid = vm.strings.intern_or_create(slice);
+                        vec![TValue::from_string_id(sid)]
+                    };
+                    let results = call_function(vm, repl, &args)?;
+                    let val = results.first().copied().unwrap_or(TValue::nil());
+                    if val.is_falsy() {
+                        subject[match_start..match_end].to_vec()
+                    } else {
+                        gsub_value_to_string(val, &vm.gc, &vm.strings)?
+                    }
+                } else {
+                    return Err(LuaError::Runtime(
+                        "bad argument #3 to 'gsub' (string/function/table expected)".to_string(),
+                    ));
+                };
 
-        result.extend_from_slice(&replacement);
-        count += 1;
-
-        if match_end == match_start {
-            if match_end < subject.len() {
-                result.push(subject[match_end]);
-                pos = match_end + 1;
-            } else {
-                break;
+                result.extend_from_slice(&replacement);
+                count += 1;
+                src = match_end;
+                lastmatch = Some(match_end);
             }
-        } else {
-            pos = match_end;
+            Ok(None) => {
+                // No match at src. Push current character and advance.
+                if src < subject.len() {
+                    result.push(subject[src]);
+                    src += 1;
+                } else {
+                    break;
+                }
+            }
         }
+        if anchor { break; }
     }
 
     // Append remaining text
-    result.extend_from_slice(&subject[pos..]);
+    result.extend_from_slice(&subject[src..]);
 
     Ok((result, count))
 }
@@ -2094,23 +2384,18 @@ fn gsub_value_to_string(
     val: TValue,
     gc: &selune_core::gc::GcHeap,
     strings: &selune_core::string::StringInterner,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, LuaError> {
     if let Some(sid) = val.as_string_id() {
-        strings.get_bytes(sid).to_vec()
+        Ok(strings.get_bytes(sid).to_vec())
     } else if let Some(i) = val.as_full_integer(gc) {
-        format!("{}", i).into_bytes()
+        Ok(format!("{}", i).into_bytes())
     } else if let Some(f) = val.as_float() {
-        format!("{}", f).into_bytes()
-    } else if val.is_nil() {
-        b"nil".to_vec()
-    } else if let Some(b) = val.as_bool() {
-        if b {
-            b"true".to_vec()
-        } else {
-            b"false".to_vec()
-        }
+        Ok(format!("{}", f).into_bytes())
     } else {
-        b"?".to_vec()
+        let type_name = selune_core::object::lua_type_name(val, gc);
+        Err(LuaError::Runtime(format!(
+            "invalid replacement value (a {})", type_name
+        )))
     }
 }
 
@@ -2493,6 +2778,39 @@ fn do_coroutine_wrap_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>,
 }
 
 pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    // Resolve __call metamethods iteratively to avoid Rust stack overflow
+    let mut current_func = func;
+    let mut owned_args: Option<Vec<TValue>> = None;
+    loop {
+        let effective_args: &[TValue] = match &owned_args {
+            Some(v) => v.as_slice(),
+            None => args,
+        };
+        if let Some(_) = current_func.as_closure_idx() {
+            return call_function_resolved(vm, current_func, effective_args);
+        } else if let Some(_) = current_func.as_native_idx() {
+            return call_function_resolved(vm, current_func, effective_args);
+        } else {
+            // Try __call metamethod
+            let mm_name = vm.mm_names.as_ref().unwrap().call;
+            if let Some(mm) = crate::metamethod::get_metamethod(current_func, mm_name, &vm.gc) {
+                // Prepend the original value as first arg
+                let mut new_args = vec![current_func];
+                new_args.extend_from_slice(effective_args);
+                current_func = mm;
+                owned_args = Some(new_args);
+                // Continue loop to resolve next __call level
+            } else {
+                return Err(LuaError::Runtime(format!(
+                    "attempt to call a {} value",
+                    selune_core::object::lua_type_name(current_func, &vm.gc)
+                )));
+            }
+        }
+    }
+}
+
+fn call_function_resolved(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
     if let Some(closure_idx) = func.as_closure_idx() {
         // Lua closure call
         let closure = vm.gc.get_closure(closure_idx);
@@ -2647,8 +2965,9 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
                             all.extend(handler_results);
                             Ok(all)
                         }
-                        Err(handler_err) => {
-                            let handler_err_val = handler_err.to_tvalue(&mut vm.strings);
+                        Err(_handler_err) => {
+                            let msg_sid = vm.strings.intern(b"error in error handling");
+                            let handler_err_val = TValue::from_string_id(msg_sid);
                             Ok(vec![TValue::from_bool(false), handler_err_val])
                         }
                     }
@@ -2663,6 +2982,8 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             let comp = args.get(1).copied().filter(|v| !v.is_nil());
             do_table_sort(vm, table_idx, comp)?;
             Ok(vec![])
+        } else if vm.table_move_idx == Some(native_idx) {
+            do_table_move(vm, args)
         } else if vm.string_gsub_idx == Some(native_idx) {
             // string.gsub(s, pattern, repl [, n])
             let s_val = args.first().copied().unwrap_or(TValue::nil());
@@ -2732,31 +3053,34 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             do_debug_getupvalue(vm, args)
         } else if vm.debug_setupvalue_idx == Some(native_idx) {
             do_debug_setupvalue(vm, args)
+        } else if vm.debug_getinfo_idx == Some(native_idx) {
+            do_debug_getinfo(vm, args)
+        } else if vm.coro_running_idx == Some(native_idx) {
+            do_coro_running(vm)
+        } else if vm.string_format_idx == Some(native_idx) {
+            do_string_format(vm, args)
+        } else if vm.string_dump_idx == Some(native_idx) {
+            do_string_dump(vm, args)
         } else {
             // Normal native function call
-            let native_fn = vm.gc.get_native(native_idx).func;
+            let native_ref = vm.gc.get_native(native_idx);
+            let native_fn = native_ref.func;
+            let native_upvalue = native_ref.upvalue;
             let args_vec = args.to_vec();
             let mut ctx = NativeContext {
                 args: &args_vec,
                 gc: &mut vm.gc,
                 strings: &mut vm.strings,
+                upvalue: native_upvalue,
             };
             native_fn(&mut ctx).map_err(map_native_error)
         }
     } else {
-        // Try __call metamethod
-        let mm_name = vm.mm_names.as_ref().unwrap().call;
-        if let Some(mm) = crate::metamethod::get_metamethod(func, mm_name, &vm.gc) {
-            // Prepend the original value as first arg
-            let mut new_args = vec![func];
-            new_args.extend_from_slice(args);
-            call_function(vm, mm, &new_args)
-        } else {
-            Err(LuaError::Runtime(format!(
-                "attempt to call a {} value",
-                selune_core::object::lua_type_name(func, &vm.gc)
-            )))
-        }
+        // __call should have been resolved by call_function wrapper
+        Err(LuaError::Runtime(format!(
+            "attempt to call a {} value",
+            selune_core::object::lua_type_name(func, &vm.gc)
+        )))
     }
 }
 
@@ -2840,13 +3164,44 @@ fn do_collectgarbage(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
 
 /// Handle `tostring(val)` with full VM access for __tostring metamethod.
 fn do_tostring(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
-    let val = args.first().copied().unwrap_or(TValue::nil());
+    if args.is_empty() {
+        return Err(LuaError::Runtime(
+            "bad argument #1 to 'tostring' (value expected)".to_string(),
+        ));
+    }
+    let val = args[0];
     // Check for __tostring metamethod
     let mm_name = vm.mm_names.as_ref().unwrap().tostring;
     if let Some(mm) = crate::metamethod::get_metamethod(val, mm_name, &vm.gc) {
         let results = call_function(vm, mm, &[val])?;
-        Ok(vec![results.first().copied().unwrap_or(TValue::nil())])
+        let result = results.first().copied().unwrap_or(TValue::nil());
+        // Lua 5.4: __tostring must return a string
+        if !result.is_string() {
+            return Err(LuaError::Runtime(
+                "'__tostring' must return a string".to_string(),
+            ));
+        }
+        Ok(vec![result])
     } else {
+        // Check for __name in metatable (type name override)
+        let mt = if let Some(tbl_idx) = val.as_table_idx() {
+            vm.gc.get_table(tbl_idx).metatable
+        } else if let Some(ud_idx) = val.as_userdata_idx() {
+            vm.gc.get_userdata(ud_idx).metatable
+        } else {
+            None
+        };
+        if let Some(mt_idx) = mt {
+            let name_key = vm.strings.intern(b"__name");
+            let name_val = vm.gc.get_table(mt_idx).raw_get_str(name_key);
+            if let Some(name_sid) = name_val.as_string_id() {
+                let name_bytes = vm.strings.get_bytes(name_sid).to_vec();
+                let ptr = val.gc_index().unwrap_or(0);
+                let s = format!("{}: 0x{:x}", String::from_utf8_lossy(&name_bytes), ptr);
+                let sid = vm.strings.intern_or_create(s.as_bytes());
+                return Ok(vec![TValue::from_string_id(sid)]);
+            }
+        }
         // Default tostring behavior
         let s = crate::vm::format_value(val, &vm.gc, &vm.strings);
         let sid = vm.strings.intern_or_create(s.as_bytes());
@@ -2863,14 +3218,12 @@ fn do_load(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
     let mode = args.get(2).copied().unwrap_or(TValue::nil());
     let env = args.get(3).copied();
 
-    // Determine mode (only "t" text mode supported)
-    if let Some(sid) = mode.as_string_id() {
-        let mode_str = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap_or("");
-        if !mode_str.contains('t') {
-            let msg = vm.strings.intern_or_create(b"attempt to load a binary chunk (mode is text only)");
-            return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
-        }
-    }
+    // Parse mode string (default "bt" = both binary and text)
+    let mode_str = if let Some(sid) = mode.as_string_id() {
+        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+    } else {
+        "bt".to_string()
+    };
 
     // Get chunk name
     let name = if let Some(sid) = chunkname.as_string_id() {
@@ -2888,7 +3241,19 @@ fn do_load(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
         // Function reader: call chunk() repeatedly, concatenate results
         let mut parts = Vec::new();
         loop {
-            let result = call_function(vm, chunk, &[])?;
+            let result = match call_function(vm, chunk, &[]) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_val = e.to_tvalue(&mut vm.strings);
+                    let msg_str = if let Some(sid) = err_val.as_string_id() {
+                        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+                    } else {
+                        format!("{:?}", e)
+                    };
+                    let msg = vm.strings.intern_or_create(msg_str.as_bytes());
+                    return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+                }
+            };
             let part = result.first().copied().unwrap_or(TValue::nil());
             if part.is_nil() {
                 break;
@@ -2916,12 +3281,46 @@ fn do_load(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
         return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
     };
 
+    // Check mode against actual source content
+    let is_binary = source.first() == Some(&0x1b); // Lua binary signature starts with \x1b
+    if is_binary && !mode_str.contains('b') {
+        let name_prefix = if name.starts_with('=') || name.starts_with('@') {
+            &name[1..]
+        } else {
+            &name
+        };
+        let msg_str = format!("{}:  attempt to load a binary chunk (mode is '{}')", name_prefix, mode_str);
+        let msg = vm.strings.intern_or_create(msg_str.as_bytes());
+        return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+    }
+    if !is_binary && !mode_str.contains('t') {
+        let name_prefix = if name.starts_with('=') || name.starts_with('@') {
+            &name[1..]
+        } else {
+            &name
+        };
+        let msg_str = format!("{}:  attempt to load a text chunk (mode is '{}')", name_prefix, mode_str);
+        let msg = vm.strings.intern_or_create(msg_str.as_bytes());
+        return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+    }
+
     // Compile
-    match vm.load_chunk(&source, &name, env) {
-        Ok(closure_val) => Ok(vec![closure_val]),
-        Err(err_msg) => {
-            let msg = vm.strings.intern_or_create(err_msg.as_bytes());
-            Ok(vec![TValue::nil(), TValue::from_string_id(msg)])
+    if is_binary {
+        // Try to load binary chunk
+        match vm.load_binary_chunk(&source, &name, env) {
+            Ok(closure_val) => Ok(vec![closure_val]),
+            Err(err_msg) => {
+                let msg = vm.strings.intern_or_create(err_msg.as_bytes());
+                Ok(vec![TValue::nil(), TValue::from_string_id(msg)])
+            }
+        }
+    } else {
+        match vm.load_chunk(&source, &name, env) {
+            Ok(closure_val) => Ok(vec![closure_val]),
+            Err(err_msg) => {
+                let msg = vm.strings.intern_or_create(err_msg.as_bytes());
+                Ok(vec![TValue::nil(), TValue::from_string_id(msg)])
+            }
         }
     }
 }
@@ -3247,6 +3646,526 @@ fn do_debug_setupvalue(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
     } else {
         Ok(vec![TValue::nil()])
     }
+}
+
+/// Handle `debug.getinfo(f [, what])` with full VM access.
+/// Handle `table.move(a1, f, e, t [, a2])` with VM access for metamethods.
+fn do_table_move(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let a1_val = args.first().copied().unwrap_or(TValue::nil());
+    let a1_idx = a1_val.as_table_idx().ok_or_else(|| {
+        LuaError::Runtime("bad argument #1 to 'move' (table expected)".to_string())
+    })?;
+
+    let f = args.get(1).copied().unwrap_or(TValue::nil())
+        .as_full_integer(&vm.gc)
+        .ok_or_else(|| LuaError::Runtime("bad argument #2 to 'move' (number expected)".to_string()))?;
+    let e = args.get(2).copied().unwrap_or(TValue::nil())
+        .as_full_integer(&vm.gc)
+        .ok_or_else(|| LuaError::Runtime("bad argument #3 to 'move' (number expected)".to_string()))?;
+    let t = args.get(3).copied().unwrap_or(TValue::nil())
+        .as_full_integer(&vm.gc)
+        .ok_or_else(|| LuaError::Runtime("bad argument #4 to 'move' (number expected)".to_string()))?;
+
+    let a2_val = if let Some(v) = args.get(4) {
+        if v.is_nil() { a1_val } else { *v }
+    } else {
+        a1_val
+    };
+    let a2_idx = a2_val.as_table_idx().ok_or_else(|| {
+        LuaError::Runtime("bad argument #5 to 'move' (table expected)".to_string())
+    })?;
+
+    if f > e {
+        return Ok(vec![a2_val]);
+    }
+
+    // PUC Lua checks: luaL_argcheck(L, f > 0 || e < LUA_MAXINTEGER + f, 3, "too many elements to move")
+    if f <= 0 && e >= i64::MAX.wrapping_add(f) {
+        return Err(LuaError::Runtime("too many elements to move".to_string()));
+    }
+    let n = (e as i128) - (f as i128) + 1; // number of elements
+    // PUC Lua check: luaL_argcheck(L, t <= LUA_MAXINTEGER - n + 1, 4, "destination wrap around")
+    let max_t = (i64::MAX as i128) - n + 1;
+    if (t as i128) > max_t {
+        return Err(LuaError::Runtime("destination wrap around".to_string()));
+    }
+
+    // Copy elements using metamethod-aware access (table_index/table_newindex)
+    // Forward when non-overlapping or destination before source
+    if t <= f || t > e || a1_idx != a2_idx {
+        // Forward copy
+        let mut i = f;
+        loop {
+            let key = TValue::from_full_integer(i, &mut vm.gc);
+            let v = table_index(vm, a1_val, key)?;
+            let dest_key = TValue::from_full_integer(t + (i - f), &mut vm.gc);
+            table_newindex(vm, a2_val, dest_key, v)?;
+            if i == e { break; }
+            i += 1;
+        }
+    } else {
+        // Backward copy (overlapping, destination after source)
+        let mut i = e;
+        loop {
+            let key = TValue::from_full_integer(i, &mut vm.gc);
+            let v = table_index(vm, a1_val, key)?;
+            let dest_key = TValue::from_full_integer(t + (i - f), &mut vm.gc);
+            table_newindex(vm, a2_val, dest_key, v)?;
+            if i == f { break; }
+            i -= 1;
+        }
+    }
+
+    Ok(vec![a2_val])
+}
+
+fn do_debug_getinfo(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let arg1 = args.first().copied().unwrap_or(TValue::nil());
+    let what_arg = args.get(1).copied().unwrap_or(TValue::nil());
+
+    // Parse the 'what' filter string (default: all common fields)
+    let what_str = if let Some(sid) = what_arg.as_string_id() {
+        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+    } else {
+        "flnSu".to_string()
+    };
+
+    // Determine if arg1 is a level (integer) or a function
+    let tbl = vm.gc.alloc_table(0, 12);
+
+    if let Some(n) = arg1.as_full_integer(&vm.gc) {
+        // Level-based query
+        let level = n as usize;
+        if level == 0 {
+            // Level 0 = getinfo itself (C function)
+            fill_native_info(vm, tbl);
+            return Ok(vec![TValue::from_table(tbl)]);
+        }
+        // call_stack[last] = the Lua frame that called getinfo (level 1)
+        let stack_len = vm.call_stack.len();
+        if level > stack_len {
+            return Ok(vec![TValue::nil()]);
+        }
+        let frame_idx = stack_len - level;
+        let frame = &vm.call_stack[frame_idx];
+
+        if !frame.is_lua {
+            fill_native_info(vm, tbl);
+            return Ok(vec![TValue::from_table(tbl)]);
+        }
+
+        let proto_idx = frame.proto_idx;
+        let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+        let func_val = frame.closure_idx.map(TValue::from_closure);
+
+        fill_lua_info(vm, tbl, proto_idx, Some(pc), func_val, &what_str);
+
+        // 'n' — function name from caller's context
+        if what_str.contains('n') {
+            fill_func_name(vm, tbl, frame_idx);
+        }
+    } else if let Some(cl_idx) = arg1.as_closure_idx() {
+        // Function object query
+        let proto_idx = vm.gc.get_closure(cl_idx).proto_idx;
+        fill_lua_info(vm, tbl, proto_idx, None, Some(arg1), &what_str);
+    } else if arg1.as_native_idx().is_some() {
+        fill_native_info(vm, tbl);
+    } else {
+        return Ok(vec![TValue::nil()]);
+    }
+
+    Ok(vec![TValue::from_table(tbl)])
+}
+
+/// Fill info table for a native (C) function.
+fn fill_native_info(
+    vm: &mut Vm,
+    tbl: selune_core::gc::GcIdx<selune_core::table::Table>,
+) {
+    let what_key = vm.strings.intern(b"what");
+    let what_val = vm.strings.intern_or_create(b"C");
+    vm.gc.get_table_mut(tbl).raw_set_str(what_key, TValue::from_string_id(what_val));
+
+    let source_key = vm.strings.intern(b"source");
+    let source_val = vm.strings.intern_or_create(b"=[C]");
+    vm.gc.get_table_mut(tbl).raw_set_str(source_key, TValue::from_string_id(source_val));
+
+    let short_src_key = vm.strings.intern(b"short_src");
+    let short_src_val = vm.strings.intern_or_create(b"[C]");
+    vm.gc.get_table_mut(tbl).raw_set_str(short_src_key, TValue::from_string_id(short_src_val));
+
+    let currentline_key = vm.strings.intern(b"currentline");
+    vm.gc.get_table_mut(tbl).raw_set_str(currentline_key, TValue::from_integer(-1));
+
+    let linedefined_key = vm.strings.intern(b"linedefined");
+    vm.gc.get_table_mut(tbl).raw_set_str(linedefined_key, TValue::from_integer(-1));
+
+    let lastlinedefined_key = vm.strings.intern(b"lastlinedefined");
+    vm.gc.get_table_mut(tbl).raw_set_str(lastlinedefined_key, TValue::from_integer(-1));
+
+    let nups_key = vm.strings.intern(b"nups");
+    vm.gc.get_table_mut(tbl).raw_set_str(nups_key, TValue::from_integer(0));
+
+    let nparams_key = vm.strings.intern(b"nparams");
+    vm.gc.get_table_mut(tbl).raw_set_str(nparams_key, TValue::from_integer(0));
+
+    let isvararg_key = vm.strings.intern(b"isvararg");
+    vm.gc.get_table_mut(tbl).raw_set_str(isvararg_key, TValue::from_bool(true));
+}
+
+/// Fill info table for a Lua function given its proto_idx.
+fn fill_lua_info(
+    vm: &mut Vm,
+    tbl: selune_core::gc::GcIdx<selune_core::table::Table>,
+    proto_idx: usize,
+    pc: Option<usize>,
+    func_val: Option<TValue>,
+    what: &str,
+) {
+    let what_filter = what.strip_prefix('>').unwrap_or(what);
+
+    // Source info
+    {
+        let proto = &vm.protos[proto_idx];
+
+        let source_key = vm.strings.intern(b"source");
+        let source_sid = proto.source.unwrap_or_else(|| vm.strings.intern_or_create(b"=?"));
+        vm.gc.get_table_mut(tbl).raw_set_str(source_key, TValue::from_string_id(source_sid));
+
+        let source_bytes = vm.strings.get_bytes(source_sid).to_vec();
+        let short_src = make_short_src(&source_bytes);
+        let short_src_key = vm.strings.intern(b"short_src");
+        let short_src_sid = vm.strings.intern_or_create(short_src.as_bytes());
+        vm.gc.get_table_mut(tbl).raw_set_str(short_src_key, TValue::from_string_id(short_src_sid));
+
+        let what_key = vm.strings.intern(b"what");
+        let is_main = proto.linedefined == 0 && proto.lastlinedefined == 0 && proto.is_vararg;
+        let what_val = if is_main {
+            vm.strings.intern_or_create(b"main")
+        } else {
+            vm.strings.intern_or_create(b"Lua")
+        };
+        vm.gc.get_table_mut(tbl).raw_set_str(what_key, TValue::from_string_id(what_val));
+
+        let linedefined_key = vm.strings.intern(b"linedefined");
+        vm.gc.get_table_mut(tbl).raw_set_str(
+            linedefined_key,
+            TValue::from_integer(proto.linedefined as i64),
+        );
+
+        let lastlinedefined_key = vm.strings.intern(b"lastlinedefined");
+        vm.gc.get_table_mut(tbl).raw_set_str(
+            lastlinedefined_key,
+            TValue::from_integer(proto.lastlinedefined as i64),
+        );
+    }
+
+    // Current line
+    {
+        let currentline_key = vm.strings.intern(b"currentline");
+        let current_line = if let Some(pc) = pc {
+            let proto = &vm.protos[proto_idx];
+            proto.get_line(pc) as i64
+        } else {
+            -1
+        };
+        vm.gc.get_table_mut(tbl).raw_set_str(currentline_key, TValue::from_integer(current_line));
+    }
+
+    // Upvalue/param info
+    {
+        let proto = &vm.protos[proto_idx];
+
+        let nups_key = vm.strings.intern(b"nups");
+        vm.gc.get_table_mut(tbl).raw_set_str(
+            nups_key,
+            TValue::from_integer(proto.upvalues.len() as i64),
+        );
+
+        let nparams_key = vm.strings.intern(b"nparams");
+        vm.gc.get_table_mut(tbl).raw_set_str(
+            nparams_key,
+            TValue::from_integer(proto.num_params as i64),
+        );
+
+        let isvararg_key = vm.strings.intern(b"isvararg");
+        vm.gc.get_table_mut(tbl).raw_set_str(isvararg_key, TValue::from_bool(proto.is_vararg));
+    }
+
+    // 'f' — the function itself
+    if what_filter.contains('f') {
+        if let Some(fv) = func_val {
+            let func_key = vm.strings.intern(b"func");
+            vm.gc.get_table_mut(tbl).raw_set_str(func_key, fv);
+        }
+    }
+
+    // 'L' — active lines table
+    if what_filter.contains('L') {
+        let proto = &vm.protos[proto_idx];
+        let activelines_tbl = vm.gc.alloc_table(0, 8);
+        for i in 0..proto.code.len() {
+            let line = proto.get_line(i);
+            if line > 0 {
+                vm.gc.get_table_mut(activelines_tbl)
+                    .raw_seti(line as i64, TValue::from_bool(true));
+            }
+        }
+        let activelines_key = vm.strings.intern(b"activelines");
+        vm.gc.get_table_mut(tbl).raw_set_str(activelines_key, TValue::from_table(activelines_tbl));
+    }
+}
+
+/// Try to find a function name by examining the calling frame's bytecode.
+/// Sets 'name' and 'namewhat' on the result table if found.
+fn fill_func_name(
+    vm: &mut Vm,
+    tbl: selune_core::gc::GcIdx<selune_core::table::Table>,
+    frame_idx: usize,
+) {
+    use selune_compiler::opcode::OpCode;
+
+    if frame_idx == 0 {
+        return;
+    }
+    let caller_idx = frame_idx - 1;
+    let caller = &vm.call_stack[caller_idx];
+    if !caller.is_lua || caller.pc == 0 {
+        return;
+    }
+
+    let caller_proto = &vm.protos[caller.proto_idx];
+    let call_pc = caller.pc - 1;
+    if call_pc >= caller_proto.code.len() {
+        return;
+    }
+    let call_inst = caller_proto.code[call_pc];
+
+    let func_reg = match call_inst.opcode() {
+        OpCode::Call | OpCode::TailCall => call_inst.a() as usize,
+        _ => return,
+    };
+
+    // Helper: find local variable name for a register at a given PC
+    let find_local_name = |proto: &selune_compiler::proto::Proto, reg: usize, pc: usize| -> Option<selune_core::string::StringId> {
+        for lv in &proto.local_vars {
+            if lv.reg as usize == reg
+                && (lv.start_pc as usize) <= pc
+                && pc < (lv.end_pc as usize)
+            {
+                let name_bytes = vm.strings.get_bytes(lv.name);
+                if !name_bytes.starts_with(b"(") {
+                    return Some(lv.name);
+                }
+            }
+        }
+        None
+    };
+
+    let mut found_name: Option<(Vec<u8>, &'static [u8])> = None;
+
+    // Strategy 1: Check if func_reg is a local variable at call_pc
+    if let Some(name_sid) = find_local_name(caller_proto, func_reg, call_pc) {
+        let name_bytes = vm.strings.get_bytes(name_sid).to_vec();
+        found_name = Some((name_bytes, b"local"));
+    }
+
+    // Strategy 2: Scan backwards to find instruction that loaded func_reg
+    if found_name.is_none() && call_pc > 0 {
+        for i in (0..call_pc).rev() {
+            let prev_inst = caller_proto.code[i];
+            if prev_inst.a() as usize != func_reg {
+                continue;
+            }
+            match prev_inst.opcode() {
+                OpCode::GetTabUp => {
+                    let c = prev_inst.c() as usize;
+                    if let Some(selune_compiler::proto::Constant::String(sid)) =
+                        caller_proto.constants.get(c)
+                    {
+                        let name_bytes = vm.strings.get_bytes(*sid).to_vec();
+                        found_name = Some((name_bytes, b"global"));
+                    }
+                    break;
+                }
+                OpCode::GetField => {
+                    let c = prev_inst.c() as usize;
+                    if let Some(selune_compiler::proto::Constant::String(sid)) =
+                        caller_proto.constants.get(c)
+                    {
+                        let name_bytes = vm.strings.get_bytes(*sid).to_vec();
+                        found_name = Some((name_bytes, b"field"));
+                    }
+                    break;
+                }
+                OpCode::Self_ => {
+                    let c = prev_inst.c() as usize;
+                    if prev_inst.k() {
+                        if let Some(selune_compiler::proto::Constant::String(sid)) =
+                            caller_proto.constants.get(c)
+                        {
+                            let name_bytes = vm.strings.get_bytes(*sid).to_vec();
+                            found_name = Some((name_bytes, b"method"));
+                        }
+                    }
+                    break;
+                }
+                OpCode::Move => {
+                    // Follow the move: check if source is a named local
+                    let src_reg = prev_inst.b() as usize;
+                    if let Some(name_sid) = find_local_name(caller_proto, src_reg, i) {
+                        let name_bytes = vm.strings.get_bytes(name_sid).to_vec();
+                        found_name = Some((name_bytes, b"local"));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    if let Some((name_bytes, namewhat_bytes)) = found_name {
+        let name_key = vm.strings.intern(b"name");
+        let name_val = vm.strings.intern_or_create(&name_bytes);
+        vm.gc
+            .get_table_mut(tbl)
+            .raw_set_str(name_key, TValue::from_string_id(name_val));
+
+        let namewhat_key = vm.strings.intern(b"namewhat");
+        let namewhat_val = vm.strings.intern_or_create(namewhat_bytes);
+        vm.gc
+            .get_table_mut(tbl)
+            .raw_set_str(namewhat_key, TValue::from_string_id(namewhat_val));
+    }
+}
+
+/// Create short_src from source name (like luaO_chunkid).
+fn make_short_src(source: &[u8]) -> String {
+    let s = String::from_utf8_lossy(source);
+    if s.starts_with('=') {
+        s[1..].to_string()
+    } else if s.starts_with('@') {
+        let name = &s[1..];
+        if name.len() > 60 {
+            format!("...{}", &name[name.len() - 57..])
+        } else {
+            name.to_string()
+        }
+    } else {
+        let first_line = s.lines().next().unwrap_or(&s);
+        if first_line.len() > 50 {
+            format!("[string \"{}...\"]", &first_line[..47])
+        } else {
+            format!("[string \"{}\"]", first_line)
+        }
+    }
+}
+
+/// Handle `coroutine.running()` — returns the running coroutine and whether it's the main thread.
+fn do_coro_running(vm: &mut Vm) -> Result<Vec<TValue>, LuaError> {
+    // If we're in the main thread, return a stable table as thread stand-in + true
+    // If we're in a coroutine, return the coroutine handle table + false
+    if let Some(_coro_id) = vm.running_coro {
+        // We're inside a coroutine. Return the env table as a stand-in for thread.
+        // A proper implementation would return the coroutine handle.
+        let thread_standin = vm.gc.alloc_table(0, 0);
+        Ok(vec![TValue::from_table(thread_standin), TValue::from_bool(false)])
+    } else {
+        // Main thread — use the _ENV table as a stable stand-in for the main thread.
+        // This ensures repeated calls return the same object.
+        if let Some(env) = vm.env_idx {
+            Ok(vec![TValue::from_table(env), TValue::from_bool(true)])
+        } else {
+            let thread_standin = vm.gc.alloc_table(0, 0);
+            Ok(vec![TValue::from_table(thread_standin), TValue::from_bool(true)])
+        }
+    }
+}
+
+/// Handle `string.format(fmt, ...)` with VM access for __tostring metamethods.
+/// Pre-processes args that use `%s` conversion via tostring, then calls the native format.
+/// Handle `string.dump(func [, strip])` with full VM access.
+fn do_string_dump(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let func = args.first().copied().unwrap_or(TValue::nil());
+    let strip = args
+        .get(1)
+        .copied()
+        .map(|v| !v.is_nil() && !v.is_falsy())
+        .unwrap_or(false);
+
+    let closure_idx = func.as_closure_idx().ok_or_else(|| {
+        LuaError::Runtime(
+            "unable to dump given function".to_string(),
+        )
+    })?;
+
+    // Can't dump C (native) functions — but this is already checked by as_closure_idx
+    let closure = vm.gc.get_closure(closure_idx);
+    let proto_idx = closure.proto_idx;
+    let proto = &vm.protos[proto_idx];
+
+    let bytes = crate::binary_chunk::dump(proto, &vm.strings, strip);
+    let sid = vm.strings.intern_or_create(&bytes);
+    Ok(vec![TValue::from_string_id(sid)])
+}
+
+fn do_string_format(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    // Parse the format string to find which arg positions use %s
+    let mut s_positions = Vec::new();
+    if let Some(fmt_val) = args.first() {
+        if let Some(sid) = fmt_val.as_string_id() {
+            let fmt_bytes = vm.strings.get_bytes(sid).to_vec();
+            let mut arg_idx = 1usize; // 1-based index into args (0 is fmt)
+            let mut i = 0;
+            while i < fmt_bytes.len() {
+                if fmt_bytes[i] == b'%' {
+                    i += 1;
+                    if i >= fmt_bytes.len() { break; }
+                    if fmt_bytes[i] == b'%' { i += 1; continue; }
+                    // Skip flags, width, precision
+                    while i < fmt_bytes.len() && b"-+ #0".contains(&fmt_bytes[i]) { i += 1; }
+                    while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() { i += 1; }
+                    if i < fmt_bytes.len() && fmt_bytes[i] == b'.' {
+                        i += 1;
+                        while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() { i += 1; }
+                    }
+                    if i < fmt_bytes.len() {
+                        if fmt_bytes[i] == b's' {
+                            s_positions.push(arg_idx);
+                        }
+                        arg_idx += 1;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    // Pre-process only args at %s positions that are table/userdata
+    let mut processed_args = args.to_vec();
+    for &pos in &s_positions {
+        if pos < processed_args.len() {
+            let val = processed_args[pos];
+            if val.as_table_idx().is_some() || val.as_userdata_idx().is_some() {
+                let ts = do_tostring(vm, &[val])?;
+                if let Some(result) = ts.first() {
+                    processed_args[pos] = *result;
+                }
+            }
+        }
+    }
+    // Now call the native string.format with pre-processed args
+    let native_ref = vm.gc.get_native(vm.string_format_idx.unwrap());
+    let native_fn = native_ref.func;
+    let native_upvalue = native_ref.upvalue;
+    let mut ctx = NativeContext {
+        args: &processed_args,
+        gc: &mut vm.gc,
+        strings: &mut vm.strings,
+        upvalue: native_upvalue,
+    };
+    native_fn(&mut ctx).map_err(|e| LuaError::Runtime(format!("{:?}", e)))
 }
 
 /// Convert a compile-time Constant to a runtime TValue.

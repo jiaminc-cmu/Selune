@@ -14,6 +14,7 @@ use selune_core::value::TValue;
 pub struct DebugIndices {
     pub getupvalue_idx: GcIdx<NativeFunction>,
     pub setupvalue_idx: GcIdx<NativeFunction>,
+    pub getinfo_idx: GcIdx<NativeFunction>,
 }
 
 pub fn register(
@@ -43,8 +44,14 @@ pub fn register(
         TValue::from_native(setupvalue_idx),
     );
 
+    // getinfo needs full VM access (redirected through dispatch.rs)
+    let getinfo_idx = gc.alloc_native(native_debug_getinfo, "getinfo");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"getinfo"),
+        TValue::from_native(getinfo_idx),
+    );
+
     // Stubs for functions that need full VM access
-    register_fn(gc, debug_table, strings, "getinfo", native_debug_getinfo);
     register_fn(gc, debug_table, strings, "traceback", native_debug_traceback);
     register_fn(gc, debug_table, strings, "sethook", native_debug_sethook);
     register_fn(gc, debug_table, strings, "getlocal", native_debug_getlocal);
@@ -57,6 +64,7 @@ pub fn register(
     DebugIndices {
         getupvalue_idx,
         setupvalue_idx,
+        getinfo_idx,
     }
 }
 
@@ -93,11 +101,27 @@ fn native_debug_getmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nat
             Some(mt_idx) => Ok(vec![TValue::from_table(mt_idx)]),
             None => Ok(vec![TValue::nil()]),
         }
+    } else if val.is_string() {
+        match ctx.gc.string_metatable {
+            Some(mt_idx) => Ok(vec![TValue::from_table(mt_idx)]),
+            None => Ok(vec![TValue::nil()]),
+        }
+    } else if val.is_number() || val.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT) {
+        match ctx.gc.number_metatable {
+            Some(mt_idx) => Ok(vec![TValue::from_table(mt_idx)]),
+            None => Ok(vec![TValue::nil()]),
+        }
+    } else if val.is_bool() {
+        match ctx.gc.boolean_metatable {
+            Some(mt_idx) => Ok(vec![TValue::from_table(mt_idx)]),
+            None => Ok(vec![TValue::nil()]),
+        }
+    } else if val.is_nil() {
+        match ctx.gc.nil_metatable {
+            Some(mt_idx) => Ok(vec![TValue::from_table(mt_idx)]),
+            None => Ok(vec![TValue::nil()]),
+        }
     } else {
-        // For other types (number, string, boolean, nil, function),
-        // Lua 5.4 returns nil from debug.getmetatable unless a type-wide
-        // metatable has been set via debug.setmetatable. We don't track
-        // type-wide metatables in NativeContext, so return nil for now.
         Ok(vec![TValue::nil()])
     }
 }
@@ -129,10 +153,20 @@ fn native_debug_setmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nat
     } else if let Some(ud_idx) = val.as_userdata_idx() {
         ctx.gc.get_userdata_mut(ud_idx).metatable = mt;
         Ok(vec![val])
+    } else if val.is_string() {
+        ctx.gc.string_metatable = mt;
+        Ok(vec![val])
+    } else if val.is_number() || val.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT) {
+        ctx.gc.number_metatable = mt;
+        Ok(vec![val])
+    } else if val.is_bool() {
+        ctx.gc.boolean_metatable = mt;
+        Ok(vec![val])
+    } else if val.is_nil() {
+        ctx.gc.nil_metatable = mt;
+        Ok(vec![val])
     } else {
-        // For other types, debug.setmetatable in Lua 5.4 can set type-wide
-        // metatables (e.g., for strings). We don't support that yet through
-        // NativeContext. Return the value anyway for compatibility.
+        // For other types (functions, etc.), just return the value
         Ok(vec![val])
     }
 }
