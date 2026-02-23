@@ -71,7 +71,7 @@ fn int_arith(op: ArithOp, a: i64, b: i64, gc: &mut GcHeap) -> Result<TValue, Lua
         ArithOp::Mul => a.wrapping_mul(b),
         ArithOp::IDiv => {
             if b == 0 {
-                return Err(LuaError::Runtime("attempt to perform 'n//0'".to_string()));
+                return Err(LuaError::Runtime("attempt to divide by zero".to_string()));
             }
             lua_idiv(a, b)
         }
@@ -105,20 +105,18 @@ fn float_arith(op: ArithOp, a: f64, b: f64) -> Result<f64, LuaError> {
         ArithOp::Div => a / b,
         ArithOp::Pow => a.powf(b),
         ArithOp::IDiv => {
-            if b == 0.0 {
-                return Err(LuaError::Runtime("attempt to perform 'n//0'".to_string()));
-            }
+            // Float floor division by zero follows IEEE 754:
+            // produces inf, -inf, or NaN (only integer idiv errors on zero)
             (a / b).floor()
         }
         ArithOp::Mod => {
-            if b == 0.0 {
-                return Err(LuaError::Runtime("attempt to perform 'n%0'".to_string()));
-            }
+            // Float modulo by zero follows IEEE 754:
+            // produces NaN (only integer mod errors on zero)
             lua_fmod(a, b)
         }
         ArithOp::BAnd | ArithOp::BOr | ArithOp::BXor | ArithOp::Shl | ArithOp::Shr => {
             return Err(LuaError::Runtime(
-                "attempt to perform bitwise operation on a float value".to_string(),
+                "number has no integer representation".to_string(),
             ));
         }
     })
@@ -126,9 +124,11 @@ fn float_arith(op: ArithOp, a: f64, b: f64) -> Result<f64, LuaError> {
 
 /// Lua integer division (floor division).
 fn lua_idiv(a: i64, b: i64) -> i64 {
-    let d = a / b;
+    // Use wrapping_div to handle i64::MIN / -1 overflow (produces i64::MIN in Lua)
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
     // If signs differ and there's a remainder, round towards negative infinity
-    if (a ^ b) < 0 && d * b != a {
+    if r != 0 && (r ^ b) < 0 {
         d - 1
     } else {
         d
@@ -137,9 +137,9 @@ fn lua_idiv(a: i64, b: i64) -> i64 {
 
 /// Lua integer modulo.
 fn lua_imod(a: i64, b: i64) -> i64 {
-    let r = a % b;
+    let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
-        r + b
+        r.wrapping_add(b)
     } else {
         r
     }
@@ -196,6 +196,10 @@ pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Arith
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
+    } else if v.is_float() {
+        ArithResult::Error(LuaError::Runtime(
+            "number has no integer representation".to_string(),
+        ))
     } else {
         ArithResult::NeedMetamethod
     }
@@ -223,7 +227,7 @@ pub fn lua_concat(values: &[TValue], gc: &GcHeap, strings: &mut StringInterner) 
 }
 
 /// Bitwise operations that need integer coercion.
-/// Returns NeedMetamethod on type mismatch.
+/// Returns NeedMetamethod on type mismatch, or Error for float-to-int conversion failures.
 pub fn bitwise_op(
     op: ArithOp,
     a: TValue,
@@ -233,11 +237,26 @@ pub fn bitwise_op(
 ) -> ArithResult {
     let ia = match coerce::to_integer(a, gc, strings) {
         Some(i) => i,
-        None => return ArithResult::NeedMetamethod,
+        None => {
+            // If the value is a number that can't convert to integer, error
+            if a.is_float() || a.as_full_integer(gc).is_some() {
+                return ArithResult::Error(LuaError::Runtime(
+                    "number has no integer representation".to_string(),
+                ));
+            }
+            return ArithResult::NeedMetamethod;
+        }
     };
     let ib = match coerce::to_integer(b, gc, strings) {
         Some(i) => i,
-        None => return ArithResult::NeedMetamethod,
+        None => {
+            if b.is_float() || b.as_full_integer(gc).is_some() {
+                return ArithResult::Error(LuaError::Runtime(
+                    "number has no integer representation".to_string(),
+                ));
+            }
+            return ArithResult::NeedMetamethod;
+        }
     };
     match int_arith(op, ia, ib, gc) {
         Ok(v) => ArithResult::Ok(v),

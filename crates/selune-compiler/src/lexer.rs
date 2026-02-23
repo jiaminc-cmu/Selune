@@ -44,6 +44,21 @@ impl<'a> Lexer<'a> {
         lexer
     }
 
+    /// Create a new lexer reusing an existing string interner.
+    pub fn with_strings(source: &'a [u8], strings: StringInterner) -> Self {
+        let mut lexer = Lexer {
+            source,
+            pos: 0,
+            line: 1,
+            column: 1,
+            current: None,
+            strings,
+        };
+        // Prime the first token using the provided interner
+        lexer.current = Some(lexer.scan_token());
+        lexer
+    }
+
     /// Peek at the current token without consuming.
     pub fn current(&self) -> Result<&SpannedToken, &LexError> {
         match &self.current {
@@ -79,6 +94,10 @@ impl<'a> Lexer<'a> {
         let ch = self.source.get(self.pos).copied()?;
         self.pos += 1;
         if ch == b'\n' {
+            // \n\r counts as one newline (Lua 5.4)
+            if self.peek() == Some(b'\r') {
+                self.pos += 1;
+            }
             self.line += 1;
             self.column = 1;
         } else if ch == b'\r' {
@@ -453,7 +472,7 @@ impl<'a> Lexer<'a> {
                 span,
             })
         } else {
-            let id = self.strings.intern(name);
+            let id = self.strings.intern_or_create(name);
             Ok(SpannedToken {
                 token: Token::Name(id),
                 span,
@@ -642,18 +661,29 @@ impl<'a> Lexer<'a> {
                 }),
             }
         } else {
-            // Parse hex int: strip 0x prefix
+            // Parse hex int: strip 0x prefix, wrapping on overflow (Lua 5.4 behavior)
             let hex_digits = &text[2..];
-            match u64::from_str_radix(hex_digits, 16) {
-                Ok(v) => Ok(SpannedToken {
-                    token: Token::Integer(v as i64),
+            let mut val: u64 = 0;
+            let mut valid = !hex_digits.is_empty();
+            for ch in hex_digits.bytes() {
+                if ch.is_ascii_hexdigit() {
+                    val = val.wrapping_mul(16).wrapping_add(hex_value(ch) as u64);
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                Ok(SpannedToken {
+                    token: Token::Integer(val as i64),
                     span,
-                }),
-                Err(_) => Err(LexError {
+                })
+            } else {
+                Err(LexError {
                     message: format!("malformed hex number: '{text}'"),
                     line: span.line,
                     column: span.column,
-                }),
+                })
             }
         }
     }
@@ -829,17 +859,8 @@ impl<'a> Lexer<'a> {
                                     column: span.column,
                                 });
                             }
-                            if let Some(c) = char::from_u32(code) {
-                                let mut utf8_buf = [0u8; 4];
-                                let s = c.encode_utf8(&mut utf8_buf);
-                                buf.extend_from_slice(s.as_bytes());
-                            } else {
-                                return Err(LexError {
-                                    message: format!("invalid Unicode code point: U+{code:04X}"),
-                                    line: span.line,
-                                    column: span.column,
-                                });
-                            }
+                            // Encode as UTF-8 (Lua 5.4 supports up to 0x7FFFFFFF)
+                            encode_utf8_lua(code, &mut buf);
                         }
                         Some(b'z') => {
                             self.advance_char();
@@ -1022,6 +1043,40 @@ fn is_ident_start(ch: u8) -> bool {
 
 fn is_ident_continue(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
+}
+
+/// Encode a Unicode code point as UTF-8 bytes (Lua 5.4 extended: up to 0x7FFFFFFF).
+/// Standard UTF-8 goes up to 4 bytes (U+10FFFF), but Lua extends the encoding
+/// to 6 bytes for values up to 0x7FFFFFFF.
+fn encode_utf8_lua(code: u32, buf: &mut Vec<u8>) {
+    if code <= 0x7F {
+        buf.push(code as u8);
+    } else if code <= 0x7FF {
+        buf.push(0xC0 | (code >> 6) as u8);
+        buf.push(0x80 | (code & 0x3F) as u8);
+    } else if code <= 0xFFFF {
+        buf.push(0xE0 | (code >> 12) as u8);
+        buf.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        buf.push(0x80 | (code & 0x3F) as u8);
+    } else if code <= 0x1FFFFF {
+        buf.push(0xF0 | (code >> 18) as u8);
+        buf.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        buf.push(0x80 | (code & 0x3F) as u8);
+    } else if code <= 0x3FFFFFF {
+        buf.push(0xF8 | (code >> 24) as u8);
+        buf.push(0x80 | ((code >> 18) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        buf.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        buf.push(0xFC | (code >> 30) as u8);
+        buf.push(0x80 | ((code >> 24) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 18) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        buf.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        buf.push(0x80 | (code & 0x3F) as u8);
+    }
 }
 
 fn hex_value(ch: u8) -> u8 {

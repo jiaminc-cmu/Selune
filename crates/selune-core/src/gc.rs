@@ -2,6 +2,7 @@
 
 use crate::table::Table;
 use crate::value::TValue;
+use std::any::Any;
 use std::marker::PhantomData;
 
 /// A typed index into an arena in the GcHeap.
@@ -41,6 +42,7 @@ pub const GC_SUB_NATIVE: u64 = 2;
 pub const GC_SUB_UPVAL: u64 = 3;
 pub const GC_SUB_BOXED_INT: u64 = 4;
 pub const GC_SUB_STRING: u64 = 5;
+pub const GC_SUB_USERDATA: u64 = 6;
 
 /// Bits used for sub-tag within the 47-bit payload.
 pub const GC_SUB_SHIFT: u64 = 44;
@@ -105,6 +107,22 @@ pub enum UpValLocation {
     Closed(TValue),
 }
 
+/// A full userdata value: arbitrary Rust data with an optional metatable.
+pub struct Userdata {
+    /// The boxed payload (e.g., file handle, custom data).
+    pub data: Box<dyn Any>,
+    /// Optional metatable (for __gc, __index, __tostring, etc.).
+    pub metatable: Option<GcIdx<Table>>,
+    /// Optional "user values" (Lua values associated with the userdata).
+    pub user_values: Vec<TValue>,
+}
+
+impl std::fmt::Debug for Userdata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Userdata {{ data: <dyn Any>, metatable: {:?} }}", self.metatable)
+    }
+}
+
 /// GC state for incremental mark-sweep collection.
 pub struct GcState {
     /// Mark bits for each arena (true = marked/reachable).
@@ -113,11 +131,13 @@ pub struct GcState {
     pub upval_marks: Vec<bool>,
     pub native_marks: Vec<bool>,
     pub boxed_int_marks: Vec<bool>,
+    pub userdata_marks: Vec<bool>,
 
     /// Gray list: objects marked but not yet traversed.
     pub gray_tables: Vec<u32>,
     pub gray_closures: Vec<u32>,
     pub gray_upvals: Vec<u32>,
+    pub gray_userdata: Vec<u32>,
 
     /// GC control.
     pub enabled: bool,
@@ -143,9 +163,11 @@ impl GcState {
             upval_marks: Vec::new(),
             native_marks: Vec::new(),
             boxed_int_marks: Vec::new(),
+            userdata_marks: Vec::new(),
             gray_tables: Vec::new(),
             gray_closures: Vec::new(),
             gray_upvals: Vec::new(),
+            gray_userdata: Vec::new(),
             enabled: true,
             total_alloc: 0,
             threshold: 4096, // Initial threshold (bytes) before first GC
@@ -164,6 +186,7 @@ impl GcState {
         upvals: usize,
         natives: usize,
         boxed_ints: usize,
+        userdata: usize,
     ) {
         self.table_marks.clear();
         self.table_marks.resize(tables, false);
@@ -175,9 +198,12 @@ impl GcState {
         self.native_marks.resize(natives, false);
         self.boxed_int_marks.clear();
         self.boxed_int_marks.resize(boxed_ints, false);
+        self.userdata_marks.clear();
+        self.userdata_marks.resize(userdata, false);
         self.gray_tables.clear();
         self.gray_closures.clear();
         self.gray_upvals.clear();
+        self.gray_userdata.clear();
     }
 }
 
@@ -199,8 +225,12 @@ pub struct GcHeap {
     native_free: Vec<u32>,
     pub upvals: Vec<Option<UpVal>>,
     upval_free: Vec<u32>,
+    pub userdata: Vec<Option<Userdata>>,
+    userdata_free: Vec<u32>,
     /// GC state for mark-sweep collection.
     pub gc_state: GcState,
+    /// Shared string metatable (for string:method() calls and getmetatable("")).
+    pub string_metatable: Option<GcIdx<Table>>,
 }
 
 impl GcHeap {
@@ -216,7 +246,10 @@ impl GcHeap {
             native_free: Vec::new(),
             upvals: Vec::new(),
             upval_free: Vec::new(),
+            userdata: Vec::new(),
+            userdata_free: Vec::new(),
             gc_state: GcState::new(),
+            string_metatable: None,
         }
     }
 
@@ -342,6 +375,36 @@ impl GcHeap {
             .expect("upval was freed")
     }
 
+    pub fn alloc_userdata(&mut self, data: Box<dyn Any>, metatable: Option<GcIdx<Table>>) -> GcIdx<Userdata> {
+        self.gc_state.total_alloc += 64; // rough estimate
+        self.gc_state.debt += 64;
+        let ud = Userdata {
+            data,
+            metatable,
+            user_values: Vec::new(),
+        };
+        if let Some(idx) = self.userdata_free.pop() {
+            self.userdata[idx as usize] = Some(ud);
+            GcIdx(idx, PhantomData)
+        } else {
+            let idx = self.userdata.len() as u32;
+            self.userdata.push(Some(ud));
+            GcIdx(idx, PhantomData)
+        }
+    }
+
+    pub fn get_userdata(&self, idx: GcIdx<Userdata>) -> &Userdata {
+        self.userdata[idx.0 as usize]
+            .as_ref()
+            .expect("userdata was freed")
+    }
+
+    pub fn get_userdata_mut(&mut self, idx: GcIdx<Userdata>) -> &mut Userdata {
+        self.userdata[idx.0 as usize]
+            .as_mut()
+            .expect("userdata was freed")
+    }
+
     // ---- GC mark/sweep methods ----
 
     /// Prepare mark bits for a new GC cycle.
@@ -352,6 +415,7 @@ impl GcHeap {
             self.upvals.len(),
             self.natives.len(),
             self.boxed_ints.len(),
+            self.userdata.len(),
         );
     }
 
@@ -398,6 +462,12 @@ impl GcHeap {
                     self.gc_state.boxed_int_marks[idx] = true;
                 }
                 // Boxed ints are leaf objects
+            }
+            GC_SUB_USERDATA => {
+                if idx < self.gc_state.userdata_marks.len() && !self.gc_state.userdata_marks[idx] {
+                    self.gc_state.userdata_marks[idx] = true;
+                    self.gc_state.gray_userdata.push(idx as u32);
+                }
             }
             GC_SUB_STRING => {
                 // Strings are managed by StringInterner, not by GC arenas
@@ -461,6 +531,31 @@ impl GcHeap {
                     {
                         self.gc_state.upval_marks[uv_i] = true;
                         self.gc_state.gray_upvals.push(uv_idx.0);
+                    }
+                }
+            }
+            work += 1;
+        }
+
+        // Propagate gray userdata
+        while let Some(idx) = self.gc_state.gray_userdata.pop() {
+            let i = idx as usize;
+            if let Some(ud) = &self.userdata[i] {
+                // Mark metatable
+                if let Some(mt_idx) = ud.metatable {
+                    let mt_i = mt_idx.0 as usize;
+                    if mt_i < self.gc_state.table_marks.len()
+                        && !self.gc_state.table_marks[mt_i]
+                    {
+                        self.gc_state.table_marks[mt_i] = true;
+                        self.gc_state.gray_tables.push(mt_idx.0);
+                    }
+                }
+                // Mark user values
+                let user_vals: Vec<TValue> = ud.user_values.clone();
+                for v in user_vals {
+                    if v.is_gc() {
+                        self.gc_mark_value(v);
                     }
                 }
             }
@@ -531,6 +626,17 @@ impl GcHeap {
                     self.natives[i] = None;
                     self.native_free.push(i as u32);
                     freed += 24;
+                }
+            }
+        }
+
+        // Sweep userdata
+        for i in 0..self.userdata.len() {
+            if self.userdata[i].is_some() {
+                if i < self.gc_state.userdata_marks.len() && !self.gc_state.userdata_marks[i] {
+                    self.userdata[i] = None;
+                    self.userdata_free.push(i as u32);
+                    freed += 64;
                 }
             }
         }

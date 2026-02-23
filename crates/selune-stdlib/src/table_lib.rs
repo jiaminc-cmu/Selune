@@ -266,12 +266,14 @@ fn native_table_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
 /// table.unpack(t [,i [,j]])
 fn native_table_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = get_table_arg(ctx, 0, "unpack")?;
-    let i = if ctx.args.len() > 1 {
+    let arg1 = ctx.args.get(1).copied().unwrap_or(TValue::nil());
+    let arg2 = ctx.args.get(2).copied().unwrap_or(TValue::nil());
+    let i = if !arg1.is_nil() {
         get_int_arg(ctx, 1, "unpack")?
     } else {
         1
     };
-    let j = if ctx.args.len() > 2 {
+    let j = if !arg2.is_nil() {
         get_int_arg(ctx, 2, "unpack")?
     } else {
         ctx.gc.get_table(table_idx).length()

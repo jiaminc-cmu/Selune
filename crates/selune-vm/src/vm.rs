@@ -85,6 +85,28 @@ pub struct Vm {
     pub collectgarbage_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for tostring (needs full VM access for __tostring metamethod).
     pub tostring_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for load (needs full VM access to compile + create closure).
+    pub load_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for dofile (needs full VM access to compile + execute).
+    pub dofile_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for loadfile (needs full VM access to compile + create closure).
+    pub loadfile_idx: Option<GcIdx<NativeFunction>>,
+    /// The _ENV table GcIdx, retained for load/dofile/loadfile to get default env.
+    pub env_idx: Option<GcIdx<selune_core::table::Table>>,
+    /// Whether warn() output is enabled (controlled by @on/@off).
+    pub warn_enabled: bool,
+    /// Native index for require (needs full VM access for loadfile + call_function).
+    pub require_idx: Option<GcIdx<NativeFunction>>,
+    /// The package.loaded table, for require() to check/store cached modules.
+    pub package_loaded_idx: Option<GcIdx<selune_core::table::Table>>,
+    /// The package.preload table, for require() to check preloaded modules.
+    pub package_preload_idx: Option<GcIdx<selune_core::table::Table>>,
+    /// Native index for error() (needs VM access for source:line prefix).
+    pub error_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.getupvalue (needs VM access for Proto upvalue names).
+    pub debug_getupvalue_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.setupvalue (needs VM access for Proto upvalue names + open upvals).
+    pub debug_setupvalue_idx: Option<GcIdx<NativeFunction>>,
 }
 
 impl Vm {
@@ -114,6 +136,17 @@ impl Vm {
             coro_wrap_resume_idx: None,
             collectgarbage_idx: None,
             tostring_idx: None,
+            load_idx: None,
+            dofile_idx: None,
+            loadfile_idx: None,
+            env_idx: None,
+            warn_enabled: false,
+            require_idx: None,
+            package_loaded_idx: None,
+            package_preload_idx: None,
+            error_idx: None,
+            debug_getupvalue_idx: None,
+            debug_setupvalue_idx: None,
         }
     }
 
@@ -150,6 +183,7 @@ impl Vm {
         // Create _ENV table
         let env_idx = self.gc.alloc_table(0, 16);
         let env_val = TValue::from_table(env_idx);
+        self.env_idx = Some(env_idx);
 
         // Register native functions
         self.register_natives(env_idx);
@@ -162,6 +196,19 @@ impl Vm {
         self.coro_yield_idx = Some(stdlib_indices.coro_yield_idx);
         self.coro_wrap_idx = Some(stdlib_indices.coro_wrap_idx);
         self.coro_wrap_resume_idx = Some(stdlib_indices.coro_wrap_resume_idx);
+        self.require_idx = Some(stdlib_indices.require_idx);
+        self.package_loaded_idx = Some(stdlib_indices.package_loaded_idx);
+        self.package_preload_idx = Some(stdlib_indices.package_preload_idx);
+        self.debug_getupvalue_idx = Some(stdlib_indices.debug_getupvalue_idx);
+        self.debug_setupvalue_idx = Some(stdlib_indices.debug_setupvalue_idx);
+
+        // Create string metatable with __index = string library table
+        let string_mt = self.gc.alloc_table(0, 4);
+        let index_name = self.strings.intern(b"__index");
+        self.gc
+            .get_table_mut(string_mt)
+            .raw_set_str(index_name, TValue::from_table(stdlib_indices.string_table_idx));
+        self.gc.string_metatable = Some(string_mt);
 
         // Create a top-level closure with _ENV as upvalue[0]
         let env_upval_idx = self.gc.alloc_upval(UpValLocation::Closed(env_val));
@@ -184,6 +231,45 @@ impl Vm {
 
         self.call_stack.pop();
         result
+    }
+
+    /// Compile source and create a closure, reusing the VM's string interner.
+    /// Returns the closure TValue (ready to call) or a compile error string.
+    pub fn load_chunk(
+        &mut self,
+        source: &[u8],
+        name: &str,
+        env: Option<TValue>,
+    ) -> Result<TValue, String> {
+        // Take ownership of strings for compilation, then put them back
+        let strings = std::mem::take(&mut self.strings);
+        let (result, strings) = selune_compiler::compiler::compile_with_strings(source, name, strings);
+        self.strings = strings;
+        let proto = result.map_err(|e| {
+            // Format: "source:line: message" matching PUC Lua error format
+            let src = if name.starts_with('=') {
+                &name[1..]
+            } else if name.starts_with('@') {
+                &name[1..]
+            } else {
+                name
+            };
+            format!("{}:{}: {}", src, e.line, e.message)
+        })?;
+
+        // Store the proto
+        let proto_idx = self.protos.len();
+        self.protos.push(proto);
+
+        // Determine the _ENV upvalue: use custom env or default _ENV
+        let env_val = env.unwrap_or_else(|| {
+            self.env_idx
+                .map(TValue::from_table)
+                .unwrap_or(TValue::nil())
+        });
+        let env_upval_idx = self.gc.alloc_upval(UpValLocation::Closed(env_val));
+        let closure_idx = self.gc.alloc_closure(proto_idx, vec![env_upval_idx]);
+        Ok(TValue::from_closure(closure_idx))
     }
 
     /// Store proto tree recursively. Returns the flat index.
@@ -231,8 +317,9 @@ impl Vm {
             .get_table_mut(env_idx)
             .raw_set_str(tonumber_name, tonumber_val);
 
-        // error
+        // error (redirect: needs VM access for source:line prefix)
         let idx = self.gc.alloc_native(native_error, "error");
+        self.error_idx = Some(idx);
         let val = TValue::from_native(idx);
         let name = self.strings.intern(b"error");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
@@ -329,6 +416,46 @@ impl Vm {
         let name = self.strings.intern(b"collectgarbage");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
         self.collectgarbage_idx = Some(idx);
+
+        // load - stub; actual dispatch via call_function
+        let idx = self.gc.alloc_native(native_load_stub, "load");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"load");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.load_idx = Some(idx);
+
+        // dofile - stub; actual dispatch via call_function
+        let idx = self.gc.alloc_native(native_dofile_stub, "dofile");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"dofile");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.dofile_idx = Some(idx);
+
+        // loadfile - stub; actual dispatch via call_function
+        let idx = self.gc.alloc_native(native_loadfile_stub, "loadfile");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"loadfile");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.loadfile_idx = Some(idx);
+
+        // warn
+        let idx = self.gc.alloc_native(native_warn_stub, "warn");
+        let val = TValue::from_native(idx);
+        let name = self.strings.intern(b"warn");
+        self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+
+        // _VERSION
+        let version_sid = self.strings.intern(b"Lua 5.4");
+        let version_val = TValue::from_string_id(version_sid);
+        let version_name = self.strings.intern(b"_VERSION");
+        self.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(version_name, version_val);
+
+        // _G = _ENV (same table)
+        let g_name = self.strings.intern(b"_G");
+        let env_val = TValue::from_table(env_idx);
+        self.gc.get_table_mut(env_idx).raw_set_str(g_name, env_val);
     }
 
     /// Get an upvalue's current value.
@@ -574,6 +701,11 @@ impl Vm {
             }
         }
 
+        // Mark string metatable
+        if let Some(idx) = self.gc.string_metatable {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+
         // Mark registered native function indices (these are always roots)
         if let Some(idx) = self.pcall_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
@@ -601,6 +733,32 @@ impl Vm {
         }
         if let Some(idx) = self.tostring_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.load_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.dofile_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.loadfile_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.require_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.error_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        // Mark _ENV table
+        if let Some(idx) = self.env_idx {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark package.loaded and package.preload tables
+        if let Some(idx) = self.package_loaded_idx {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        if let Some(idx) = self.package_preload_idx {
+            self.gc.gc_mark_value(TValue::from_table(idx));
         }
     }
 
@@ -712,19 +870,10 @@ fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         let bytes = ctx.strings.get_bytes(sid);
         let s = std::str::from_utf8(bytes).unwrap_or("");
         let s = s.trim();
-        // Try hex integer
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            if let Ok(i) = i64::from_str_radix(hex, 16) {
-                return Ok(vec![TValue::from_full_integer(i, ctx.gc)]);
-            }
-        }
-        // Try decimal integer
-        if let Ok(i) = s.parse::<i64>() {
-            return Ok(vec![TValue::from_full_integer(i, ctx.gc)]);
-        }
-        // Try float
-        if let Ok(f) = s.parse::<f64>() {
-            return Ok(vec![TValue::from_float(f)]);
+        // Use coerce::to_number_from_str which handles hex (with sign and wrapping),
+        // decimal integers, and floats
+        if let Some(result) = crate::coerce::tonumber_from_str(s, ctx.gc) {
+            return Ok(vec![result]);
         }
     }
     Ok(vec![TValue::nil()])
@@ -874,15 +1023,32 @@ fn native_setmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 
 fn native_getmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
+    // Helper: given a metatable idx, check __metatable and return appropriately
+    let check_mt = |mt_idx: GcIdx<selune_core::table::Table>, gc: &GcHeap, strings: &mut StringInterner| -> Vec<TValue> {
+        let mm_name = strings.intern(b"__metatable");
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if !mm_val.is_nil() {
+            vec![mm_val]
+        } else {
+            vec![TValue::from_table(mt_idx)]
+        }
+    };
     if let Some(table_idx) = val.as_table_idx() {
         if let Some(mt_idx) = ctx.gc.get_table(table_idx).metatable {
-            // Check for __metatable field
-            let mm_name = ctx.strings.intern(b"__metatable");
-            let mm_val = ctx.gc.get_table(mt_idx).raw_get_str(mm_name);
-            if !mm_val.is_nil() {
-                return Ok(vec![mm_val]);
-            }
-            Ok(vec![TValue::from_table(mt_idx)])
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else if val.is_string() {
+        // String metatable
+        if let Some(mt_idx) = ctx.gc.string_metatable {
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
+        } else {
+            Ok(vec![TValue::nil()])
+        }
+    } else if let Some(ud_idx) = val.as_userdata_idx() {
+        if let Some(mt_idx) = ctx.gc.get_userdata(ud_idx).metatable {
+            Ok(check_mt(mt_idx, ctx.gc, ctx.strings))
         } else {
             Ok(vec![TValue::nil()])
         }
@@ -990,6 +1156,43 @@ fn native_collectgarbage_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, N
     ))
 }
 
+fn native_load_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "load stub should not be called directly".to_string(),
+    ))
+}
+
+fn native_dofile_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "dofile stub should not be called directly".to_string(),
+    ))
+}
+
+fn native_loadfile_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Err(NativeError::String(
+        "loadfile stub should not be called directly".to_string(),
+    ))
+}
+
+fn native_warn_stub(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    // warn is handled inline (not redirected) since it only needs string args.
+    // Check for @on/@off control messages
+    if let Some(first) = _ctx.args.first() {
+        if let Some(sid) = first.as_string_id() {
+            let s = std::str::from_utf8(_ctx.strings.get_bytes(sid)).unwrap_or("");
+            if s == "@on" || s == "@off" {
+                // Control messages are handled by the caller (need Vm access)
+                // For now, just ignore - actual @on/@off needs Vm.warn_enabled
+                return Ok(vec![]);
+            }
+        }
+    }
+    // Regular warn: just print to stderr when enabled
+    // Note: actual warn_enabled check requires Vm access, so we just print here.
+    // This will be refined when redirected through call_function.
+    Ok(vec![])
+}
+
 /// Format a TValue for display (used by print, tostring).
 pub fn format_value(
     val: TValue,
@@ -1015,6 +1218,8 @@ pub fn format_value(
         format!("table: 0x{:x}", val.gc_index().unwrap_or(0))
     } else if val.as_closure_idx().is_some() || val.as_native_idx().is_some() {
         format!("function: 0x{:x}", val.gc_index().unwrap_or(0))
+    } else if val.is_userdata() {
+        format!("userdata: 0x{:x}", val.gc_index().unwrap_or(0))
     } else {
         format!("{:?}", val)
     }

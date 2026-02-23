@@ -327,6 +327,28 @@ impl TValue {
         }
     }
 
+    /// Create a TValue from a userdata GC index.
+    #[inline]
+    pub fn from_userdata(idx: GcIdx<crate::gc::Userdata>) -> Self {
+        Self::from_gc_sub(GC_SUB_USERDATA, idx.0)
+    }
+
+    /// Extract userdata index if this is a userdata.
+    #[inline]
+    pub fn as_userdata_idx(&self) -> Option<GcIdx<crate::gc::Userdata>> {
+        if self.gc_sub_tag() == Some(GC_SUB_USERDATA) {
+            Some(GcIdx(self.gc_index().unwrap(), PhantomData))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this is a userdata value.
+    #[inline]
+    pub fn is_userdata(&self) -> bool {
+        self.gc_sub_tag() == Some(GC_SUB_USERDATA)
+    }
+
     /// Returns true if this is any kind of function (closure or native).
     #[inline]
     pub fn is_function(&self) -> bool {
@@ -424,6 +446,7 @@ impl fmt::Debug for TValue {
                 Some(GC_SUB_NATIVE) => write!(f, "native(#{})", self.gc_index().unwrap()),
                 Some(GC_SUB_UPVAL) => write!(f, "upval(#{})", self.gc_index().unwrap()),
                 Some(GC_SUB_BOXED_INT) => write!(f, "boxedint(#{})", self.gc_index().unwrap()),
+                Some(GC_SUB_USERDATA) => write!(f, "userdata(#{})", self.gc_index().unwrap()),
                 _ => write!(f, "gc({:#x})", self.0 & PAYLOAD_MASK),
             }
         } else if self.is_light_userdata() {

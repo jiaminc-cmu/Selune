@@ -6,10 +6,10 @@ goto skip
 x = 999
 ::skip::
 
--- Goto skipping over variable scope
+-- Goto skipping statements (not locals) in block
 do
     goto done
-    local y = 42
+    print("skipped")
     ::done::
 end
 

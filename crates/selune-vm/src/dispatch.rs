@@ -19,6 +19,68 @@ macro_rules! proto {
     };
 }
 
+/// Format a runtime error with "source:line: " prefix using current call stack state.
+pub fn runtime_error(vm: &Vm, msg: &str) -> LuaError {
+    let prefix = get_error_prefix(vm, 0);
+    LuaError::Runtime(format!("{}{}", prefix, msg))
+}
+
+/// Add source:line prefix to a runtime error if it doesn't already have one.
+pub fn add_error_prefix(vm: &Vm, err: LuaError) -> LuaError {
+    match err {
+        LuaError::Runtime(msg) => {
+            // Don't add prefix if it already looks like it has source:line:
+            if msg.contains(':') && !msg.starts_with("bad argument") && !msg.starts_with("attempt to") {
+                LuaError::Runtime(msg)
+            } else {
+                let prefix = get_error_prefix(vm, 0);
+                LuaError::Runtime(format!("{}{}", prefix, msg))
+            }
+        }
+        other => other,
+    }
+}
+
+/// Get error prefix "source:line: " for a given call stack level offset.
+/// Level 0 = current frame, 1 = caller, etc.
+fn get_error_prefix(vm: &Vm, level: usize) -> String {
+    // Walk backwards through call stack to find the right Lua frame
+    let mut lua_level = 0;
+    for i in (0..vm.call_stack.len()).rev() {
+        let ci = &vm.call_stack[i];
+        if ci.proto_idx < vm.protos.len() {
+            if lua_level == level {
+                let proto = &vm.protos[ci.proto_idx];
+                let source = proto.source.map(|sid| {
+                    let bytes = vm.strings.get_bytes(sid);
+                    let s = String::from_utf8_lossy(bytes);
+                    if s.starts_with('@') {
+                        s[1..].to_string()
+                    } else if s.starts_with('=') {
+                        s[1..].to_string()
+                    } else {
+                        // Short source: first line of string chunk
+                        let short = if s.len() > 45 {
+                            format!("[string \"{}...\"]", &s[..45])
+                        } else {
+                            format!("[string \"{}\"]", s.replace('\n', ""))
+                        };
+                        short
+                    }
+                }).unwrap_or_else(|| "?".to_string());
+                let line = if ci.pc > 0 {
+                    proto.get_line(ci.pc - 1)
+                } else {
+                    proto.get_line(0)
+                };
+                return format!("{}:{}: ", source, line);
+            }
+            lua_level += 1;
+        }
+    }
+    String::new()
+}
+
 /// Get a constant from the current proto, cloned to avoid borrow issues.
 #[inline]
 fn get_k(vm: &Vm, ci_idx: usize, idx: usize) -> Constant {
@@ -1102,6 +1164,13 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.coro_wrap_resume_idx == Some(native_idx)
                         || vm.collectgarbage_idx == Some(native_idx)
                         || vm.tostring_idx == Some(native_idx)
+                        || vm.load_idx == Some(native_idx)
+                        || vm.dofile_idx == Some(native_idx)
+                        || vm.loadfile_idx == Some(native_idx)
+                        || vm.require_idx == Some(native_idx)
+                        || vm.error_idx == Some(native_idx)
+                        || vm.debug_getupvalue_idx == Some(native_idx)
+                        || vm.debug_setupvalue_idx == Some(native_idx)
                     {
                         // Redirect through call_function for full VM access
                         let args: Vec<TValue> =
@@ -1272,6 +1341,13 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.coro_wrap_resume_idx == Some(native_idx)
                         || vm.collectgarbage_idx == Some(native_idx)
                         || vm.tostring_idx == Some(native_idx)
+                        || vm.load_idx == Some(native_idx)
+                        || vm.dofile_idx == Some(native_idx)
+                        || vm.loadfile_idx == Some(native_idx)
+                        || vm.require_idx == Some(native_idx)
+                        || vm.error_idx == Some(native_idx)
+                        || vm.debug_getupvalue_idx == Some(native_idx)
+                        || vm.debug_setupvalue_idx == Some(native_idx)
                     {
                         call_function(vm, func_val, &args)?
                     } else {
@@ -1706,11 +1782,23 @@ fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, Lu
             Ok(TValue::nil())
         }
     } else {
-        // Non-table: check for __index metamethod (unlikely but valid for userdata etc.)
-        Err(LuaError::Runtime(format!(
-            "attempt to index a {} value",
-            selune_core::object::lua_type_name(table_val, &vm.gc)
-        )))
+        // Non-table: check for __index metamethod (valid for userdata)
+        let mm_name = vm.mm_names.as_ref().unwrap().index;
+        if let Some(mm) = metamethod::get_metamethod(table_val, mm_name, &vm.gc) {
+            if let Some(mm_table_idx) = mm.as_table_idx() {
+                // __index is a table: look up the key in it
+                let result = vm.gc.get_table(mm_table_idx).raw_get(key);
+                return Ok(result);
+            }
+            // __index is a function: call with (object, key)
+            let results = call_function(vm, mm, &[table_val, key])?;
+            Ok(results.first().copied().unwrap_or(TValue::nil()))
+        } else {
+            Err(LuaError::Runtime(format!(
+                "attempt to index a {} value",
+                selune_core::object::lua_type_name(table_val, &vm.gc)
+            )))
+        }
     }
 }
 
@@ -2630,6 +2718,20 @@ pub fn call_function(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec<T
             do_collectgarbage(vm, args)
         } else if vm.tostring_idx == Some(native_idx) {
             do_tostring(vm, args)
+        } else if vm.load_idx == Some(native_idx) {
+            do_load(vm, args)
+        } else if vm.dofile_idx == Some(native_idx) {
+            do_dofile(vm, args)
+        } else if vm.loadfile_idx == Some(native_idx) {
+            do_loadfile(vm, args)
+        } else if vm.require_idx == Some(native_idx) {
+            do_require(vm, args)
+        } else if vm.error_idx == Some(native_idx) {
+            do_error(vm, args)
+        } else if vm.debug_getupvalue_idx == Some(native_idx) {
+            do_debug_getupvalue(vm, args)
+        } else if vm.debug_setupvalue_idx == Some(native_idx) {
+            do_debug_setupvalue(vm, args)
         } else {
             // Normal native function call
             let native_fn = vm.gc.get_native(native_idx).func;
@@ -2749,6 +2851,401 @@ fn do_tostring(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
         let s = crate::vm::format_value(val, &vm.gc, &vm.strings);
         let sid = vm.strings.intern_or_create(s.as_bytes());
         Ok(vec![TValue::from_string_id(sid)])
+    }
+}
+
+/// Handle `load(chunk [, chunkname [, mode [, env]]])`.
+/// If chunk is a string, compile it. If it's a function, call it repeatedly to build source.
+/// Returns the compiled function on success, or (nil, errmsg) on failure.
+fn do_load(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let chunk = args.first().copied().unwrap_or(TValue::nil());
+    let chunkname = args.get(1).copied().unwrap_or(TValue::nil());
+    let mode = args.get(2).copied().unwrap_or(TValue::nil());
+    let env = args.get(3).copied();
+
+    // Determine mode (only "t" text mode supported)
+    if let Some(sid) = mode.as_string_id() {
+        let mode_str = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap_or("");
+        if !mode_str.contains('t') {
+            let msg = vm.strings.intern_or_create(b"attempt to load a binary chunk (mode is text only)");
+            return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+        }
+    }
+
+    // Get chunk name
+    let name = if let Some(sid) = chunkname.as_string_id() {
+        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+    } else if chunk.is_string() {
+        "=(load)".to_string()
+    } else {
+        "=(load)".to_string()
+    };
+
+    // Get source bytes
+    let source = if let Some(sid) = chunk.as_string_id() {
+        vm.strings.get_bytes(sid).to_vec()
+    } else if chunk.is_function() {
+        // Function reader: call chunk() repeatedly, concatenate results
+        let mut parts = Vec::new();
+        loop {
+            let result = call_function(vm, chunk, &[])?;
+            let part = result.first().copied().unwrap_or(TValue::nil());
+            if part.is_nil() {
+                break;
+            }
+            if let Some(sid) = part.as_string_id() {
+                let bytes = vm.strings.get_bytes(sid).to_vec();
+                if bytes.is_empty() {
+                    break;
+                }
+                parts.extend_from_slice(&bytes);
+            } else {
+                let msg = vm.strings.intern_or_create(b"reader function must return a string");
+                return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+            }
+        }
+        parts
+    } else {
+        let msg = vm.strings.intern_or_create(
+            format!(
+                "bad argument #1 to 'load' (value expected, got {})",
+                selune_core::object::lua_type_name(chunk, &vm.gc)
+            )
+            .as_bytes(),
+        );
+        return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+    };
+
+    // Compile
+    match vm.load_chunk(&source, &name, env) {
+        Ok(closure_val) => Ok(vec![closure_val]),
+        Err(err_msg) => {
+            let msg = vm.strings.intern_or_create(err_msg.as_bytes());
+            Ok(vec![TValue::nil(), TValue::from_string_id(msg)])
+        }
+    }
+}
+
+/// Handle `dofile([filename])`.
+/// Reads file, compiles it, and executes it. Returns the chunk's results.
+fn do_dofile(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let filename = args.first().copied().unwrap_or(TValue::nil());
+
+    let source = if filename.is_nil() {
+        // Read from stdin
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| LuaError::Runtime(format!("cannot read stdin: {e}")))?;
+        buf
+    } else {
+        let sid = filename.as_string_id().ok_or_else(|| {
+            LuaError::Runtime("bad argument #1 to 'dofile' (string expected)".to_string())
+        })?;
+        let path = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+        std::fs::read(&path).map_err(|e| {
+            LuaError::Runtime(format!("cannot open {path}: {e}"))
+        })?
+    };
+
+    let name = if let Some(sid) = filename.as_string_id() {
+        let path_str = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+        format!("@{path_str}")
+    } else {
+        "=stdin".to_string()
+    };
+
+    let closure_val = vm.load_chunk(&source, &name, None).map_err(|e| {
+        LuaError::Runtime(e)
+    })?;
+
+    // Execute the loaded chunk
+    call_function(vm, closure_val, &[])
+}
+
+/// Handle `loadfile([filename [, mode [, env]]])`.
+/// Reads file, compiles it, returns the function (does not execute).
+fn do_loadfile(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let filename = args.first().copied().unwrap_or(TValue::nil());
+    let mode = args.get(1).copied().unwrap_or(TValue::nil());
+    let env = args.get(2).copied();
+
+    // Check mode
+    if let Some(sid) = mode.as_string_id() {
+        let mode_str = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap_or("");
+        if !mode_str.contains('t') {
+            let msg = vm.strings.intern_or_create(b"attempt to load a binary chunk (mode is text only)");
+            return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+        }
+    }
+
+    let source = if filename.is_nil() {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| LuaError::Runtime(format!("cannot read stdin: {e}")))?;
+        buf
+    } else {
+        let sid = filename.as_string_id().ok_or_else(|| {
+            LuaError::Runtime("bad argument #1 to 'loadfile' (string expected)".to_string())
+        })?;
+        let path = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+        match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) => {
+                let msg = vm.strings.intern_or_create(
+                    format!("cannot open {path}: {e}").as_bytes(),
+                );
+                return Ok(vec![TValue::nil(), TValue::from_string_id(msg)]);
+            }
+        }
+    };
+
+    let name = if let Some(sid) = filename.as_string_id() {
+        let path_str = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+        format!("@{path_str}")
+    } else {
+        "=stdin".to_string()
+    };
+
+    match vm.load_chunk(&source, &name, env) {
+        Ok(closure_val) => Ok(vec![closure_val]),
+        Err(err_msg) => {
+            let msg = vm.strings.intern_or_create(err_msg.as_bytes());
+            Ok(vec![TValue::nil(), TValue::from_string_id(msg)])
+        }
+    }
+}
+
+/// Handle `require(modname)`.
+/// Checks package.loaded, package.preload, then searches package.path for Lua files.
+fn do_require(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let modname_val = args.first().copied().unwrap_or(TValue::nil());
+    let modname_sid = modname_val.as_string_id().ok_or_else(|| {
+        LuaError::Runtime("bad argument #1 to 'require' (string expected)".to_string())
+    })?;
+    let modname = String::from_utf8_lossy(vm.strings.get_bytes(modname_sid)).into_owned();
+
+    // 1. Check package.loaded[modname]
+    let loaded_idx = vm.package_loaded_idx.ok_or_else(|| {
+        LuaError::Runtime("package.loaded not initialized".to_string())
+    })?;
+    let cached = vm.gc.get_table(loaded_idx).raw_get_str(modname_sid);
+    if !cached.is_nil() {
+        return Ok(vec![cached]);
+    }
+
+    // 2. Check package.preload[modname]
+    let preload_idx = vm.package_preload_idx.ok_or_else(|| {
+        LuaError::Runtime("package.preload not initialized".to_string())
+    })?;
+    let preload_func = vm.gc.get_table(preload_idx).raw_get_str(modname_sid);
+    if !preload_func.is_nil() {
+        // Set package.loaded[modname] = true (sentinel to prevent circular require)
+        vm.gc.get_table_mut(loaded_idx)
+            .raw_set_str(modname_sid, TValue::from_bool(true));
+
+        // Call the preload function with modname as argument
+        let result = call_function(vm, preload_func, &[modname_val])?;
+        let module = result.first().copied().unwrap_or(TValue::nil());
+
+        // If the loader returned a non-nil value, store it in package.loaded
+        if !module.is_nil() {
+            vm.gc.get_table_mut(loaded_idx)
+                .raw_set_str(modname_sid, module);
+            return Ok(vec![module]);
+        }
+
+        // Otherwise check if the loader set package.loaded[modname] to something
+        let final_val = vm.gc.get_table(loaded_idx).raw_get_str(modname_sid);
+        return Ok(vec![final_val]);
+    }
+
+    // 3. Search for a Lua file using package.path
+    let env_idx = vm.env_idx.ok_or_else(|| {
+        LuaError::Runtime("_ENV not available".to_string())
+    })?;
+    let pkg_key = vm.strings.intern(b"package");
+    let pkg_tval = vm.gc.get_table(env_idx).raw_get_str(pkg_key);
+    let pkg_table_idx = pkg_tval.as_table_idx().ok_or_else(|| {
+        LuaError::Runtime("package table not found".to_string())
+    })?;
+    let path_key = vm.strings.intern(b"path");
+    let path_val = vm.gc.get_table(pkg_table_idx).raw_get_str(path_key);
+    let path_str = if let Some(sid) = path_val.as_string_id() {
+        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+    } else {
+        "./?.lua".to_string()
+    };
+
+    if let Some(filepath) = selune_stdlib::package_lib::search_lua_file(&modname, &path_str) {
+        // Set package.loaded[modname] = true (sentinel to prevent circular require)
+        vm.gc.get_table_mut(loaded_idx)
+            .raw_set_str(modname_sid, TValue::from_bool(true));
+
+        // Read and compile the file
+        let source = std::fs::read(&filepath).map_err(|e| {
+            LuaError::Runtime(format!("cannot open {}: {}", filepath, e))
+        })?;
+        let name = format!("@{}", filepath);
+        let closure_val = vm.load_chunk(&source, &name, None).map_err(|e| {
+            LuaError::Runtime(format!("error loading module '{}' from file '{}':\n\t{}", modname, filepath, e))
+        })?;
+
+        // Execute the loaded chunk with modname and filepath as arguments
+        let filepath_sid = vm.strings.intern_or_create(filepath.as_bytes());
+        let filepath_val = TValue::from_string_id(filepath_sid);
+        let result = call_function(vm, closure_val, &[modname_val, filepath_val])?;
+        let module = result.first().copied().unwrap_or(TValue::nil());
+
+        // If the loader returned a non-nil value, store it in package.loaded
+        if !module.is_nil() {
+            vm.gc.get_table_mut(loaded_idx)
+                .raw_set_str(modname_sid, module);
+            return Ok(vec![module]);
+        }
+
+        // Check if the module set package.loaded[modname] itself
+        let final_val = vm.gc.get_table(loaded_idx).raw_get_str(modname_sid);
+        return Ok(vec![final_val]);
+    }
+
+    // 4. Module not found - build error message
+    let modname_path = modname.replace('.', "/");
+    let mut tried = String::new();
+    for template in path_str.split(';') {
+        let filepath = template.replace('?', &modname_path);
+        tried.push_str(&format!("\n\tno file '{}'", filepath));
+    }
+    Err(LuaError::Runtime(format!(
+        "module '{}' not found:{}",
+        modname, tried
+    )))
+}
+
+/// Handle `error(msg [, level])`.
+/// Raises an error with the given message, optionally adding source:line prefix.
+fn do_error(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let msg = args.first().copied().unwrap_or(TValue::nil());
+    let _level = args
+        .get(1)
+        .and_then(|v| v.as_full_integer(&vm.gc))
+        .unwrap_or(1);
+
+    // If msg is a string and level > 0, add source:line prefix
+    if let Some(sid) = msg.as_string_id() {
+        let s = String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned();
+        if _level > 0 {
+            let prefix = get_error_prefix(vm, (_level - 1) as usize);
+            let full = format!("{}{}", prefix, s);
+            Err(LuaError::Runtime(full))
+        } else {
+            Err(LuaError::Runtime(s))
+        }
+    } else {
+        // Non-string errors are raised as-is (no prefix)
+        Err(LuaError::LuaValue(msg))
+    }
+}
+
+/// Handle `debug.getupvalue(f, up)`.
+/// Returns name, value for upvalue #up of function f, or nil if out of range.
+/// Needs VM access to look up upvalue names from Proto.
+fn do_debug_getupvalue(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let func = args.first().copied().unwrap_or(TValue::nil());
+    let n_val = args.get(1).copied().unwrap_or(TValue::nil());
+    let n = n_val.as_full_integer(&vm.gc).unwrap_or(0) as usize;
+
+    if let Some(cl_idx) = func.as_closure_idx() {
+        let closure = vm.gc.get_closure(cl_idx);
+        if n < 1 || n > closure.upvalues.len() {
+            return Ok(vec![TValue::nil()]);
+        }
+        let idx = n - 1;
+        let proto_idx = closure.proto_idx;
+        let uv_gc_idx = closure.upvalues[idx];
+
+        // Get upvalue name from proto
+        let name = if proto_idx < vm.protos.len() {
+            let proto = &vm.protos[proto_idx];
+            if idx < proto.upvalues.len() {
+                proto.upvalues[idx].name.map(|sid| {
+                    let bytes = vm.strings.get_bytes(sid);
+                    String::from_utf8_lossy(bytes).into_owned()
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let name_str = name.unwrap_or_else(|| format!("(upvalue {})", n));
+
+        // Get upvalue value
+        let uv = vm.gc.get_upval(uv_gc_idx);
+        let val = match uv.location {
+            selune_core::gc::UpValLocation::Closed(v) => v,
+            selune_core::gc::UpValLocation::Open(stack_idx) => vm.stack[stack_idx],
+            selune_core::gc::UpValLocation::OpenInThread(_, _) => TValue::nil(),
+        };
+
+        let name_sid = vm.strings.intern_or_create(name_str.as_bytes());
+        Ok(vec![TValue::from_string_id(name_sid), val])
+    } else {
+        Ok(vec![TValue::nil()])
+    }
+}
+
+/// Handle `debug.setupvalue(f, up, value)`.
+/// Sets upvalue #up of function f to value. Returns name or nil.
+fn do_debug_setupvalue(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    let func = args.first().copied().unwrap_or(TValue::nil());
+    let n_val = args.get(1).copied().unwrap_or(TValue::nil());
+    let new_val = args.get(2).copied().unwrap_or(TValue::nil());
+    let n = n_val.as_full_integer(&vm.gc).unwrap_or(0) as usize;
+
+    if let Some(cl_idx) = func.as_closure_idx() {
+        let closure = vm.gc.get_closure(cl_idx);
+        if n < 1 || n > closure.upvalues.len() {
+            return Ok(vec![TValue::nil()]);
+        }
+        let idx = n - 1;
+        let proto_idx = closure.proto_idx;
+        let uv_gc_idx = closure.upvalues[idx];
+
+        // Get upvalue name from proto
+        let name = if proto_idx < vm.protos.len() {
+            let proto = &vm.protos[proto_idx];
+            if idx < proto.upvalues.len() {
+                proto.upvalues[idx].name.map(|sid| {
+                    let bytes = vm.strings.get_bytes(sid);
+                    String::from_utf8_lossy(bytes).into_owned()
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let name_str = name.unwrap_or_else(|| format!("(upvalue {})", n));
+
+        // Set upvalue value
+        let uv = vm.gc.get_upval_mut(uv_gc_idx);
+        match &mut uv.location {
+            selune_core::gc::UpValLocation::Closed(ref mut v) => *v = new_val,
+            selune_core::gc::UpValLocation::Open(stack_idx) => {
+                let si = *stack_idx;
+                vm.stack[si] = new_val;
+            }
+            selune_core::gc::UpValLocation::OpenInThread(_, _) => {}
+        }
+
+        let name_sid = vm.strings.intern_or_create(name_str.as_bytes());
+        Ok(vec![TValue::from_string_id(name_sid)])
+    } else {
+        Ok(vec![TValue::nil()])
     }
 }
 

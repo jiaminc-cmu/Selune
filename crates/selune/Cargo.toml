@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 selune-core.workspace = true
 selune-compiler.workspace = true
+selune-vm.workspace = true
+selune-stdlib.workspace = true
+rustyline = "14"

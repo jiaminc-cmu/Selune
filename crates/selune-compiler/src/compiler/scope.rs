@@ -51,6 +51,7 @@ pub struct LabelInfo {
     pub name: StringId,
     pub pc: usize,
     pub num_locals: usize,
+    pub line: u32,
 }
 
 /// Manages scopes and local variables for a single function.
@@ -132,6 +133,48 @@ impl ScopeManager {
 
     /// Leave the current block scope. Returns break jump PCs to patch.
     /// Unresolved pending gotos are propagated to the parent block.
+    /// Goto num_locals are adjusted to the block entry level (PUC Lua semantics).
+    /// Adjust labels at the end of the current block.
+    /// Labels whose PC equals `current_pc` (nothing emitted after them) have their
+    /// num_locals reduced to the block entry level. This implements PUC Lua's
+    /// "label at block end" semantics: gotos can jump over locals to labels at block end.
+    /// Returns any resolved (goto_idx, target_pc) pairs for patching.
+    pub fn adjust_end_labels(&mut self, current_pc: usize) -> Vec<(usize, usize)> {
+        let block = match self.blocks.last_mut() {
+            Some(b) => b,
+            None => return vec![],
+        };
+        let entry_locals = block.num_locals_on_entry;
+
+        // Adjust labels at block end: any label whose PC == current_pc
+        // (i.e., no instructions were emitted after it)
+        for label in &mut block.labels {
+            if label.pc == current_pc {
+                label.num_locals = entry_locals;
+            }
+        }
+
+        // Re-resolve pending gotos against adjusted labels
+        let mut resolved = Vec::new(); // (goto_pc, target_pc)
+        let mut resolved_indices = Vec::new();
+        for (goto_idx, goto_info) in block.pending_gotos.iter().enumerate() {
+            for label in &block.labels {
+                if label.name == goto_info.name && goto_info.num_locals >= label.num_locals {
+                    resolved.push((goto_info.pc, label.pc));
+                    resolved_indices.push(goto_idx);
+                    break;
+                }
+            }
+        }
+
+        // Remove resolved gotos (in reverse order to maintain indices)
+        for &idx in resolved_indices.iter().rev() {
+            block.pending_gotos.remove(idx);
+        }
+
+        resolved
+    }
+
     pub fn leave_block(&mut self) -> BlockScope {
         self.scope_depth -= 1;
         let block = self.blocks.pop().expect("mismatched block");
@@ -140,9 +183,17 @@ impl ScopeManager {
         self.free_reg = block.first_free_reg_on_entry;
 
         // Propagate unresolved pending gotos to the parent block
+        // Adjust num_locals down to the block entry level
         if !block.pending_gotos.is_empty() {
             if let Some(parent) = self.blocks.last_mut() {
-                parent.pending_gotos.extend(block.pending_gotos.iter().cloned());
+                let adjusted_gotos = block.pending_gotos.iter().map(|g| {
+                    let mut adjusted = g.clone();
+                    if adjusted.num_locals > block.num_locals_on_entry {
+                        adjusted.num_locals = block.num_locals_on_entry;
+                    }
+                    adjusted
+                });
+                parent.pending_gotos.extend(adjusted_gotos);
             }
         }
 

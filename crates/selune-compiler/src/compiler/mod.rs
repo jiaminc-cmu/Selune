@@ -45,6 +45,7 @@ struct UpvalInfo {
     name: StringId,
     in_stack: bool,
     index: u8,
+    is_const: bool,
 }
 
 /// State for a single function being compiled.
@@ -107,6 +108,13 @@ impl<'a> Compiler<'a> {
     fn new(source: &'a [u8]) -> Self {
         Compiler {
             lexer: Lexer::new(source),
+            func_stack: Vec::new(),
+        }
+    }
+
+    fn with_strings(source: &'a [u8], strings: StringInterner) -> Self {
+        Compiler {
+            lexer: Lexer::with_strings(source, strings),
             func_stack: Vec::new(),
         }
     }
@@ -430,8 +438,16 @@ impl<'a> Compiler<'a> {
                     // so higher-priority ops (+ * ^ unary) are absorbed
                     // but further concats are NOT absorbed into this operand.
                     let operand = self.sub_expression(left_prec)?;
-                    let reg = self.fs_mut().scope.alloc_reg();
-                    self.discharge_to_reg(&operand, reg, op_line);
+                    // Target register must be consecutive: first_reg + count.
+                    // After sub_expression, free_reg may have moved due to
+                    // function calls allocating temp registers. Reset it so
+                    // the operand goes into the correct consecutive slot.
+                    let target = first_reg + count;
+                    if self.fs().scope.free_reg < target + 1 {
+                        self.fs_mut().scope.free_reg = target + 1;
+                    }
+                    self.discharge_to_reg(&operand, target, op_line);
+                    self.fs_mut().scope.free_reg = target + 1;
                     count += 1;
                     // Check if next token is also concat
                     if let Some(next_op) = self.check_binary_op()? {
@@ -582,27 +598,47 @@ impl<'a> Compiler<'a> {
         Ok(expr)
     }
 
-    /// Finish parsing an expression that started with a name (for table constructor reuse).
-    fn finish_expression(&mut self, expr: ExprDesc) -> Result<ExprDesc, CompileError> {
-        // Continue with binary operators if any
-        if let Some(binop) = self.check_binary_op()? {
+    /// Continue parsing binary operators on an already-parsed left-hand expression.
+    /// This is equivalent to the loop body of `sub_expression` starting from priority 0.
+    fn continue_sub_expression(&mut self, mut expr: ExprDesc, min_prec: u8) -> Result<ExprDesc, CompileError> {
+        while let Some(binop) = self.check_binary_op()? {
             let (left_prec, right_prec) = binop.priority();
-            if left_prec > 0 {
-                let op_line = self.line();
-                self.advance()?;
-                let left_reg = self.discharge_to_any_reg(&expr, op_line);
-                if binop == BinOp::And || binop == BinOp::Or {
-                    // Put the value back and call sub_expression properly
-                    // Actually, for simplicity in table constructors, just handle it:
-                    let right = self.sub_expression(right_prec)?;
-                    if binop == BinOp::And || binop == BinOp::Or {
-                        // Short-circuit was already handled in sub_expression
-                        return self.code_binary_op(binop, left_reg, right, op_line);
+            if left_prec <= min_prec {
+                break;
+            }
+            let op_line = self.line();
+            self.advance()?;
+
+            if binop == BinOp::And || binop == BinOp::Or {
+                expr = self.code_short_circuit(binop, expr, right_prec, op_line)?;
+            } else if binop == BinOp::Concat {
+                let first_reg = self.fs_mut().scope.alloc_reg();
+                self.discharge_to_reg(&expr, first_reg, op_line);
+                let mut count: u8 = 1;
+                loop {
+                    let operand = self.sub_expression(left_prec)?;
+                    let target = first_reg + count;
+                    if self.fs().scope.free_reg < target + 1 {
+                        self.fs_mut().scope.free_reg = target + 1;
                     }
-                    return self.code_binary_op(binop, left_reg, right, op_line);
+                    self.discharge_to_reg(&operand, target, op_line);
+                    self.fs_mut().scope.free_reg = target + 1;
+                    count += 1;
+                    if let Some(next_op) = self.check_binary_op()? {
+                        if next_op == BinOp::Concat {
+                            self.advance()?;
+                            continue;
+                        }
+                    }
+                    break;
                 }
+                self.emit_abc(OpCode::Concat, first_reg, count, 0, op_line);
+                self.fs_mut().scope.free_reg_to(first_reg + 1);
+                expr = ExprDesc::Register(first_reg);
+            } else {
+                let left_reg = self.discharge_to_any_reg(&expr, op_line);
                 let right = self.sub_expression(right_prec)?;
-                return self.code_binary_op(binop, left_reg, right, op_line);
+                expr = self.code_binary_op(binop, left_reg, right, op_line)?;
             }
         }
         Ok(expr)
@@ -619,6 +655,16 @@ impl<'a> Compiler<'a> {
             ExprDesc::Register(r) if *r >= num_locals => {
                 // Already above all locals — safe to use directly
                 *r
+            }
+            ExprDesc::Call(pc) => {
+                // Chained call: resolve the previous call to 1 result in its A
+                // register, then reuse that register as the function for this call.
+                let inst = &mut self.fs_mut().proto.code[*pc];
+                let a = inst.a();
+                *inst = Instruction::abc(inst.opcode(), a, inst.b(), 2, inst.k());
+                // free_reg should be at a+1 after the previous call set it
+                self.fs_mut().scope.free_reg_to(a + 1);
+                a
             }
             _ => {
                 let reg = self.fs_mut().scope.alloc_reg();
@@ -939,8 +985,8 @@ impl<'a> Compiler<'a> {
                         let name_expr = self.resolve_name(name)?;
                         // Parse suffix chain on this name
                         let expr = self.finish_primary_expression(name_expr)?;
-                        // Check for binary operators
-                        let expr = self.finish_expression(expr)?;
+                        // Continue with binary operators (full Pratt parser)
+                        let expr = self.continue_sub_expression(expr, 0)?;
                         let eline = self.line();
                         last_array_is_multi =
                             matches!(&expr, ExprDesc::Call(_) | ExprDesc::Vararg(_));
@@ -1379,9 +1425,10 @@ impl<'a> Compiler<'a> {
             // At the outermost function, check its locals
             if let Some(local) = self.func_stack[0].scope.resolve_local(name) {
                 let reg = local.reg;
+                let is_const = local.is_const;
                 // Mark the local as captured by a closure
                 self.func_stack[0].scope.mark_captured(reg);
-                return Some(self.add_upvalue(fs_idx, name, true, reg));
+                return Some(self.add_upvalue(fs_idx, name, true, reg, is_const));
             }
             // Also check the outermost function's own upvalues (e.g., _ENV)
             for (i, up) in self.func_stack[0].upvalues.iter().enumerate() {
@@ -1396,20 +1443,22 @@ impl<'a> Compiler<'a> {
         let parent_idx = fs_idx - 1;
         if let Some(local) = self.func_stack[parent_idx].scope.resolve_local(name) {
             let reg = local.reg;
+            let is_const = local.is_const || local.is_close;
             // Mark the local as captured by a closure
             self.func_stack[parent_idx].scope.mark_captured(reg);
-            return Some(self.add_upvalue(fs_idx, name, true, reg));
+            return Some(self.add_upvalue(fs_idx, name, true, reg, is_const));
         }
 
         // Check parent's upvalues
         if let Some(parent_upval) = self.resolve_upvalue(parent_idx, name) {
-            return Some(self.add_upvalue(fs_idx, name, false, parent_upval));
+            let parent_is_const = self.func_stack[parent_idx].upvalues[parent_upval as usize].is_const;
+            return Some(self.add_upvalue(fs_idx, name, false, parent_upval, parent_is_const));
         }
 
         None
     }
 
-    fn add_upvalue(&mut self, fs_idx: usize, name: StringId, in_stack: bool, index: u8) -> u8 {
+    fn add_upvalue(&mut self, fs_idx: usize, name: StringId, in_stack: bool, index: u8, is_const: bool) -> u8 {
         let fs = &mut self.func_stack[fs_idx];
         // Check if already registered
         for (i, up) in fs.upvalues.iter().enumerate() {
@@ -1422,6 +1471,7 @@ impl<'a> Compiler<'a> {
             name,
             in_stack,
             index,
+            is_const,
         });
         idx
     }
@@ -1470,6 +1520,10 @@ impl<'a> Compiler<'a> {
         // Emit RETURN0 if no explicit return
         let ret_line = self.line();
         self.emit_abc(OpCode::Return0, 0, 0, 0, ret_line);
+
+        // Adjust labels at function end and check for unresolved gotos
+        self.close_block_gotos();
+        self.check_unresolved_gotos()?;
 
         // Pop FuncState
         let mut child_fs = self.func_stack.pop().unwrap();
@@ -1594,7 +1648,8 @@ impl<'a> Compiler<'a> {
                 } else if attr_bytes == b"close" {
                     (false, true)
                 } else {
-                    return Err(self.error("unknown attribute (expected 'const' or 'close')"));
+                    let attr_name = String::from_utf8_lossy(attr_bytes).into_owned();
+                    return Err(self.error(&format!("unknown attribute '{}'", attr_name)));
                 }
             } else {
                 (false, false)
@@ -1659,6 +1714,7 @@ impl<'a> Compiler<'a> {
         self.fs_mut().scope.enter_block(false);
         self.block()?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
         self.fs_mut().scope.leave_block();
 
         // Handle elseif chain
@@ -1679,6 +1735,7 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.enter_block(false);
             self.block()?;
             self.emit_close_if_needed(self.line());
+            self.close_block_gotos();
             self.fs_mut().scope.leave_block();
         }
 
@@ -1694,6 +1751,7 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.enter_block(false);
             self.block()?;
             self.emit_close_if_needed(self.line());
+            self.close_block_gotos();
             self.fs_mut().scope.leave_block();
         } else {
             // No else: patch false_jump to after the if statement
@@ -1723,6 +1781,7 @@ impl<'a> Compiler<'a> {
         self.fs_mut().scope.enter_block(true);
         self.block()?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
         let block = self.fs_mut().scope.leave_block();
 
         // Jump back to loop start
@@ -1747,6 +1806,7 @@ impl<'a> Compiler<'a> {
         self.fs_mut().scope.enter_block(false);
         self.block()?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
         self.fs_mut().scope.leave_block();
         self.expect(&Token::End)?;
         Ok(())
@@ -1810,6 +1870,7 @@ impl<'a> Compiler<'a> {
 
         self.block()?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -1883,6 +1944,7 @@ impl<'a> Compiler<'a> {
 
         self.block()?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -1925,6 +1987,7 @@ impl<'a> Compiler<'a> {
         let line = self.line();
         let loop_back_jump = self.code_test_jump(&cond, false, line)?;
         self.emit_close_if_needed(self.line());
+        self.close_block_gotos();
 
         let block = self.fs_mut().scope.leave_block();
 
@@ -2037,20 +2100,72 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.free_reg = base + 1;
         }
         let mut count = 1u8;
+        let mut last_expr = None;
         while self.test_next(&Token::Comma)? {
             let expr = self.expression()?;
-            self.discharge_to_reg(&expr, base + count, line);
-            count += 1;
-            // Advance free_reg past this value too
-            if self.fs().scope.free_reg <= base + count {
-                self.fs_mut().scope.free_reg = base + count;
+            if self.check(&Token::Comma) {
+                // Not the last expression — discharge normally
+                self.discharge_to_reg(&expr, base + count, line);
+                count += 1;
+                if self.fs().scope.free_reg <= base + count {
+                    self.fs_mut().scope.free_reg = base + count;
+                }
+            } else {
+                // Last expression — may be multi-return
+                last_expr = Some(expr);
             }
         }
         self.test_next(&Token::Semi)?;
-        self.emit(
-            Instruction::abc(OpCode::Return, base, count + 1, 0, false),
-            line,
-        );
+        if let Some(expr) = last_expr {
+            match &expr {
+                ExprDesc::Call(_pc) => {
+                    // Ensure the call is at base+count position
+                    // discharge_to_reg would have placed it, but we need multi-return
+                    // The Call instruction's A register already has the function.
+                    // We need to ensure results go to the right place.
+                    // Discharge the call expr to the target reg first, which generates
+                    // a MOVE + single-result Call. Instead, just patch the Call to C=0.
+                    self.discharge_to_reg(&expr, base + count, line);
+                    // Now find and patch the Call instruction to multi-return
+                    let code = &self.fs().proto.code;
+                    let mut patch_pc = code.len() - 1;
+                    while patch_pc > 0 {
+                        let op = code[patch_pc].opcode();
+                        if op == OpCode::Call {
+                            break;
+                        }
+                        patch_pc -= 1;
+                    }
+                    let pinst = self.fs().proto.code[patch_pc];
+                    self.fs_mut().proto.code[patch_pc] =
+                        Instruction::abc(OpCode::Call, pinst.a(), pinst.b(), 0, pinst.k());
+                    // Remove any MOVE after the Call (from discharge_to_reg)
+                    self.fs_mut().proto.code.truncate(patch_pc + 1);
+                    self.fs_mut().proto.line_info.truncate(patch_pc + 1);
+                    // Return with B=0 (multi-return: base to stack_top)
+                    self.emit_abc(OpCode::Return, base, 0, 0, line);
+                }
+                ExprDesc::Vararg(pc) => {
+                    let pc = *pc;
+                    self.fs_mut().proto.code[pc] =
+                        Instruction::abc(OpCode::VarArg, base + count, 0, 0, false);
+                    self.emit_abc(OpCode::Return, base, 0, 0, line);
+                }
+                _ => {
+                    self.discharge_to_reg(&expr, base + count, line);
+                    count += 1;
+                    self.emit(
+                        Instruction::abc(OpCode::Return, base, count + 1, 0, false),
+                        line,
+                    );
+                }
+            }
+        } else {
+            self.emit(
+                Instruction::abc(OpCode::Return, base, count + 1, 0, false),
+                line,
+            );
+        }
         Ok(())
     }
 
@@ -2081,9 +2196,21 @@ impl<'a> Compiler<'a> {
         let pc = self.emit_sj(OpCode::Jmp, 0, line);
         let num_locals = self.fs().scope.num_locals();
 
-        // Try to resolve immediately
+        // Try to resolve immediately (backward goto to already-defined label)
         let resolved = self.find_label(name);
-        if let Some(target_pc) = resolved {
+        if let Some((target_pc, label_num_locals)) = resolved {
+            // Check if goto jumps over locals (backward goto should not)
+            if num_locals < label_num_locals {
+                let local_name = self.fs().scope.locals[num_locals].name;
+                let local_name_bytes = self.lexer.strings.get_bytes(local_name).to_vec();
+                let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
+                let goto_name_bytes = self.lexer.strings.get_bytes(name).to_vec();
+                let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
+                return Err(self.error(&format!(
+                    "<goto {}> at line {} jumps into the scope of local '{}'",
+                    goto_name_str, line, local_name_str
+                )));
+            }
             self.patch_jump_to(pc, target_pc);
         } else {
             // Save as pending goto
@@ -2102,49 +2229,78 @@ impl<'a> Compiler<'a> {
     /// `:: name ::`
     fn stat_label(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume '::'
+        let label_line = self.line();
         let name = self.expect_name()?;
         self.expect(&Token::DoubleColon)?;
         let pc = self.fs().current_pc();
         let num_locals = self.fs().scope.num_locals();
 
-        if let Some(block) = self.fs_mut().scope.current_block_mut() {
-            // Check for duplicate label
-            for label in &block.labels {
-                if label.name == name {
-                    return Err(self.error("duplicate label"));
-                }
-            }
-            block.labels.push(LabelInfo {
-                name,
-                pc,
-                num_locals,
-            });
+        // Note: "label at block end" adjustment is handled in close_block_labels(),
+        // called when the block closes. This allows consecutive labels at block end to all
+        // get the reduced num_locals, while labels followed by statements do not.
 
-            // Resolve pending gotos that reference this label
-            let mut resolved = Vec::new();
-            for (i, goto) in block.pending_gotos.iter().enumerate() {
-                if goto.name == name {
-                    resolved.push((i, goto.pc));
+        // Check for duplicate label in all visible scopes (same function)
+        {
+            let label_name_bytes = self.lexer.strings.get_bytes(name).to_vec();
+            let label_name_str = String::from_utf8_lossy(&label_name_bytes).into_owned();
+            for block in self.fs().scope.blocks.iter() {
+                for label in &block.labels {
+                    if label.name == name {
+                        return Err(self.error(&format!(
+                            "label '{}' already defined on line {}",
+                            label_name_str, label.line
+                        )));
+                    }
                 }
             }
-            for (_, goto_pc) in &resolved {
-                self.patch_jump_to(*goto_pc, pc);
+        }
+
+        // Add label to current block
+        self.fs_mut().scope.current_block_mut().unwrap().labels.push(LabelInfo {
+            name,
+            pc,
+            num_locals,
+            line: label_line,
+        });
+
+        // Resolve pending gotos that reference this label
+        // First pass: collect matching gotos (to avoid borrow conflicts)
+        // Gotos that would jump into scope of a local are left pending — they will either
+        // be resolved by close_block_gotos() (if the label turns out to be at block end)
+        // or will error via check_unresolved_gotos() at function close.
+        let mut resolved = Vec::new();
+        {
+            let block = self.fs().scope.blocks.last().unwrap();
+            for (i, goto_info) in block.pending_gotos.iter().enumerate() {
+                if goto_info.name == name {
+                    // Only resolve if goto doesn't jump over local variable declarations
+                    if goto_info.num_locals >= num_locals {
+                        resolved.push((i, goto_info.pc));
+                    }
+                    // If goto_info.num_locals < num_locals, leave it pending.
+                    // close_block_gotos may adjust the label's num_locals at block end.
+                }
             }
-            // Remove resolved gotos (in reverse order to preserve indices)
-            for (i, _) in resolved.into_iter().rev() {
-                self.fs_mut()
-                    .scope
-                    .current_block_mut()
-                    .unwrap()
-                    .pending_gotos
-                    .remove(i);
-            }
+        }
+
+        for (_, goto_pc) in &resolved {
+            self.patch_jump_to(*goto_pc, pc);
+        }
+        // Remove resolved gotos (in reverse order to preserve indices)
+        for (i, _) in resolved.into_iter().rev() {
+            self.fs_mut()
+                .scope
+                .current_block_mut()
+                .unwrap()
+                .pending_gotos
+                .remove(i);
         }
         Ok(())
     }
 
     /// Expression statement or assignment.
     fn stat_expr_or_assign(&mut self) -> Result<(), CompileError> {
+        let save_free_reg = self.fs().scope.free_reg;
         let expr = self.primary_expression()?;
         let line = self.line();
 
@@ -2160,24 +2316,16 @@ impl<'a> Compiler<'a> {
             let base = self.fs().scope.free_reg;
             let count = targets.len();
 
-            // Parse right-hand side.
-            // After discharging each RHS value, advance free_reg so the next
-            // expression's temporaries don't clobber previously discharged values.
-            let first = self.expression()?;
-            self.discharge_to_reg(&first, base, line);
-            self.fs_mut().scope.free_reg = base + 1;
-            let mut num_rhs = 1;
-            while self.test_next(&Token::Comma)? {
-                let e = self.expression()?;
-                self.discharge_to_reg(&e, base + num_rhs, line);
-                num_rhs += 1;
-                self.fs_mut().scope.free_reg = base + num_rhs;
-            }
+            // Parse right-hand side using expression_list_adjust to handle
+            // multi-return from the last expression (e.g., a,b = f())
+            let num_rhs = self.expression_list_adjust(base, count as u8)?;
 
-            // Pad with nils
-            while (num_rhs as usize) < count {
-                self.emit_abx(OpCode::LoadNil, base + num_rhs, 0, line);
-                num_rhs += 1;
+            // Pad with nils if fewer expressions than targets
+            // (expression_list_adjust returns count when multi-return fills all slots)
+            if (num_rhs as usize) < count && num_rhs != MULTRET_SENTINEL {
+                for i in num_rhs..count as u8 {
+                    self.emit_abx(OpCode::LoadNil, base + i, 0, line);
+                }
             }
 
             // Store values to targets
@@ -2186,7 +2334,9 @@ impl<'a> Compiler<'a> {
                 self.code_store(target, &val, line)?;
             }
 
-            self.fs_mut().scope.free_reg_to(base);
+            // Free all temporaries: both LHS table regs and RHS value regs.
+            // save_free_reg was captured before any LHS parsing.
+            self.fs_mut().scope.free_reg_to(save_free_reg);
         } else {
             // Expression statement (function call)
             match &expr {
@@ -2197,6 +2347,10 @@ impl<'a> Compiler<'a> {
                         let a = inst.a();
                         let b = inst.b();
                         *inst = Instruction::abc(OpCode::Call, a, b, 1, false);
+                        // Free all temporaries including function + args.
+                        // Use save_free_reg to handle chained calls (f()())
+                        // where intermediary calls used temporary registers.
+                        self.fs_mut().scope.free_reg_to(save_free_reg);
                     }
                 }
                 _ => {
@@ -2265,14 +2419,20 @@ impl<'a> Compiler<'a> {
                 // Check if const
                 let reg = *reg;
                 if let Some(local) = self.fs().scope.resolve_local_by_reg(reg) {
-                    if local.is_const {
-                        return Err(self.error("attempt to assign to const variable"));
+                    if local.is_const || local.is_close {
+                        let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(local.name)).into_owned();
+                        return Err(self.error(&format!("attempt to assign to const variable '{}'", name)));
                     }
                 }
                 self.discharge_to_reg(value, reg, line);
             }
             ExprDesc::Upvalue(idx) => {
                 let idx = *idx;
+                // Check if the upvalue is a const variable
+                if self.fs().upvalues[idx as usize].is_const {
+                    let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(self.fs().upvalues[idx as usize].name)).into_owned();
+                    return Err(self.error(&format!("attempt to assign to const variable '{}'", name)));
+                }
                 let val_reg = self.discharge_to_any_reg(value, line);
                 self.emit_abc(OpCode::SetUpval, val_reg, idx, 0, line);
             }
@@ -2316,15 +2476,67 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn find_label(&self, name: StringId) -> Option<usize> {
+    fn find_label(&self, name: StringId) -> Option<(usize, usize)> {
         for block in self.fs().scope.blocks.iter().rev() {
             for label in &block.labels {
                 if label.name == name {
-                    return Some(label.pc);
+                    return Some((label.pc, label.num_locals));
                 }
             }
         }
         None
+    }
+
+    /// Adjust labels at the end of the current block and resolve any pending gotos.
+    /// Must be called before leave_block() for blocks that may contain labels.
+    fn close_block_gotos(&mut self) {
+        let current_pc = self.fs().current_pc();
+        let resolved = self.fs_mut().scope.adjust_end_labels(current_pc);
+        for (goto_pc, target_pc) in resolved {
+            self.patch_jump_to(goto_pc, target_pc);
+        }
+    }
+
+    /// Check for unresolved gotos in the current function scope.
+    /// Called before closing a function to ensure all gotos have valid targets.
+    fn check_unresolved_gotos(&self) -> Result<(), CompileError> {
+        // Collect all labels in the function scope for error diagnosis
+        let all_labels: Vec<_> = self.fs().scope.blocks.iter()
+            .flat_map(|b| b.labels.iter())
+            .collect();
+
+        for block in &self.fs().scope.blocks {
+            for goto_info in &block.pending_gotos {
+                let goto_name_bytes = self.lexer.strings.get_bytes(goto_info.name).to_vec();
+                let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
+
+                // Check if there's a label with this name but num_locals mismatch
+                if let Some(label) = all_labels.iter().find(|l| l.name == goto_info.name) {
+                    if goto_info.num_locals < label.num_locals {
+                        // Goto jumps into scope of a local variable
+                        let local_name = self.fs().scope.locals[goto_info.num_locals].name;
+                        let local_name_bytes = self.lexer.strings.get_bytes(local_name).to_vec();
+                        let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
+                        return Err(CompileError {
+                            message: format!(
+                                "<goto {}> at line {} jumps into the scope of local '{}'",
+                                goto_name_str, goto_info.line, local_name_str
+                            ),
+                            line: goto_info.line,
+                        });
+                    }
+                }
+
+                return Err(CompileError {
+                    message: format!(
+                        "no visible label '{}' for <goto> at line {}",
+                        goto_name_str, goto_info.line
+                    ),
+                    line: goto_info.line,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2359,7 +2571,25 @@ fn int_log2(mut n: u32) -> u32 {
 /// Compile Lua source to a Proto. Public API — this is the entry point.
 pub fn compile(source: &[u8], name: &str) -> Result<(Proto, StringInterner), CompileError> {
     let mut compiler = Compiler::new(source);
+    let proto = compile_inner(&mut compiler, name)?;
+    Ok((proto, compiler.lexer.strings))
+}
 
+/// Compile Lua source reusing an existing StringInterner.
+/// Used by `load()` at runtime so newly compiled code shares the VM's string table.
+/// Always returns the StringInterner (even on error) so the caller can restore it.
+pub fn compile_with_strings(
+    source: &[u8],
+    name: &str,
+    strings: StringInterner,
+) -> (Result<Proto, CompileError>, StringInterner) {
+    let mut compiler = Compiler::with_strings(source, strings);
+    let result = compile_inner(&mut compiler, name);
+    (result, compiler.lexer.strings)
+}
+
+/// Inner compile logic shared by `compile` and `compile_with_strings`.
+fn compile_inner(compiler: &mut Compiler<'_>, name: &str) -> Result<Proto, CompileError> {
     // Create the top-level function
     let mut top = FuncState::new(None);
     let source_name = compiler.lexer.strings.intern_or_create(name.as_bytes());
@@ -2373,6 +2603,7 @@ pub fn compile(source: &[u8], name: &str) -> Result<(Proto, StringInterner), Com
         name: env_name,
         in_stack: true,
         index: 0,
+        is_const: false,
     });
 
     // VarArgPrep
@@ -2390,6 +2621,10 @@ pub fn compile(source: &[u8], name: &str) -> Result<(Proto, StringInterner), Com
     let line = compiler.line();
     compiler.emit_abc(OpCode::Return0, 0, 0, 0, line);
 
+    // Adjust labels at function end and check for unresolved gotos
+    compiler.close_block_gotos();
+    compiler.check_unresolved_gotos()?;
+
     // Finalize
     let mut fs = compiler.func_stack.pop().unwrap();
     fs.scope.leave_block();
@@ -2405,7 +2640,7 @@ pub fn compile(source: &[u8], name: &str) -> Result<(Proto, StringInterner), Com
         })
         .collect();
 
-    Ok((fs.proto, compiler.lexer.strings))
+    Ok(fs.proto)
 }
 
 #[cfg(test)]
@@ -2628,7 +2863,7 @@ mod tests {
     #[test]
     fn test_label_duplicate_error() {
         let err = compile_err("::x::\n::x::");
-        assert!(err.message.contains("duplicate label"));
+        assert!(err.message.contains("label 'x' already defined"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub enum GcObjectType {
     UpVal,
     BoxedInt,
     String,
+    Userdata,
 }
 
 impl GcObjectType {
@@ -24,6 +25,7 @@ impl GcObjectType {
             GC_SUB_UPVAL => Some(GcObjectType::UpVal),
             GC_SUB_BOXED_INT => Some(GcObjectType::BoxedInt),
             GC_SUB_STRING => Some(GcObjectType::String),
+            GC_SUB_USERDATA => Some(GcObjectType::Userdata),
             _ => None,
         }
     }
@@ -43,7 +45,8 @@ pub fn lua_type_name(val: TValue, _heap: &GcHeap) -> &'static str {
             Some(GC_SUB_CLOSURE) | Some(GC_SUB_NATIVE) => "function",
             Some(GC_SUB_STRING) => "string",
             Some(GC_SUB_BOXED_INT) => "number",
-            _ => "userdata",
+            Some(GC_SUB_USERDATA) => "userdata",
+            _ => "unknown",
         }
     } else if val.is_light_userdata() {
         "userdata"

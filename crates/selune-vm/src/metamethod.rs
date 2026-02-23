@@ -85,13 +85,32 @@ impl MetamethodNames {
 
 /// Look up a metamethod on a TValue. Returns Some(method_value) if found.
 pub fn get_metamethod(val: TValue, mm_name: StringId, gc: &GcHeap) -> Option<TValue> {
-    // Only tables have metatables for now
-    let table_idx = val.as_table_idx()?;
-    let mt_idx = gc.get_table(table_idx).metatable?;
-    let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
-    if mm_val.is_nil() {
-        None
-    } else {
-        Some(mm_val)
+    // Check tables
+    if let Some(table_idx) = val.as_table_idx() {
+        let mt_idx = gc.get_table(table_idx).metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
     }
+    // Check userdata
+    if let Some(ud_idx) = val.as_userdata_idx() {
+        let mt_idx = gc.get_userdata(ud_idx).metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
+    }
+    // Check strings (shared string metatable)
+    if val.is_string() {
+        let mt_idx = gc.string_metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
+    }
+    None
 }

@@ -250,7 +250,11 @@ fn native_math_fmod(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
 fn native_math_modf(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let f = get_number_arg(ctx, 0, "modf")?;
     let trunc = f.trunc();
-    let frac = f - trunc;
+    let frac = if f.is_infinite() {
+        0.0_f64.copysign(f)
+    } else {
+        f - trunc
+    };
     // Integer part returned as integer if it fits
     let int_part = if trunc >= i64::MIN as f64 && trunc <= i64::MAX as f64 && trunc == (trunc as i64) as f64 {
         TValue::from_full_integer(trunc as i64, ctx.gc)
