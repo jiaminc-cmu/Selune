@@ -205,6 +205,12 @@ pub struct Vm {
     pub pending_hook_call: bool,
     /// Registry table for debug.getregistry().
     pub registry_idx: Option<GcIdx<selune_core::table::Table>>,
+    /// Flag to prevent reentrant GC collection (set during run_finalizers).
+    pub in_gc: bool,
+    /// Fast guard: true only when a CloseReturnYield call status has been set.
+    pub needs_close_return_resume: bool,
+    /// Bitset: redirect_natives[idx] = true if native at GcIdx(idx) needs VM-dispatch redirect.
+    pub redirect_natives: Vec<bool>,
 }
 
 /// Format a source name for error messages (matching PUC Lua behavior).
@@ -325,6 +331,74 @@ impl Vm {
             in_hook: false,
             pending_hook_call: false,
             registry_idx: None,
+            in_gc: false,
+            needs_close_return_resume: false,
+            redirect_natives: Vec::new(),
+        }
+    }
+
+    /// Mark a native function index as needing VM-dispatch redirect.
+    pub fn mark_native_redirect(&mut self, idx: GcIdx<NativeFunction>) {
+        let i = idx.0 as usize;
+        if i >= self.redirect_natives.len() {
+            self.redirect_natives.resize(i + 1, false);
+        }
+        self.redirect_natives[i] = true;
+    }
+
+    /// Check if a native function index needs VM-dispatch redirect.
+    #[inline]
+    pub fn is_redirect_native(&self, idx: GcIdx<NativeFunction>) -> bool {
+        let i = idx.0 as usize;
+        i < self.redirect_natives.len() && self.redirect_natives[i]
+    }
+
+    /// Mark all redirect natives in the bitset. Called once after all stdlib registration.
+    fn mark_redirect_natives(&mut self) {
+        // Collect all redirect native indices
+        let indices: Vec<Option<GcIdx<NativeFunction>>> = vec![
+            self.table_sort_idx,
+            self.table_move_idx,
+            self.string_gsub_idx,
+            self.pcall_idx,
+            self.xpcall_idx,
+            self.coro_resume_idx,
+            self.coro_yield_idx,
+            self.coro_wrap_idx,
+            self.coro_wrap_resume_idx,
+            self.collectgarbage_idx,
+            self.tostring_idx,
+            self.load_idx,
+            self.dofile_idx,
+            self.loadfile_idx,
+            self.require_idx,
+            self.error_idx,
+            self.debug_getupvalue_idx,
+            self.debug_setupvalue_idx,
+            self.debug_getinfo_idx,
+            self.debug_traceback_idx,
+            self.debug_sethook_idx,
+            self.debug_gethook_idx,
+            self.debug_getlocal_idx,
+            self.debug_setlocal_idx,
+            self.debug_getregistry_idx,
+            self.coro_running_idx,
+            self.coro_isyieldable_idx,
+            self.coro_close_idx,
+            self.string_format_idx,
+            self.string_dump_idx,
+            self.pairs_idx,
+            self.ipairs_iter_idx,
+            self.table_insert_idx,
+            self.table_remove_idx,
+            self.table_concat_idx,
+            self.table_unpack_idx,
+            self.warn_idx,
+        ];
+        for opt_idx in indices {
+            if let Some(idx) = opt_idx {
+                self.mark_native_redirect(idx);
+            }
         }
     }
 
@@ -397,6 +471,9 @@ impl Vm {
         self.table_concat_idx = Some(stdlib_indices.table_concat_idx);
         self.table_unpack_idx = Some(stdlib_indices.table_unpack_idx);
 
+        // Mark all redirect natives for fast bitset lookup in Call/TailCall dispatch
+        self.mark_redirect_natives();
+
         // Create main thread handle (stable identity for coroutine.running() in main thread)
         let main_handle = self.gc.alloc_table(4, 0);
         self.gc
@@ -467,9 +544,8 @@ impl Vm {
             format!("{}:{}: {}", src, e.line, e.message)
         })?;
 
-        // Store the proto
-        let proto_idx = self.protos.len();
-        self.protos.push(proto);
+        // Store the proto (with child flattening)
+        let proto_idx = self.store_proto_tree(&proto);
 
         // Determine the _ENV upvalue: use custom env or default _ENV
         let env_val = env.unwrap_or_else(|| {
@@ -492,9 +568,8 @@ impl Vm {
         let proto =
             crate::binary_chunk::undump(data, name, &mut self.strings).map_err(|e| e.message)?;
 
-        // Store the proto
-        let proto_idx = self.protos.len();
-        self.protos.push(proto);
+        // Store the proto (with child flattening)
+        let proto_idx = self.store_proto_tree(&proto);
 
         // Create upvalues — for the main chunk, first upvalue is _ENV
         let num_upvalues = self.protos[proto_idx].upvalues.len();
@@ -524,9 +599,16 @@ impl Vm {
     fn store_proto_tree(&mut self, proto: &Proto) -> usize {
         let idx = self.protos.len();
         self.protos.push(proto.clone());
-        // Recursively store children — they're already inline in proto.protos
-        // The flat indices won't match the child indices, but we access children
-        // through the proto.protos[i] field directly.
+        // Recursively flatten child protos into vm.protos and record flat indices
+        let num_children = self.protos[idx].protos.len();
+        let mut flat_indices = Vec::with_capacity(num_children);
+        for i in 0..num_children {
+            // Clone child out to avoid borrow issues, then recurse
+            let child = self.protos[idx].protos[i].clone();
+            let child_flat_idx = self.store_proto_tree(&child);
+            flat_indices.push(child_flat_idx);
+        }
+        self.protos[idx].child_flat_indices = flat_indices;
         idx
     }
 
@@ -855,30 +937,32 @@ impl Vm {
     }
 
     /// Save the current running state into a LuaThread snapshot.
-    pub fn save_running_state(&self, thread_id: usize) -> LuaThread {
-        LuaThread {
-            stack: self.stack.clone(),
-            call_stack: self.call_stack.clone(),
-            stack_top: self.stack_top,
-            open_upvals: self.open_upvals.clone(),
-            status: CoroutineStatus::Normal, // caller becomes Normal while waiting
-            thread_id,
-            hook_func: self.hook_func,
-            hook_mask: self.hook_mask,
-            hook_count: self.hook_count,
-            hook_counter: self.hook_counter,
-            hooks_active: self.hooks_active,
-            hook_last_line: self.hook_last_line,
-            hook_old_pc: self.hook_old_pc,
-        }
+    /// Save the current VM running state into a LuaThread by swapping Vecs
+    /// (zero heap allocation). The `thread` receives the current state, and
+    /// the VM's stack/call_stack/open_upvals are replaced with whatever was
+    /// in `thread` (typically empty Vecs from a freshly-created LuaThread).
+    pub fn save_running_state_swap(&mut self, thread: &mut LuaThread) {
+        std::mem::swap(&mut self.stack, &mut thread.stack);
+        std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
+        std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
+        thread.stack_top = self.stack_top;
+        thread.hook_func = self.hook_func;
+        thread.hook_mask = self.hook_mask;
+        thread.hook_count = self.hook_count;
+        thread.hook_counter = self.hook_counter;
+        thread.hooks_active = self.hooks_active;
+        thread.hook_last_line = self.hook_last_line;
+        thread.hook_old_pc = self.hook_old_pc;
     }
 
-    /// Restore a LuaThread snapshot into the running state.
-    pub fn restore_running_state(&mut self, thread: LuaThread) {
-        self.stack = thread.stack;
-        self.call_stack = thread.call_stack;
+    /// Restore a LuaThread snapshot into the running state by swapping Vecs.
+    /// After this call, the `thread` contains the VM's previous state (empty
+    /// Vecs if the VM was just swapped out via save_running_state_swap).
+    pub fn restore_running_state_swap(&mut self, thread: &mut LuaThread) {
+        std::mem::swap(&mut self.stack, &mut thread.stack);
+        std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
+        std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
         self.stack_top = thread.stack_top;
-        self.open_upvals = thread.open_upvals;
         self.hook_func = thread.hook_func;
         self.hook_mask = thread.hook_mask;
         self.hook_count = thread.hook_count;
@@ -888,12 +972,18 @@ impl Vm {
         self.hook_old_pc = thread.hook_old_pc;
     }
 
-    /// Save the current running state back into the coroutine slot.
+    /// Save the current running state back into the coroutine slot by swapping.
     pub fn save_coro_state(&mut self, coro_id: usize) {
-        self.coroutines[coro_id].stack = self.stack.clone();
-        self.coroutines[coro_id].call_stack = self.call_stack.clone();
+        std::mem::swap(&mut self.stack, &mut self.coroutines[coro_id].stack);
+        std::mem::swap(
+            &mut self.call_stack,
+            &mut self.coroutines[coro_id].call_stack,
+        );
+        std::mem::swap(
+            &mut self.open_upvals,
+            &mut self.coroutines[coro_id].open_upvals,
+        );
         self.coroutines[coro_id].stack_top = self.stack_top;
-        self.coroutines[coro_id].open_upvals = self.open_upvals.clone();
         self.coroutines[coro_id].hook_func = self.hook_func;
         self.coroutines[coro_id].hook_mask = self.hook_mask;
         self.coroutines[coro_id].hook_count = self.hook_count;
@@ -901,6 +991,28 @@ impl Vm {
         self.coroutines[coro_id].hooks_active = self.hooks_active;
         self.coroutines[coro_id].hook_last_line = self.hook_last_line;
         self.coroutines[coro_id].hook_old_pc = self.hook_old_pc;
+    }
+
+    /// Restore coroutine state from coroutines[coro_id] into the running VM state
+    /// by swapping. After this, the coroutine slot contains empty Vecs.
+    pub fn restore_coro_into_running(&mut self, coro_id: usize) {
+        std::mem::swap(&mut self.stack, &mut self.coroutines[coro_id].stack);
+        std::mem::swap(
+            &mut self.call_stack,
+            &mut self.coroutines[coro_id].call_stack,
+        );
+        std::mem::swap(
+            &mut self.open_upvals,
+            &mut self.coroutines[coro_id].open_upvals,
+        );
+        self.stack_top = self.coroutines[coro_id].stack_top;
+        self.hook_func = self.coroutines[coro_id].hook_func;
+        self.hook_mask = self.coroutines[coro_id].hook_mask;
+        self.hook_count = self.coroutines[coro_id].hook_count;
+        self.hook_counter = self.coroutines[coro_id].hook_counter;
+        self.hooks_active = self.coroutines[coro_id].hooks_active;
+        self.hook_last_line = self.coroutines[coro_id].hook_last_line;
+        self.hook_old_pc = self.coroutines[coro_id].hook_old_pc;
     }
 
     // ---- Garbage Collection ----
@@ -1087,6 +1199,8 @@ impl Vm {
     /// Run __gc finalizers for objects in the finalization queue (LIFO order).
     fn run_finalizers(&mut self) {
         let queue: Vec<TValue> = self.gc.gc_state.finalization_queue.drain(..).collect();
+        let was_in_gc = self.in_gc;
+        self.in_gc = true;
         // Run in reverse (LIFO) order
         for obj in queue.iter().rev() {
             let gc_sid = self.strings.intern(b"__gc");
@@ -1127,6 +1241,7 @@ impl Vm {
             // Call the finalizer, catching any errors (like pcall)
             let _ = dispatch::call_function(self, gc_func, &[*obj]);
         }
+        self.in_gc = was_in_gc;
     }
 
     /// Mark all GC roots: stack values, call frame closures, _ENV, open upvalues,
@@ -1162,7 +1277,7 @@ impl Vm {
             }
 
             // Mark TBC slots (may be in "dead" registers during __close processing)
-            for &slot in &ci.tbc_slots {
+            for &slot in ci.tbc_slots.as_deref().unwrap_or(&[]) {
                 if slot < self.stack.len() {
                     self.gc.gc_mark_value(self.stack[slot]);
                 }
@@ -1502,6 +1617,9 @@ impl Vm {
 
     /// Close all open upvalues at or above the given level.
     pub fn close_upvalues(&mut self, level: usize) {
+        if self.open_upvals.is_empty() {
+            return;
+        }
         let mut i = 0;
         while i < self.open_upvals.len() {
             let (stack_idx, uv_idx) = self.open_upvals[i];

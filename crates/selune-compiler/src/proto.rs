@@ -79,6 +79,10 @@ pub struct Proto {
 
     /// Current line being compiled (used during compilation).
     current_line: u32,
+
+    /// Flat indices of child protos in the VM's proto array.
+    /// Populated at load time by store_proto_tree. Empty during compilation.
+    pub child_flat_indices: Vec<usize>,
 }
 
 impl Proto {
@@ -99,6 +103,7 @@ impl Proto {
             linedefined: 0,
             lastlinedefined: 0,
             current_line: 0,
+            child_flat_indices: Vec::new(),
         }
     }
 

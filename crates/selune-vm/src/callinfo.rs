@@ -4,6 +4,15 @@ use selune_core::gc::{GcIdx, LuaClosure};
 
 use selune_core::value::TValue;
 
+/// Data for CloseReturnYield status (boxed since it's rare).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloseReturnYieldData {
+    /// The saved return values.
+    pub saved_results: Vec<TValue>,
+    /// Remaining TBC slots to close (indices in reverse order).
+    pub remaining_tbc_slots: Vec<usize>,
+}
+
 /// Status of a call frame (used for yield across pcall/xpcall).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CallStatus {
@@ -23,13 +32,14 @@ pub enum CallStatus {
     },
     /// Yielded during __close in a Return handler.
     /// On resume, after all __close calls complete, finish the return.
-    CloseReturnYield {
-        /// The saved return values.
-        saved_results: Vec<TValue>,
-        /// Remaining TBC slots to close (indices in reverse order).
-        remaining_tbc_slots: Vec<usize>,
-    },
+    CloseReturnYield(Box<CloseReturnYieldData>),
 }
+
+// Flags for CallInfo boolean fields
+const FLAG_IS_LUA: u8 = 1;
+const FLAG_IS_HOOK_CALL: u8 = 2;
+const FLAG_IS_TAIL_CALL: u8 = 4;
+const FLAG_IS_TBC_CLOSE: u8 = 8;
 
 /// A call frame on the VM call stack.
 #[derive(Clone, Debug)]
@@ -42,8 +52,6 @@ pub struct CallInfo {
     pub num_results: i32,
     /// Index into the proto list (for Lua calls).
     pub proto_idx: usize,
-    /// Whether this is a Lua call (vs native).
-    pub is_lua: bool,
     /// The closure being executed (if Lua call).
     pub closure_idx: Option<GcIdx<LuaClosure>>,
     /// Stack position where the function value lives (for result placement).
@@ -52,23 +60,18 @@ pub struct CallInfo {
     pub vararg_base: Option<usize>,
     /// Counter for tail calls to detect infinite tail recursion.
     pub tail_count: u32,
-    /// Stack indices of to-be-closed variables in this frame.
-    pub tbc_slots: Vec<usize>,
+    /// Stack indices of to-be-closed variables in this frame (None = empty).
+    pub tbc_slots: Option<Vec<usize>>,
     /// Call status for yield across pcall/xpcall boundaries.
     pub call_status: CallStatus,
-    /// Whether this frame was pushed by the hook dispatcher.
-    pub is_hook_call: bool,
-    /// Whether this frame was entered via a tail call.
-    pub is_tail_call: bool,
+    /// Packed boolean flags (is_lua, is_hook_call, is_tail_call, is_tbc_close).
+    flags: u8,
     /// First transferred local (1-based) for call/return hook inspection.
     pub ftransfer: u16,
     /// Number of transferred values for call/return hook inspection.
     pub ntransfer: u16,
     /// Saved hook_last_line from caller frame (restored on return).
     pub saved_hook_line: i32,
-    /// Whether this frame is a __close (TBC) metamethod call.
-    /// Used by debug.getinfo to report name="close", namewhat="metamethod".
-    pub is_tbc_close: bool,
 }
 
 impl CallInfo {
@@ -78,19 +81,90 @@ impl CallInfo {
             pc: 0,
             num_results: -1,
             proto_idx,
-            is_lua: true,
             closure_idx: None,
             func_stack_idx: 0,
             vararg_base: None,
             tail_count: 0,
-            tbc_slots: Vec::new(),
+            tbc_slots: None,
             call_status: CallStatus::Normal,
-            is_hook_call: false,
-            is_tail_call: false,
+            flags: FLAG_IS_LUA, // is_lua = true by default
             ftransfer: 0,
             ntransfer: 0,
             saved_hook_line: -1,
-            is_tbc_close: false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_lua(&self) -> bool {
+        self.flags & FLAG_IS_LUA != 0
+    }
+
+    #[inline(always)]
+    pub fn set_is_lua(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_IS_LUA;
+        } else {
+            self.flags &= !FLAG_IS_LUA;
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_hook_call(&self) -> bool {
+        self.flags & FLAG_IS_HOOK_CALL != 0
+    }
+
+    #[inline(always)]
+    pub fn set_is_hook_call(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_IS_HOOK_CALL;
+        } else {
+            self.flags &= !FLAG_IS_HOOK_CALL;
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_tail_call(&self) -> bool {
+        self.flags & FLAG_IS_TAIL_CALL != 0
+    }
+
+    #[inline(always)]
+    pub fn set_is_tail_call(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_IS_TAIL_CALL;
+        } else {
+            self.flags &= !FLAG_IS_TAIL_CALL;
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_tbc_close(&self) -> bool {
+        self.flags & FLAG_IS_TBC_CLOSE != 0
+    }
+
+    #[inline(always)]
+    pub fn set_is_tbc_close(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_IS_TBC_CLOSE;
+        } else {
+            self.flags &= !FLAG_IS_TBC_CLOSE;
+        }
+    }
+
+    /// Check if tbc_slots is empty (None or empty vec).
+    #[inline(always)]
+    pub fn tbc_slots_is_empty(&self) -> bool {
+        match &self.tbc_slots {
+            None => true,
+            Some(v) => v.is_empty(),
+        }
+    }
+
+    /// Push a TBC slot index.
+    #[inline]
+    pub fn tbc_slots_push(&mut self, slot: usize) {
+        match &mut self.tbc_slots {
+            Some(v) => v.push(slot),
+            None => self.tbc_slots = Some(vec![slot]),
         }
     }
 }

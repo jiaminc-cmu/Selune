@@ -17,23 +17,23 @@ use std::fmt;
 use std::marker::PhantomData;
 
 /// Quiet NaN prefix: exponent all 1s + quiet bit set
-const QNAN: u64 = 0x7FF8_0000_0000_0000;
+pub const QNAN: u64 = 0x7FF8_0000_0000_0000;
 
 /// Tag mask: 3 bits at positions 47-49
 const TAG_MASK: u64 = 0x0007_0000_0000_0000;
 /// Payload mask: lower 47 bits
-const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+pub const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 const TAG_NIL: u64 = 0x0001_0000_0000_0000;
 const TAG_BOOL: u64 = 0x0002_0000_0000_0000;
-const TAG_INT: u64 = 0x0003_0000_0000_0000;
+pub const TAG_INT: u64 = 0x0003_0000_0000_0000;
 const TAG_GC: u64 = 0x0004_0000_0000_0000;
 const TAG_LIGHT: u64 = 0x0005_0000_0000_0000;
 
 /// 47-bit signed integer max: 2^46 - 1
-const SMALL_INT_MAX: i64 = (1i64 << 46) - 1;
+pub const SMALL_INT_MAX: i64 = (1i64 << 46) - 1;
 /// 47-bit signed integer min: -2^46
-const SMALL_INT_MIN: i64 = -(1i64 << 46);
+pub const SMALL_INT_MIN: i64 = -(1i64 << 46);
 
 /// A NaN-boxed Lua value packed into 8 bytes.
 #[derive(Clone, Copy)]
@@ -83,6 +83,14 @@ impl TValue {
         TValue(QNAN | TAG_INT | payload)
     }
 
+    /// Create an inline integer without range checks.
+    /// Safety: caller must ensure i is in [SMALL_INT_MIN, SMALL_INT_MAX].
+    #[inline(always)]
+    pub unsafe fn from_integer_unchecked(i: i64) -> Self {
+        let payload = (i as u64) & PAYLOAD_MASK;
+        TValue(QNAN | TAG_INT | payload)
+    }
+
     /// Create a GC pointer value.
     ///
     /// # Panics
@@ -115,7 +123,7 @@ impl TValue {
 
     /// Returns true if this is a NaN-boxed tagged value (not a plain float).
     #[inline]
-    fn is_tagged(&self) -> bool {
+    pub fn is_tagged(&self) -> bool {
         // A tagged value has the QNAN prefix set
         (self.0 & QNAN) == QNAN
     }
@@ -194,6 +202,49 @@ impl TValue {
             // Sign-extend from 47 bits
             let extended = ((raw << 17) as i64) >> 17;
             Some(extended)
+        } else {
+            None
+        }
+    }
+
+    /// Extract inline integer without checking. Caller MUST verify is_integer() first.
+    #[inline(always)]
+    pub unsafe fn as_integer_unchecked(&self) -> i64 {
+        let raw = self.0 & PAYLOAD_MASK;
+        ((raw << 17) as i64) >> 17
+    }
+
+    /// Extract float without checking. Caller MUST verify is_float() and !is_tagged() first.
+    /// For canonical NaN (is_tagged() && tag()==0), use as_float() instead.
+    #[inline(always)]
+    pub unsafe fn as_float_unchecked(&self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    /// Check if this is a GC-boxed integer (sub-tag == BOXED_INT).
+    /// This is separate from is_integer() which only checks inline 47-bit ints.
+    #[inline(always)]
+    pub fn is_boxed_int(&self) -> bool {
+        // Check: is GC-tagged AND sub-tag bits == GC_SUB_BOXED_INT
+        // GC tag: QNAN | TAG_GC, sub-tag at bits 44-46
+        self.is_gc() && ((self.0 & PAYLOAD_MASK) >> GC_SUB_SHIFT) & GC_SUB_MASK == GC_SUB_BOXED_INT
+    }
+
+    /// Extract GC-boxed integer without checking. Caller MUST verify is_boxed_int() first.
+    #[inline(always)]
+    pub unsafe fn as_boxed_int_unchecked(&self, gc: &GcHeap) -> i64 {
+        let idx = (self.0 & PAYLOAD_MASK & GC_INDEX_MASK) as u32;
+        gc.get_boxed_int(GcIdx::<i64>(idx, PhantomData))
+    }
+
+    /// Try to extract i64 from either inline or boxed integer. Returns None for non-integers.
+    /// This is the fast-path-friendly version of as_full_integer().
+    #[inline(always)]
+    pub fn try_as_i64(&self, gc: &GcHeap) -> Option<i64> {
+        if self.is_integer() {
+            Some(unsafe { self.as_integer_unchecked() })
+        } else if self.is_boxed_int() {
+            Some(unsafe { self.as_boxed_int_unchecked(gc) })
         } else {
             None
         }
