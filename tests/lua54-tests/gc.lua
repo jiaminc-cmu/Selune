@@ -301,27 +301,233 @@ collectgarbage()
 assert(next(a) == string.rep('$', 11))
 
 
--- skip: __gc + weak table finalization ordering
-do end -- skipped section
+-- skip: 'bug' in 5.1 (__gc + weak table finalization ordering)
+-- requires __gc finalizers to run automatically during collectgarbage()
+do end
+
+-- skip: ephemerons - requires GC() which loops allocating until __gc fires
+do end
 
 
--- skip: ephemerons with GC() - needs auto GC during alloc
-do end -- skipped section
+-- skip: errors during __gc collection (requires T / C API)
+if T then
+  collectgarbage("stop")   -- stop collection
+  local u = {}
+  local s = {}; setmetatable(s, {__mode = 'k'})
+  setmetatable(u, {__gc = function (o)
+    local i = s[o]
+    s[i] = true
+    assert(not s[i - 1])   -- check proper finalization order
+    if i == 8 then error("@expected@") end   -- error during GC
+  end})
 
--- skip: errors during __gc collection
-do end -- skipped section
+  for i = 6, 10 do
+    local n = setmetatable({}, getmetatable(u))
+    s[n] = i
+  end
+
+  warn("@on"); warn("@store")
+  collectgarbage()
+  assert(string.find(_WARN, "error in __gc"))
+  assert(string.match(_WARN, "@(.-)@") == "expected"); _WARN = false
+  for i = 8, 10 do assert(s[i]) end
+
+  for i = 1, 5 do
+    local n = setmetatable({}, getmetatable(u))
+    s[n] = i
+  end
+
+  collectgarbage()
+  for i = 1, 10 do assert(s[i]) end
+
+  getmetatable(u).__gc = nil
+  warn("@normal")
+
+end
+print '+'
 
 
--- skip: testing userdata __gc
-do end -- skipped section
+-- skip: testing userdata __gc (requires T / C API for newproxy)
+if T==nil then
+  (Message or print)('\n >>> testC not active: skipping userdata GC tests <<<\n')
+end
 
--- skip: stress test
-do end -- skipped section
 
--- skip: self-referenced threads
-do end -- skipped section
+-- skip: __gc x weak tables (requires correct weak-table-before-finalizer ordering)
+do end
 
--- skip: closing state finalizers
-do end -- skipped section
+-- skip: string keys in weak tables (4MB strings, too memory-intensive)
+do end
+
+
+-- errors during collection (requires T)
+if T then
+  warn("@store")
+  u = setmetatable({}, {__gc = function () error "@expected error" end})
+  u = nil
+  collectgarbage()
+  assert(string.find(_WARN, "@expected error")); _WARN = false
+  warn("@normal")
+end
+
+
+if not _soft then
+  print("long list")
+  local a = {}
+  for i = 1,200000 do
+    a = {next = a}
+  end
+  a = nil
+  collectgarbage()
+end
+
+-- create many threads with self-references and open upvalues
+print("self-referenced threads")
+local thread_id = 0
+local threads = {}
+
+local function fn (thread)
+    local x = {}
+    threads[thread_id] = function()
+                             thread = x
+                         end
+    coroutine.yield()
+end
+
+while thread_id < 1000 do
+    local thread = coroutine.create(fn)
+    coroutine.resume(thread, thread)
+    thread_id = thread_id + 1
+end
+
+
+-- skip: closure/coroutine __gc collection test
+-- (requires coroutine stack to be collectable when thread handle goes out of scope)
+do end
+
+
+-- skip: step-while-stopped test (can OOM if gcinfo tracking differs)
+do end
+
+
+-- skip: tests for weird cases collecting upvalues (requires T / C API)
+if T then
+  local function foo ()
+    local a = {x = 20}
+    coroutine.yield(function () return a.x end)  -- will run collector
+    assert(a.x == 20)   -- 'a' is 'ok'
+    a = {x = 30}   -- create a new object
+    assert(T.gccolor(a) == "white")   -- of course it is new...
+    coroutine.yield(100)   -- 'a' is still local to this thread
+  end
+
+  local t = setmetatable({}, {__mode = "kv"})
+  collectgarbage(); collectgarbage('stop')
+  -- create coroutine in a weak table, so it will never be marked
+  t.co = coroutine.wrap(foo)
+  local f = t.co()   -- create function to access local 'a'
+  T.gcstate("atomic")   -- ensure all objects are traversed
+  assert(T.gcstate() == "atomic")
+  assert(t.co() == 100)   -- resume coroutine, creating new table for 'a'
+  assert(T.gccolor(t.co) == "white")  -- thread was not traversed
+  T.gcstate("pause")   -- collect thread, but should mark 'a' before that
+  assert(t.co == nil and f() == 30)   -- ensure correct access to 'a'
+
+  collectgarbage("restart")
+
+  -- test barrier in sweep phase (backing userdata to gray)
+  local u = T.newuserdata(0, 1)   -- create a userdata
+  collectgarbage()
+  collectgarbage"stop"
+  local a = {}     -- avoid 'u' as first element in 'allgc'
+  T.gcstate"atomic"
+  T.gcstate"sweepallgc"
+  local x = {}
+  assert(T.gccolor(u) == "black")   -- userdata is "old" (black)
+  assert(T.gccolor(x) == "white")   -- table is "new" (white)
+  debug.setuservalue(u, x)          -- trigger barrier
+  assert(T.gccolor(u) == "gray")   -- userdata changed back to gray
+  collectgarbage"restart"
+
+  print"+"
+end
+
+
+-- skip: T-dependent memory tests
+if T then
+  local debug = require "debug"
+  collectgarbage("stop")
+  local x = T.newuserdata(0)
+  local y = T.newuserdata(0)
+  debug.setmetatable(y, {__gc = nop})   -- bless the new udata before...
+  debug.setmetatable(x, {__gc = nop})   -- ...the old one
+  assert(T.gccolor(y) == "white")
+  T.checkmemory()
+  collectgarbage("restart")
+end
+
+-- skip: T-dependent emergency collection tests
+if T then
+  print("emergency collections")
+  collectgarbage()
+  collectgarbage()
+  T.totalmem(T.totalmem() + 200)
+  for i=1,200 do local a = {} end
+  T.totalmem(0)
+  collectgarbage()
+  local t = T.totalmem("table")
+  local a = {{}, {}, {}}   -- create 4 new tables
+  assert(T.totalmem("table") == t + 4)
+  t = T.totalmem("function")
+  a = function () end   -- create 1 new closure
+  assert(T.totalmem("function") == t + 1)
+  t = T.totalmem("thread")
+  a = coroutine.create(function () end)   -- create 1 new coroutine
+  assert(T.totalmem("thread") == t + 1)
+end
+
+
+-- skip: closing state finalizers (requires lua_close behavior)
+do end
+
+-- skip: errors during closing state (requires T)
+if T then
+  local error, assert, find, warn = error, assert, string.find, warn
+  local n = 0
+  local lastmsg
+  local mt = {__gc = function (o)
+    n = n + 1
+    assert(n == o[1])
+    if n == 1 then
+      _WARN = false
+    elseif n == 2 then
+      assert(find(_WARN, "@expected warning"))
+      lastmsg = _WARN    -- get message from previous error (first 'o')
+    else
+      assert(lastmsg == _WARN)  -- subsequent error messages are equal
+    end
+    warn("@store"); _WARN = false
+    error"@expected warning"
+  end}
+  for i = 10, 1, -1 do
+    -- create object and preserve it until the end
+    table.insert(___Glob, setmetatable({i}, mt))
+  end
+end
+
+-- just to make sure
+assert(collectgarbage'isrunning')
+
+do    -- check that the collector is not reentrant in incremental mode
+  local res = true
+  setmetatable({}, {__gc = function ()
+    res = collectgarbage()
+  end})
+  collectgarbage()
+  assert(not res)
+end
+
+
+collectgarbage(oldmode)
 
 print('OK')
