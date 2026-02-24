@@ -171,7 +171,10 @@ impl<'a> Compiler<'a> {
             let msg = if func_line == 0 {
                 "main function has too many local variables".to_string()
             } else {
-                format!("function at line {} has too many local variables", func_line)
+                format!(
+                    "function at line {} has too many local variables",
+                    func_line
+                )
             };
             Err(self.syntax_error(msg))
         } else {
@@ -293,7 +296,9 @@ impl<'a> Compiler<'a> {
     /// Get the line of the last emitted instruction, or 0 if none.
     fn last_emitted_line(&self) -> u32 {
         let pc = self.fs().current_pc();
-        if pc == 0 { return 0; }
+        if pc == 0 {
+            return 0;
+        }
         self.fs().proto.get_line(pc - 1)
     }
 
@@ -731,7 +736,7 @@ impl<'a> Compiler<'a> {
                         let key_reg = self.fs_mut().scope.alloc_reg();
                         self.emit_load_constant(key_reg, k, line);
                         self.emit(
-                            Instruction::abc(OpCode::Self_, func_reg, table_reg, key_reg as u8, false),
+                            Instruction::abc(OpCode::Self_, func_reg, table_reg, key_reg, false),
                             line,
                         );
                         self.fs_mut().scope.free_reg_to(key_reg);
@@ -751,7 +756,11 @@ impl<'a> Compiler<'a> {
 
     /// Continue parsing binary operators on an already-parsed left-hand expression.
     /// This is equivalent to the loop body of `sub_expression` starting from priority 0.
-    fn continue_sub_expression(&mut self, mut expr: ExprDesc, min_prec: u8) -> Result<ExprDesc, CompileError> {
+    fn continue_sub_expression(
+        &mut self,
+        mut expr: ExprDesc,
+        min_prec: u8,
+    ) -> Result<ExprDesc, CompileError> {
         while let Some(binop) = self.check_binary_op()? {
             let (left_prec, right_prec) = binop.priority();
             if left_prec <= min_prec {
@@ -879,11 +888,12 @@ impl<'a> Compiler<'a> {
 
         // CALL A B C: call func at R(A), B-1 args, C-1 results (0 = multi)
         // MULTRET_SENTINEL from expression_list means multi-return last arg → B=0
-        let b = if nargs == MULTRET_SENTINEL { 0 } else { nargs + 1 };
-        let pc = self.emit(
-            Instruction::abc(OpCode::Call, base, b, 0, false),
-            line,
-        );
+        let b = if nargs == MULTRET_SENTINEL {
+            0
+        } else {
+            nargs + 1
+        };
+        let pc = self.emit(Instruction::abc(OpCode::Call, base, b, 0, false), line);
         // Free all arg registers, leave result in base
         self.fs_mut().scope.free_reg_to(base + 1);
         Ok(ExprDesc::Call(pc))
@@ -923,11 +933,12 @@ impl<'a> Compiler<'a> {
 
         // nargs includes the implicit self argument
         // MULTRET_SENTINEL means last explicit arg was multi-return → B=0
-        let b = if explicit_nargs == MULTRET_SENTINEL { 0 } else { explicit_nargs + 1 + 1 };
-        let pc = self.emit(
-            Instruction::abc(OpCode::Call, base, b, 0, false),
-            line,
-        );
+        let b = if explicit_nargs == MULTRET_SENTINEL {
+            0
+        } else {
+            explicit_nargs + 1 + 1
+        };
+        let pc = self.emit(Instruction::abc(OpCode::Call, base, b, 0, false), line);
         self.fs_mut().scope.free_reg_to(base + 1);
         Ok(ExprDesc::Call(pc))
     }
@@ -981,7 +992,7 @@ impl<'a> Compiler<'a> {
                         let trailing_lines = self.fs_mut().proto.line_info.split_off(pc);
                         // Emit Moves to relocate func and args from call_a..call_a+B-1 to target..target+B-1
                         for i in 0..num_args_b {
-                            self.emit_abc(OpCode::Move, target + i as u8, call_a + i as u8, 0, line);
+                            self.emit_abc(OpCode::Move, target + i, call_a + i, 0, line);
                         }
                         // Re-emit the Call with new A, C=0 (multi-return)
                         self.emit(
@@ -990,11 +1001,15 @@ impl<'a> Compiler<'a> {
                         );
                         // Re-append any trailing instructions (shouldn't be any normally)
                         for (i, inst) in trailing.into_iter().enumerate() {
-                            if i == 0 { continue; } // skip the original Call
+                            if i == 0 {
+                                continue;
+                            } // skip the original Call
                             self.fs_mut().proto.code.push(inst);
                         }
                         for (i, ln) in trailing_lines.into_iter().enumerate() {
-                            if i == 0 { continue; }
+                            if i == 0 {
+                                continue;
+                            }
                             self.fs_mut().proto.line_info.push(ln);
                         }
                         return Ok(MULTRET_SENTINEL);
@@ -1146,7 +1161,9 @@ impl<'a> Compiler<'a> {
                     let val_reg = self.discharge_to_any_reg(&val, kline);
                     self.emit_abc(OpCode::SetTable, table_reg, key_reg, val_reg, kline);
                     // Free temp regs but preserve stacked array values
-                    self.fs_mut().scope.free_reg_to(table_reg + 1 + array_count as u8);
+                    self.fs_mut()
+                        .scope
+                        .free_reg_to(table_reg + 1 + array_count as u8);
                     hash_count += 1;
                 }
                 Token::Name(name) => {
@@ -1162,7 +1179,13 @@ impl<'a> Compiler<'a> {
                         let val_reg = self.discharge_to_any_reg(&val, kline);
                         if k <= 255 {
                             self.emit(
-                                Instruction::abc(OpCode::SetField, table_reg, k as u8, val_reg, false),
+                                Instruction::abc(
+                                    OpCode::SetField,
+                                    table_reg,
+                                    k as u8,
+                                    val_reg,
+                                    false,
+                                ),
                                 kline,
                             );
                         } else {
@@ -1172,7 +1195,9 @@ impl<'a> Compiler<'a> {
                             self.fs_mut().scope.free_reg_to(key_reg);
                         }
                         // Free temp regs but preserve stacked array values
-                        self.fs_mut().scope.free_reg_to(table_reg + 1 + array_count as u8);
+                        self.fs_mut()
+                            .scope
+                            .free_reg_to(table_reg + 1 + array_count as u8);
                         hash_count += 1;
                     } else {
                         // It's an expression starting with a name — resolve as expression
@@ -1633,7 +1658,11 @@ impl<'a> Compiler<'a> {
     }
 
     /// Resolve an upvalue by walking up the function state stack.
-    fn resolve_upvalue(&mut self, fs_idx: usize, name: StringId) -> Result<Option<u8>, CompileError> {
+    fn resolve_upvalue(
+        &mut self,
+        fs_idx: usize,
+        name: StringId,
+    ) -> Result<Option<u8>, CompileError> {
         if fs_idx == 0 {
             // At the outermost function, check its locals
             if let Some(local) = self.func_stack[0].scope.resolve_local(name) {
@@ -1664,14 +1693,28 @@ impl<'a> Compiler<'a> {
 
         // Check parent's upvalues
         if let Some(parent_upval) = self.resolve_upvalue(parent_idx, name)? {
-            let parent_is_const = self.func_stack[parent_idx].upvalues[parent_upval as usize].is_const;
-            return Ok(Some(self.add_upvalue(fs_idx, name, false, parent_upval, parent_is_const)?));
+            let parent_is_const =
+                self.func_stack[parent_idx].upvalues[parent_upval as usize].is_const;
+            return Ok(Some(self.add_upvalue(
+                fs_idx,
+                name,
+                false,
+                parent_upval,
+                parent_is_const,
+            )?));
         }
 
         Ok(None)
     }
 
-    fn add_upvalue(&mut self, fs_idx: usize, name: StringId, in_stack: bool, index: u8, is_const: bool) -> Result<u8, CompileError> {
+    fn add_upvalue(
+        &mut self,
+        fs_idx: usize,
+        name: StringId,
+        in_stack: bool,
+        index: u8,
+        is_const: bool,
+    ) -> Result<u8, CompileError> {
         let fs = &mut self.func_stack[fs_idx];
         // Check if already registered
         for (i, up) in fs.upvalues.iter().enumerate() {
@@ -1760,7 +1803,10 @@ impl<'a> Compiler<'a> {
         child_fs.proto.max_stack_size = child_fs.scope.max_reg + 2;
 
         // Populate local_vars from finished_locals (sorted by register)
-        child_fs.scope.finished_locals.sort_by_key(|l| (l.reg, l.start_pc));
+        child_fs
+            .scope
+            .finished_locals
+            .sort_by_key(|l| (l.reg, l.start_pc));
         child_fs.proto.local_vars = child_fs
             .scope
             .finished_locals
@@ -1903,7 +1949,7 @@ impl<'a> Compiler<'a> {
                     (false, true)
                 } else {
                     let attr_name = String::from_utf8_lossy(attr_bytes).into_owned();
-                    return Err(self.error(&format!("unknown attribute '{}'", attr_name)));
+                    return Err(self.error(format!("unknown attribute '{}'", attr_name)));
                 }
             } else {
                 (false, false)
@@ -1973,7 +2019,10 @@ impl<'a> Compiler<'a> {
         self.block()?;
         self.close_block_gotos();
         self.emit_close_if_needed(self.line());
-        { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
 
         // Handle elseif chain
         while self.check(&Token::ElseIf) {
@@ -1997,7 +2046,10 @@ impl<'a> Compiler<'a> {
             self.block()?;
             self.close_block_gotos();
             self.emit_close_if_needed(self.line());
-            { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+            {
+                let pc = self.fs().current_pc() as u32;
+                self.fs_mut().scope.leave_block_at_pc(pc)
+            };
         }
 
         if self.check(&Token::Else) {
@@ -2014,7 +2066,10 @@ impl<'a> Compiler<'a> {
             self.block()?;
             self.close_block_gotos();
             self.emit_close_if_needed(self.line());
-            { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+            {
+                let pc = self.fs().current_pc() as u32;
+                self.fs_mut().scope.leave_block_at_pc(pc)
+            };
         } else {
             // No else: patch false_jump to after the if statement
             if let Some(fj) = false_jump {
@@ -2046,7 +2101,10 @@ impl<'a> Compiler<'a> {
         self.block()?;
         self.close_block_gotos();
         self.emit_close_if_needed(self.line());
-        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        let block = {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
 
         // Jump back to loop start
         let back_jump = self.emit_sj(OpCode::Jmp, 0, self.line());
@@ -2071,7 +2129,10 @@ impl<'a> Compiler<'a> {
         self.block()?;
         self.close_block_gotos();
         self.emit_close_if_needed(self.line());
-        { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
         self.expect(&Token::End)?;
         Ok(())
     }
@@ -2136,7 +2197,10 @@ impl<'a> Compiler<'a> {
         self.close_block_gotos();
         self.emit_close_if_needed(self.line());
 
-        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        let block = {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
 
         // ForLoop: increment and test
         let loop_pc = self.emit_abx(OpCode::ForLoop, base, 0, self.line());
@@ -2251,7 +2315,10 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        let block = {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
 
         // TForCall + TForLoop — use the line of the `for` keyword for proper error messages
         let nvars = names.len() as u8;
@@ -2284,12 +2351,14 @@ impl<'a> Compiler<'a> {
             let end_pc = self.fs().current_pc() as u32;
             let fs = self.fs_mut();
             for local in &fs.scope.locals[num_locals_before_hidden..] {
-                fs.scope.finished_locals.push(crate::compiler::scope::FinishedLocal {
-                    name: local.name,
-                    reg: local.reg,
-                    start_pc: local.start_pc,
-                    end_pc,
-                });
+                fs.scope
+                    .finished_locals
+                    .push(crate::compiler::scope::FinishedLocal {
+                        name: local.name,
+                        reg: local.reg,
+                        start_pc: local.start_pc,
+                        end_pc,
+                    });
             }
             fs.scope.locals.truncate(num_locals_before_hidden);
         }
@@ -2339,7 +2408,10 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
+        let block = {
+            let pc = self.fs().current_pc() as u32;
+            self.fs_mut().scope.leave_block_at_pc(pc)
+        };
 
         // Patch breaks to after the loop
         for brk in block.break_jumps {
@@ -2563,7 +2635,7 @@ impl<'a> Compiler<'a> {
                 let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
                 let goto_name_bytes = self.lexer.strings.get_bytes(name).to_vec();
                 let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
-                return Err(self.error(&format!(
+                return Err(self.error(format!(
                     "<goto {}> at line {} jumps into the scope of local '{}'",
                     goto_name_str, line, local_name_str
                 )));
@@ -2620,7 +2692,7 @@ impl<'a> Compiler<'a> {
             for block in self.fs().scope.blocks.iter() {
                 for label in &block.labels {
                     if label.name == name {
-                        return Err(self.error(&format!(
+                        return Err(self.error(format!(
                             "label '{}' already defined on line {}",
                             label_name_str, label.line
                         )));
@@ -2630,12 +2702,17 @@ impl<'a> Compiler<'a> {
         }
 
         // Add label to current block
-        self.fs_mut().scope.current_block_mut().unwrap().labels.push(LabelInfo {
-            name,
-            pc,
-            num_locals,
-            line: label_line,
-        });
+        self.fs_mut()
+            .scope
+            .current_block_mut()
+            .unwrap()
+            .labels
+            .push(LabelInfo {
+                name,
+                pc,
+                num_locals,
+                line: label_line,
+            });
 
         // Check if this label could be at block end (next token is block-terminating)
         let at_block_end = match self.current_token() {
@@ -2661,10 +2738,11 @@ impl<'a> Compiler<'a> {
                         // Label is NOT at block end — this goto definitely jumps into scope
                         let local_name = self.fs().scope.locals[goto_info.num_locals].name;
                         let local_name_bytes = self.lexer.strings.get_bytes(local_name).to_vec();
-                        let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
+                        let local_name_str =
+                            String::from_utf8_lossy(&local_name_bytes).into_owned();
                         let goto_name_bytes = self.lexer.strings.get_bytes(goto_info.name).to_vec();
                         let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
-                        return Err(self.error(&format!(
+                        return Err(self.error(format!(
                             "<goto {}> at line {} jumps into the scope of local '{}'",
                             goto_name_str, goto_info.line, local_name_str
                         )));
@@ -2850,8 +2928,13 @@ impl<'a> Compiler<'a> {
                 let reg = *reg;
                 if let Some(local) = self.fs().scope.resolve_local_by_reg(reg) {
                     if local.is_const || local.is_close {
-                        let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(local.name)).into_owned();
-                        return Err(self.error_at(line, format!("attempt to assign to const variable '{}'", name)));
+                        let name =
+                            String::from_utf8_lossy(self.lexer.strings.get_bytes(local.name))
+                                .into_owned();
+                        return Err(self.error_at(
+                            line,
+                            format!("attempt to assign to const variable '{}'", name),
+                        ));
                     }
                 }
                 self.discharge_to_reg(value, reg, line);
@@ -2860,8 +2943,16 @@ impl<'a> Compiler<'a> {
                 let idx = *idx;
                 // Check if the upvalue is a const variable
                 if self.fs().upvalues[idx as usize].is_const {
-                    let name = String::from_utf8_lossy(self.lexer.strings.get_bytes(self.fs().upvalues[idx as usize].name)).into_owned();
-                    return Err(self.error_at(line, format!("attempt to assign to const variable '{}'", name)));
+                    let name = String::from_utf8_lossy(
+                        self.lexer
+                            .strings
+                            .get_bytes(self.fs().upvalues[idx as usize].name),
+                    )
+                    .into_owned();
+                    return Err(self.error_at(
+                        line,
+                        format!("attempt to assign to const variable '{}'", name),
+                    ));
                 }
                 let val_reg = self.discharge_to_any_reg(value, line);
                 self.emit_abc(OpCode::SetUpval, val_reg, idx, 0, line);
@@ -2957,12 +3048,16 @@ impl<'a> Compiler<'a> {
     /// Called before closing a function to ensure all gotos have valid targets.
     fn check_unresolved_gotos(&self) -> Result<(), CompileError> {
         // Collect all labels in the function scope for error diagnosis
-        let all_labels: Vec<_> = self.fs().scope.blocks.iter()
+        let all_labels: Vec<_> = self
+            .fs()
+            .scope
+            .blocks
+            .iter()
             .flat_map(|b| b.labels.iter())
             .collect();
 
         for block in &self.fs().scope.blocks {
-            for goto_info in &block.pending_gotos {
+            if let Some(goto_info) = block.pending_gotos.first() {
                 let goto_name_bytes = self.lexer.strings.get_bytes(goto_info.name).to_vec();
                 let goto_name_str = String::from_utf8_lossy(&goto_name_bytes).into_owned();
 
@@ -2972,7 +3067,8 @@ impl<'a> Compiler<'a> {
                         // Goto jumps into scope of a local variable
                         let local_name = self.fs().scope.locals[goto_info.num_locals].name;
                         let local_name_bytes = self.lexer.strings.get_bytes(local_name).to_vec();
-                        let local_name_str = String::from_utf8_lossy(&local_name_bytes).into_owned();
+                        let local_name_str =
+                            String::from_utf8_lossy(&local_name_bytes).into_owned();
                         return Err(CompileError {
                             message: format!(
                                 "<goto {}> at line {} jumps into the scope of local '{}'",
@@ -3088,7 +3184,9 @@ fn compile_inner(compiler: &mut Compiler<'_>, name: &str) -> Result<Proto, Compi
     fs.proto.max_stack_size = fs.scope.max_reg + 2;
 
     // Populate local_vars from finished_locals (sorted by register)
-    fs.scope.finished_locals.sort_by_key(|l| (l.reg, l.start_pc));
+    fs.scope
+        .finished_locals
+        .sort_by_key(|l| (l.reg, l.start_pc));
     fs.proto.local_vars = fs
         .scope
         .finished_locals

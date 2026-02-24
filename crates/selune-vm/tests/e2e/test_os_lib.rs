@@ -41,10 +41,7 @@ fn test_os_time_with_table() {
 fn test_os_time_with_table_defaults() {
     // hour defaults to 12, min/sec default to 0
     // 2000-01-01 12:00:00 UTC = 946684800 + 12*3600 = 946728000
-    run_check_ints(
-        "return os.time({year=2000, month=1, day=1})",
-        &[946728000],
-    );
+    run_check_ints("return os.time({year=2000, month=1, day=1})", &[946728000]);
 }
 
 // ---- os.difftime ----
@@ -158,10 +155,12 @@ fn test_os_execute_success() {
 #[test]
 #[ignore = "requires shell access"]
 fn test_os_execute_failure() {
-    let (results, vm) = run_with_vm(r#"
+    let (results, vm) = run_with_vm(
+        r#"
         local ok, tp, code = os.execute("exit 1")
         return ok == nil, tp, code
-    "#);
+    "#,
+    );
     assert_bool(&results, 0, true); // ok == nil is true
     assert_str(&results, 1, "exit", &vm);
 }
@@ -186,10 +185,12 @@ fn test_os_tmpname_unique() {
 #[test]
 fn test_os_remove_nonexistent() {
     // Removing a nonexistent file should return nil + error message
-    let results = run_lua(r#"
+    let results = run_lua(
+        r#"
         local ok, msg = os.remove("/tmp/selune_nonexistent_file_12345")
         return ok == nil, type(msg) == "string"
-    "#);
+    "#,
+    );
     assert_bool(&results, 0, true);
     assert_bool(&results, 1, true);
 }
@@ -199,10 +200,12 @@ fn test_os_remove_nonexistent() {
 #[test]
 fn test_os_rename_nonexistent() {
     // Renaming a nonexistent file should return nil + error message
-    let results = run_lua(r#"
+    let results = run_lua(
+        r#"
         local ok, msg = os.rename("/tmp/selune_nonexistent_a_12345", "/tmp/selune_nonexistent_b_12345")
         return ok == nil, type(msg) == "string"
-    "#);
+    "#,
+    );
     assert_bool(&results, 0, true);
     assert_bool(&results, 1, true);
 }
@@ -227,10 +230,12 @@ fn test_os_setlocale_query() {
 fn test_os_date_time_roundtrip() {
     // os.time(os.date("*t")) should return approximately current time
     // (may differ by 1 second due to timing)
-    let results = run_lua(r#"
+    let results = run_lua(
+        r#"
         local t1 = os.time()
         local t2 = os.time(os.date("*t"))
         return math.abs(t2 - t1) <= 1
-    "#);
+    "#,
+    );
     assert_bool(&results, 0, true);
 }

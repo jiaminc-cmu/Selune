@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, phase1]
+    branches: [main, phase1, phase-3-compliance]
   pull_request:
     branches: [main]
 
@@ -30,3 +30,26 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test --all
+
+  puc-testsuite:
+    name: PUC-Rio Lua 5.4.7 Test Suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release
+      - name: Run official Lua 5.4.7 test suite
+        run: ./scripts/run_puc_547.sh ./target/release/selune
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: puc-testsuite-log-${{ matrix.os }}
+          path: |
+            scripts/run_puc_547.sh
+            tests/lua54-tests/run_test.lua

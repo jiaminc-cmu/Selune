@@ -113,12 +113,18 @@ fn test_string_upper_mixed() {
 
 #[test]
 fn test_format_string() {
-    run_check_strings("return string.format('hello %s', 'world')", &["hello world"]);
+    run_check_strings(
+        "return string.format('hello %s', 'world')",
+        &["hello world"],
+    );
 }
 
 #[test]
 fn test_format_integer() {
-    run_check_strings("return string.format('%d + %d = %d', 1, 2, 3)", &["1 + 2 = 3"]);
+    run_check_strings(
+        "return string.format('%d + %d = %d', 1, 2, 3)",
+        &["1 + 2 = 3"],
+    );
 }
 
 #[test]
@@ -153,7 +159,10 @@ fn test_format_padded() {
 
 #[test]
 fn test_format_quoted() {
-    run_check_strings(r#"return string.format('%q', 'hello "world"')"#, &[r#""hello \"world\"""#]);
+    run_check_strings(
+        r#"return string.format('%q', 'hello "world"')"#,
+        &[r#""hello \"world\"""#],
+    );
 }
 
 #[test]
@@ -165,7 +174,10 @@ fn test_format_char() {
 
 #[test]
 fn test_find_plain() {
-    run_check_ints("return string.find('hello world', 'world', 1, true)", &[7, 11]);
+    run_check_ints(
+        "return string.find('hello world', 'world', 1, true)",
+        &[7, 11],
+    );
 }
 
 #[test]
@@ -203,7 +215,10 @@ fn test_match_basic() {
 
 #[test]
 fn test_match_captures() {
-    run_check_strings("return string.match('2023-01-15', '(%d+)-(%d+)-(%d+)')", &["2023", "01", "15"]);
+    run_check_strings(
+        "return string.match('2023-01-15', '(%d+)-(%d+)-(%d+)')",
+        &["2023", "01", "15"],
+    );
 }
 
 #[test]
@@ -270,10 +285,7 @@ fn test_gsub_string_replacement() {
 
 #[test]
 fn test_gsub_count() {
-    run_check_ints(
-        "local r, n = string.gsub('aaa', 'a', 'b') return n",
-        &[3],
-    );
+    run_check_ints("local r, n = string.gsub('aaa', 'a', 'b') return n", &[3]);
 }
 
 #[test]
@@ -449,10 +461,7 @@ fn test_format_g_small() {
 
 #[test]
 fn test_byte_char_roundtrip() {
-    run_check_strings(
-        "return string.char(string.byte('A'))",
-        &["A"],
-    );
+    run_check_strings("return string.char(string.byte('A'))", &["A"]);
 }
 
 #[test]

@@ -40,6 +40,7 @@ enum CapStatus {
 /// mutable capture state.
 struct Matcher<'a> {
     subject: &'a [u8],
+    #[allow(dead_code)]
     pattern: &'a [u8],
     caps: Vec<CapStatus>,
     depth: usize,
@@ -54,7 +55,11 @@ struct Matcher<'a> {
 /// Validate a Lua pattern, returning an error message if invalid.
 pub fn validate_pattern(pattern: &[u8]) -> Result<(), String> {
     let mut i = 0;
-    let pat = if !pattern.is_empty() && pattern[0] == b'^' { &pattern[1..] } else { pattern };
+    let pat = if !pattern.is_empty() && pattern[0] == b'^' {
+        &pattern[1..]
+    } else {
+        pattern
+    };
     let mut open_parens = 0i32;
     while i < pat.len() {
         match pat[i] {
@@ -148,7 +153,11 @@ pub fn validate_pattern(pattern: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn pattern_find(subject: &[u8], pattern: &[u8], init: usize) -> Result<Option<MatchState>, String> {
+pub fn pattern_find(
+    subject: &[u8],
+    pattern: &[u8],
+    init: usize,
+) -> Result<Option<MatchState>, String> {
     let anchor = !pattern.is_empty() && pattern[0] == b'^';
     let pat = if anchor { &pattern[1..] } else { pattern };
 
@@ -536,7 +545,7 @@ impl<'a> Matcher<'a> {
                     return None;
                 }
                 let cap_idx = n - 1; // %1 = index 0, etc.
-                // Check if this capture exists and is closed
+                                     // Check if this capture exists and is closed
                 if cap_idx >= self.caps.len() {
                     self.error = Some(format!("invalid capture index %{}", n));
                     return None;
@@ -608,8 +617,7 @@ impl<'a> Matcher<'a> {
     ) -> Option<usize> {
         // Count maximum matches.
         let mut count = 0usize;
-        while si + count < self.subject.len()
-            && singlematch(pattern, pp, self.subject[si + count])
+        while si + count < self.subject.len() && singlematch(pattern, pp, self.subject[si + count])
         {
             count += 1;
         }
@@ -684,12 +692,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// `%bxy` balanced match.
-    fn match_balance(
-        &mut self,
-        pattern: &[u8],
-        pp: usize,
-        si: usize,
-    ) -> Option<usize> {
+    fn match_balance(&mut self, pattern: &[u8], pp: usize, si: usize) -> Option<usize> {
         let open = pattern[pp + 2];
         let close = pattern[pp + 3];
         let rest_pp = pp + 4;
@@ -718,12 +721,7 @@ impl<'a> Matcher<'a> {
     /// `%f[set]` frontier pattern: matches the transition where the previous
     /// character does not match `[set]` but the current character does.
     /// This is a zero-width assertion.
-    fn match_frontier(
-        &mut self,
-        pattern: &[u8],
-        pp: usize,
-        si: usize,
-    ) -> Option<usize> {
+    fn match_frontier(&mut self, pattern: &[u8], pp: usize, si: usize) -> Option<usize> {
         // pp points to '%', pp+1 is 'f', pp+2 is '['
         let set_start = pp + 2; // points to '['
         let set_inner = set_start + 1; // points to first byte inside [...]
@@ -750,6 +748,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// Get the byte slice for a closed capture by index (0-based among user captures).
+    #[allow(dead_code)]
     fn get_closed_capture(&self, idx: usize) -> Option<&[u8]> {
         // Find the idx-th capture (skipping open/position captures for counting purposes).
         // In Lua, captures are numbered in order of their opening parenthesis.
@@ -764,12 +763,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// Open a capture group.
-    fn match_open_capture(
-        &mut self,
-        pattern: &[u8],
-        rest_pp: usize,
-        si: usize,
-    ) -> Option<usize> {
+    fn match_open_capture(&mut self, pattern: &[u8], rest_pp: usize, si: usize) -> Option<usize> {
         if self.caps.len() >= MAX_CAPTURES {
             return None; // too many captures
         }
@@ -784,12 +778,7 @@ impl<'a> Matcher<'a> {
     }
 
     /// Close the most recent open capture.
-    fn match_close_capture(
-        &mut self,
-        pattern: &[u8],
-        rest_pp: usize,
-        si: usize,
-    ) -> Option<usize> {
+    fn match_close_capture(&mut self, pattern: &[u8], rest_pp: usize, si: usize) -> Option<usize> {
         // Find the last open capture.
         let mut idx = None;
         for i in (0..self.caps.len()).rev() {
@@ -798,10 +787,7 @@ impl<'a> Matcher<'a> {
                 break;
             }
         }
-        let idx = match idx {
-            Some(i) => i,
-            None => return None, // unmatched close
-        };
+        let idx = idx?; // unmatched close
         let start = match self.caps[idx] {
             CapStatus::Open(s) => s,
             _ => unreachable!(),
@@ -866,7 +852,11 @@ impl<'a> Matcher<'a> {
 /// `ms` is the match state from a successful match.
 /// `subject` is the original subject string.
 /// Returns the expanded replacement string.
-pub fn expand_replacement(replacement: &[u8], ms: &MatchState, subject: &[u8]) -> Result<Vec<u8>, String> {
+pub fn expand_replacement(
+    replacement: &[u8],
+    ms: &MatchState,
+    subject: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     // Number of user captures (excluding capture 0 = full match).
@@ -874,7 +864,7 @@ pub fn expand_replacement(replacement: &[u8], ms: &MatchState, subject: &[u8]) -
     while i < replacement.len() {
         if replacement[i] == b'%' && i + 1 < replacement.len() {
             let next = replacement[i + 1];
-            if next >= b'0' && next <= b'9' {
+            if next.is_ascii_digit() {
                 let n = (next - b'0') as usize;
                 // PUC Lua: %0 = whole match. %1..%9 = explicit captures.
                 // When no explicit captures, %1 = whole match (capture index 0).
@@ -1036,9 +1026,9 @@ mod tests {
     fn test_captures_basic() {
         let caps = captures("hello world", "(hello) (world)").unwrap();
         assert_eq!(caps.len(), 3);
-        assert_eq!(caps[0], (0, 11));   // full match
-        assert_eq!(caps[1], (0, 5));    // first capture
-        assert_eq!(caps[2], (6, 11));   // second capture
+        assert_eq!(caps[0], (0, 11)); // full match
+        assert_eq!(caps[1], (0, 5)); // first capture
+        assert_eq!(caps[2], (6, 11)); // second capture
     }
 
     #[test]
@@ -1150,8 +1140,8 @@ mod tests {
         let caps = captures("user@host.com", "(%w+)@(%w+%.%w+)");
         let caps = caps.unwrap();
         assert_eq!(caps[0], (0, 13));
-        assert_eq!(caps[1], (0, 4));   // "user"
-        assert_eq!(caps[2], (5, 13));  // "host.com"
+        assert_eq!(caps[1], (0, 4)); // "user"
+        assert_eq!(caps[2], (5, 13)); // "host.com"
     }
 
     #[test]
@@ -1212,7 +1202,9 @@ mod tests {
     fn test_frontier_at_boundary() {
         // Frontier between digit and non-digit.
         let subject = "abc123def";
-        let ms = pattern_find(subject.as_bytes(), b"%f[%d]", 0).unwrap().unwrap();
+        let ms = pattern_find(subject.as_bytes(), b"%f[%d]", 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(ms.captures[0], (3, 3)); // zero-width at pos 3
     }
 
@@ -1220,7 +1212,9 @@ mod tests {
     fn test_frontier_at_end_boundary() {
         // Frontier from digit back to letter.
         let subject = "123abc";
-        let ms = pattern_find(subject.as_bytes(), b"%f[%a]", 0).unwrap().unwrap();
+        let ms = pattern_find(subject.as_bytes(), b"%f[%a]", 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(ms.captures[0], (3, 3));
     }
 }

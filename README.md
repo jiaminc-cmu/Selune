@@ -32,6 +32,19 @@ Selune is validated against the [official Lua 5.4.7 test suite](https://www.lua.
 
 **4 tests excluded** (not applicable): `api` (C API only), `main` (CLI-specific, skipped by `_port`), `heavy` (memory stress), `gengc` (generational GC, planned)
 
+### Test Mode
+
+The test suite runs in Lua's standard **portable mode** via `run_test.lua`, which sets:
+
+| Global | Value | Purpose |
+|--------|-------|---------|
+| `_port` | `true` | Skip platform-specific / OS-dependent tests |
+| `_soft` | `true` | Use smaller limits (fewer iterations, smaller tables) |
+| `_nomsg` | `true` | Suppress "not testing X" messages |
+| `T` | `nil` | Disable internal C API tests (not applicable) |
+
+This is the same configuration used by the official test suite for portable Lua implementations. See [`tests/lua54-tests/ORIGIN.md`](tests/lua54-tests/ORIGIN.md) for full provenance details.
+
 ## Features
 
 ### Phase 1 — Compiler
@@ -110,8 +123,11 @@ cargo run -- path/to/script.lua
 # Run the full Rust test suite
 cargo test --workspace
 
-# Run official Lua 5.4 test suite (requires release build)
+# Run official Lua 5.4.7 test suite (all 28 files)
 cargo build --release
+./scripts/run_puc_547.sh
+
+# Run a single official test file
 ./target/release/selune tests/lua54-tests/run_test.lua tests/lua54-tests/math.lua
 ```
 
@@ -150,4 +166,4 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 
 ## License
 
-TBD
+MIT License. See [LICENSE](LICENSE) for details.

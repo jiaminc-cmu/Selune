@@ -244,7 +244,10 @@ fn test_tbc_no_close_metamethod() {
         return ok
         "#,
     );
-    assert!(err.contains("non-closable value"), "expected non-closable error, got: {err}");
+    assert!(
+        err.contains("non-closable value"),
+        "expected non-closable error, got: {err}"
+    );
 }
 
 // ── Multiple TBC in different functions ─────────────────────────

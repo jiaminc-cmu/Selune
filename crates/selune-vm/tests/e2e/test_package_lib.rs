@@ -216,10 +216,7 @@ fn test_require_not_found() {
 #[test]
 fn test_require_bad_argument() {
     let err = run_lua_err("require(123)");
-    assert!(
-        err.contains("string expected"),
-        "error was: {err}"
-    );
+    assert!(err.contains("string expected"), "error was: {err}");
 }
 
 // ---- package.searchpath ----

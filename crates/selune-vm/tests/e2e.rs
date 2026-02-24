@@ -3,36 +3,36 @@ mod e2e {
     mod test_arithmetic;
     mod test_closures;
     mod test_control_flow;
+    mod test_coroutines;
     mod test_error_handling;
     mod test_functions;
+    mod test_gc;
     mod test_generic_for;
     mod test_literals;
+    mod test_math_lib;
     mod test_metamethods;
+    mod test_os_lib;
     mod test_qa_comprehensive;
     mod test_stdlib;
+    mod test_string_lib;
+    mod test_table_lib;
     mod test_tables;
     mod test_tbc;
-    mod test_math_lib;
-    mod test_table_lib;
-    mod test_string_lib;
-    mod test_coroutines;
-    mod test_gc;
-    mod test_os_lib;
     mod test_utf8_lib;
     // Tier 1: Lua 5.4 Conformance
     mod test_lua54_conformance;
     // Tier 2: Gap-fill
     mod test_number_semantics;
+    mod test_scope_semantics;
     mod test_string_coercion;
     mod test_table_semantics;
-    mod test_scope_semantics;
     // Tier 3: Cross-feature & Stress
     mod test_cross_feature;
     mod test_stress;
     // Phase 3: Compliance
-    mod test_load_exec;
-    mod test_userdata;
     mod test_debug_lib;
     mod test_io_lib;
+    mod test_load_exec;
     mod test_package_lib;
+    mod test_userdata;
 }

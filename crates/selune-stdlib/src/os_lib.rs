@@ -11,11 +11,7 @@ thread_local! {
 }
 
 /// Register the os library into _ENV.
-pub fn register(
-    env_idx: GcIdx<Table>,
-    gc: &mut GcHeap,
-    strings: &mut StringInterner,
-) {
+pub fn register(env_idx: GcIdx<Table>, gc: &mut GcHeap, strings: &mut StringInterner) {
     let os_table = gc.alloc_table(0, 16);
 
     register_fn(gc, os_table, strings, "clock", native_os_clock);
@@ -89,16 +85,17 @@ fn native_os_time(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         let check_int_range = |val: i64, name: &str| -> Result<(), NativeError> {
             if val < i32::MIN as i64 || val > i32::MAX as i64 {
                 Err(NativeError::String(format!(
-                    "field '{}' is out-of-bound", name
+                    "field '{}' is out-of-bound",
+                    name
                 )))
             } else {
                 Ok(())
             }
         };
         // year - 1900 must fit in i32 (tm_year)
-        let tm_year = year.checked_sub(1900).ok_or_else(|| {
-            NativeError::String("field 'year' is out-of-bound".to_string())
-        })?;
+        let tm_year = year
+            .checked_sub(1900)
+            .ok_or_else(|| NativeError::String("field 'year' is out-of-bound".to_string()))?;
         check_int_range(tm_year, "year")?;
         // month - 1 must fit in i32 (tm_mon)
         check_int_range(month - 1, "month")?;
@@ -239,9 +236,8 @@ fn native_os_date(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         "%c"
     } else if let Some(sid) = fmt_arg.as_string_id() {
         format_bytes = ctx.strings.get_bytes(sid).to_vec();
-        std::str::from_utf8(&format_bytes).map_err(|_| {
-            NativeError::String("bad argument #1 to 'date' (invalid UTF-8)".into())
-        })?
+        std::str::from_utf8(&format_bytes)
+            .map_err(|_| NativeError::String("bad argument #1 to 'date' (invalid UTF-8)".into()))?
     } else {
         return Err(NativeError::String(
             "bad argument #1 to 'date' (string expected)".into(),
@@ -278,8 +274,7 @@ fn native_os_date(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     }
 
     // Format the date string
-    let result = format_date(format_str, &dt)
-        .map_err(|e| NativeError::String(e))?;
+    let result = format_date(format_str, &dt).map_err(NativeError::String)?;
     let sid = ctx.strings.intern_or_create(result.as_bytes());
     Ok(vec![TValue::from_string_id(sid)])
 }
@@ -287,13 +282,13 @@ fn native_os_date(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
 /// Date/time components (UTC).
 struct DateTime {
     year: i64,
-    month: i64,  // 1-12
-    day: i64,    // 1-31
-    hour: i64,   // 0-23
-    min: i64,    // 0-59
-    sec: i64,    // 0-59
-    wday: i64,   // 1=Sunday, 2=Monday, ..., 7=Saturday
-    yday: i64,   // 1-366
+    month: i64, // 1-12
+    day: i64,   // 1-31
+    hour: i64,  // 0-23
+    min: i64,   // 0-59
+    sec: i64,   // 0-59
+    wday: i64,  // 1=Sunday, 2=Monday, ..., 7=Saturday
+    yday: i64,  // 1-366
 }
 
 /// Convert Unix timestamp to date/time components (UTC).
@@ -342,8 +337,8 @@ fn day_of_year(year: i64, month: i64, day: i64) -> i64 {
     let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut yday = day;
-    for i in 0..(month - 1) as usize {
-        yday += month_days[i];
+    for &days in month_days.iter().take((month - 1) as usize) {
+        yday += days;
     }
     if is_leap && month > 2 {
         yday += 1;
@@ -382,12 +377,28 @@ fn gc_alloc_date_table(
 }
 
 static WEEKDAY_NAMES: [&str; 7] = [
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
 ];
 static WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 static MONTH_NAMES: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 static MONTH_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -482,9 +493,7 @@ fn format_date(fmt: &str, dt: &DateTime) -> Result<String, String> {
                     'n' => result.push('\n'),
                     't' => result.push('\t'),
                     _ => {
-                        return Err(format!(
-                            "invalid conversion specifier '%{}'", spec
-                        ));
+                        return Err(format!("invalid conversion specifier '%{}'", spec));
                     }
                 }
             } else {
@@ -669,7 +678,11 @@ fn native_os_exit(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         if val.is_nil() {
             0
         } else if let Some(b) = val.as_bool() {
-            if b { 0 } else { 1 }
+            if b {
+                0
+            } else {
+                1
+            }
         } else if let Some(i) = val.as_full_integer(ctx.gc) {
             i as i32
         } else if let Some(f) = val.as_float() {
@@ -701,7 +714,7 @@ fn native_os_setlocale(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     if let Some(sid) = arg.as_string_id() {
         let bytes = ctx.strings.get_bytes(sid).to_vec();
         let locale = std::str::from_utf8(&bytes).unwrap_or("");
-        if locale == "C" || locale == "" || locale == "POSIX" {
+        if locale == "C" || locale.is_empty() || locale == "POSIX" {
             let result_sid = ctx.strings.intern(b"C");
             return Ok(vec![TValue::from_string_id(result_sid)]);
         }

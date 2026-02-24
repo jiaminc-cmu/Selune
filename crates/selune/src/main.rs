@@ -86,10 +86,7 @@ fn main() {
     // If no script and no -e, and stdin is a terminal, go interactive
     let stdin_is_tty = atty_check();
     let go_interactive = interactive
-        || (script_file.is_none()
-            && exec_statements.is_empty()
-            && stdin_is_tty
-            && !show_version);
+        || (script_file.is_none() && exec_statements.is_empty() && stdin_is_tty && !show_version);
 
     // Execute -l modules and -e statements
     if !load_modules.is_empty() || !exec_statements.is_empty() || script_file.is_some() {
@@ -197,9 +194,10 @@ fn create_vm(warn_on: bool, script_file: &Option<String>, script_args: &[String]
         // arg[1..] = script arguments
         for (j, a) in script_args.iter().enumerate() {
             let sid = vm.strings.intern_or_create(a.as_bytes());
-            vm.gc
-                .get_table_mut(arg_table)
-                .raw_seti((j + 1) as i64, selune_core::value::TValue::from_string_id(sid));
+            vm.gc.get_table_mut(arg_table).raw_seti(
+                (j + 1) as i64,
+                selune_core::value::TValue::from_string_id(sid),
+            );
         }
 
         // arg[-1] = program name
@@ -209,10 +207,9 @@ fn create_vm(warn_on: bool, script_file: &Option<String>, script_args: &[String]
             .raw_seti(-1, selune_core::value::TValue::from_string_id(prog_sid));
 
         let arg_key = vm.strings.intern(b"arg");
-        vm.gc.get_table_mut(env_idx).raw_set_str(
-            arg_key,
-            selune_core::value::TValue::from_table(arg_table),
-        );
+        vm.gc
+            .get_table_mut(env_idx)
+            .raw_set_str(arg_key, selune_core::value::TValue::from_table(arg_table));
     }
 
     vm
@@ -267,8 +264,7 @@ fn run_repl(mut vm: Vm) {
 
                 // Try as expression first (prepend "return ")
                 let try_expr = format!("return {}", line);
-                let result =
-                    try_compile_and_run(&mut vm, &try_expr, "=stdin");
+                let result = try_compile_and_run(&mut vm, &try_expr, "=stdin");
 
                 match result {
                     Ok(Some(output)) => {
@@ -346,9 +342,7 @@ fn try_compile_and_run(vm: &mut Vm, source: &str, name: &str) -> Result<Option<S
                 Ok(Some(parts.join("\t")))
             }
         }
-        Err(e) => {
-            Err(format!("{}", e))
-        }
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
@@ -360,7 +354,11 @@ fn format_value(
     if val.is_nil() {
         "nil".to_string()
     } else if let Some(b) = val.as_bool() {
-        if b { "true".to_string() } else { "false".to_string() }
+        if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
     } else if let Some(i) = val.as_integer() {
         format!("{}", i)
     } else if let Some(i) = val.as_full_integer(gc) {

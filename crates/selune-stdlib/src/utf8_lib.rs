@@ -9,11 +9,7 @@ use selune_core::value::TValue;
 const MAX_UNICODE: u32 = 0x10FFFF;
 
 /// Register the utf8 library into _ENV.
-pub fn register(
-    env_idx: GcIdx<Table>,
-    gc: &mut GcHeap,
-    strings: &mut StringInterner,
-) {
+pub fn register(env_idx: GcIdx<Table>, gc: &mut GcHeap, strings: &mut StringInterner) {
     let utf8_table = gc.alloc_table(0, 8);
 
     register_fn(gc, utf8_table, strings, "char", native_utf8_char);
@@ -56,7 +52,7 @@ const MAX_LAX: u32 = 0x7FFFFFFF;
 
 /// Check if a codepoint is a surrogate (U+D800..U+DFFF).
 fn is_surrogate(cp: u32) -> bool {
-    cp >= 0xD800 && cp <= 0xDFFF
+    (0xD800..=0xDFFF).contains(&cp)
 }
 
 /// Encode a single code point into UTF-8 bytes (up to 6 bytes for lax mode).
@@ -128,50 +124,78 @@ fn decode_utf8_raw(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
     if b0 <= 0x7F {
         Some((b0 as u32, pos + 1))
     } else if b0 & 0xE0 == 0xC0 {
-        if pos + 1 >= bytes.len() { return None; }
+        if pos + 1 >= bytes.len() {
+            return None;
+        }
         let b1 = bytes[pos + 1];
-        if b1 & 0xC0 != 0x80 { return None; }
+        if b1 & 0xC0 != 0x80 {
+            return None;
+        }
         let cp = ((b0 as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F);
-        if cp < 0x80 { return None; }
+        if cp < 0x80 {
+            return None;
+        }
         Some((cp, pos + 2))
     } else if b0 & 0xF0 == 0xE0 {
-        if pos + 2 >= bytes.len() { return None; }
+        if pos + 2 >= bytes.len() {
+            return None;
+        }
         let b1 = bytes[pos + 1];
         let b2 = bytes[pos + 2];
-        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) { return None; }
+        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) {
+            return None;
+        }
         let cp = ((b0 as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
-        if cp < 0x800 { return None; }
+        if cp < 0x800 {
+            return None;
+        }
         Some((cp, pos + 3))
     } else if b0 & 0xF8 == 0xF0 {
-        if pos + 3 >= bytes.len() { return None; }
+        if pos + 3 >= bytes.len() {
+            return None;
+        }
         let b1 = bytes[pos + 1];
         let b2 = bytes[pos + 2];
         let b3 = bytes[pos + 3];
-        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) { return None; }
+        if (b1 & 0xC0 != 0x80) || (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) {
+            return None;
+        }
         let cp = ((b0 as u32 & 0x07) << 18)
             | ((b1 as u32 & 0x3F) << 12)
             | ((b2 as u32 & 0x3F) << 6)
             | (b3 as u32 & 0x3F);
-        if cp < 0x10000 { return None; }
+        if cp < 0x10000 {
+            return None;
+        }
         Some((cp, pos + 4))
     } else if b0 & 0xFC == 0xF8 {
         // 5-byte: 111110xx
-        if pos + 4 >= bytes.len() { return None; }
+        if pos + 4 >= bytes.len() {
+            return None;
+        }
         for k in 1..5 {
-            if bytes[pos + k] & 0xC0 != 0x80 { return None; }
+            if bytes[pos + k] & 0xC0 != 0x80 {
+                return None;
+            }
         }
         let cp = ((b0 as u32 & 0x03) << 24)
             | ((bytes[pos + 1] as u32 & 0x3F) << 18)
             | ((bytes[pos + 2] as u32 & 0x3F) << 12)
             | ((bytes[pos + 3] as u32 & 0x3F) << 6)
             | (bytes[pos + 4] as u32 & 0x3F);
-        if cp < 0x200000 { return None; }
+        if cp < 0x200000 {
+            return None;
+        }
         Some((cp, pos + 5))
     } else if b0 & 0xFE == 0xFC {
         // 6-byte: 1111110x
-        if pos + 5 >= bytes.len() { return None; }
+        if pos + 5 >= bytes.len() {
+            return None;
+        }
         for k in 1..6 {
-            if bytes[pos + k] & 0xC0 != 0x80 { return None; }
+            if bytes[pos + k] & 0xC0 != 0x80 {
+                return None;
+            }
         }
         let cp = ((b0 as u32 & 0x01) << 30)
             | ((bytes[pos + 1] as u32 & 0x3F) << 24)
@@ -179,7 +203,9 @@ fn decode_utf8_raw(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
             | ((bytes[pos + 3] as u32 & 0x3F) << 12)
             | ((bytes[pos + 4] as u32 & 0x3F) << 6)
             | (bytes[pos + 5] as u32 & 0x3F);
-        if cp < 0x4000000 { return None; }
+        if cp < 0x4000000 {
+            return None;
+        }
         Some((cp, pos + 6))
     } else {
         None
@@ -251,11 +277,7 @@ fn native_utf8_codes(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
         ));
     }
 
-    let lax = ctx
-        .args
-        .get(1)
-        .map(|v| v.is_truthy())
-        .unwrap_or(false);
+    let lax = ctx.args.get(1).map(|v| v.is_truthy()).unwrap_or(false);
 
     // Return (iterator_function, s, 0) — use lax or strict iterator
     let iter_fn = if lax {
@@ -287,7 +309,9 @@ fn native_utf8_codes_iter_lax(ctx: &mut NativeContext) -> Result<Vec<TValue>, Na
 fn utf8_codes_iter_impl(ctx: &mut NativeContext, lax: bool) -> Result<Vec<TValue>, NativeError> {
     let s_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let sid = s_val.as_string_id().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'utf8.codes iterator' (string expected)".to_string())
+        NativeError::String(
+            "bad argument #1 to 'utf8.codes iterator' (string expected)".to_string(),
+        )
     })?;
     let bytes = ctx.strings.get_bytes(sid).to_vec();
     let len = bytes.len();
@@ -375,7 +399,13 @@ fn native_utf8_codepoint(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
     // Bounds check: start must be in [0, len-1] for codepoint
     if start_raw < 0 || start_raw as usize >= len {
         // But if j would result in end < start, it's just an empty range
-        let end_raw = if j >= 1 { (j as isize) - 1 } else if j < 0 { (len as isize) + (j as isize) } else { -1 };
+        let end_raw = if j >= 1 {
+            (j as isize) - 1
+        } else if j < 0 {
+            (len as isize) + (j as isize)
+        } else {
+            -1
+        };
         if end_raw < start_raw {
             return Ok(vec![]); // empty range
         }
@@ -408,11 +438,7 @@ fn native_utf8_codepoint(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
     }
 
     // 4th argument: lax/nonstrict mode
-    let lax = ctx
-        .args
-        .get(3)
-        .map(|v| v.is_truthy())
-        .unwrap_or(false);
+    let lax = ctx.args.get(3).map(|v| v.is_truthy()).unwrap_or(false);
 
     let mut results = Vec::new();
     let mut pos = start;
@@ -515,11 +541,7 @@ fn native_utf8_len(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     let end_inclusive = end_inclusive_raw as usize;
 
     // 4th argument: lax/nonstrict mode
-    let lax = ctx
-        .args
-        .get(3)
-        .map(|v| v.is_truthy())
-        .unwrap_or(false);
+    let lax = ctx.args.get(3).map(|v| v.is_truthy()).unwrap_or(false);
 
     // Count UTF-8 characters in the range [start, end_inclusive]
     let mut count: i64 = 0;
@@ -571,9 +593,7 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         .get(1)
         .and_then(|v| v.as_full_integer(ctx.gc))
         .ok_or_else(|| {
-            NativeError::String(
-                "bad argument #2 to 'utf8.offset' (number expected)".to_string(),
-            )
+            NativeError::String("bad argument #2 to 'utf8.offset' (number expected)".to_string())
         })?;
 
     // Default i: if n >= 0, i = 1; if n < 0, i = len + 1 (one past the end)
@@ -683,6 +703,7 @@ fn native_utf8_offset(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
 
 /// Convert a 1-based Lua byte index (possibly negative) to a 0-based index.
 /// Negative indices count from the end (-1 = last byte).
+#[allow(dead_code)]
 fn lua_byte_index(i: i64, len: usize) -> usize {
     if i >= 0 {
         if i == 0 {
@@ -692,10 +713,6 @@ fn lua_byte_index(i: i64, len: usize) -> usize {
         }
     } else {
         let back = (-i) as usize;
-        if back > len {
-            0
-        } else {
-            len - back
-        }
+        len.saturating_sub(back)
     }
 }

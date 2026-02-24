@@ -17,11 +17,13 @@ fn test_coroutine_basic_resume_return() {
 
 #[test]
 fn test_coroutine_resume_returns_true() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local co = coroutine.create(function() return 1 end)
         local ok = coroutine.resume(co)
         return ok
-    "#);
+    "#,
+    );
     assert_bool(&r, 0, true);
 }
 
@@ -184,12 +186,14 @@ fn test_coroutine_wrap_with_args() {
 
 #[test]
 fn test_coroutine_close() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local co = coroutine.create(function() coroutine.yield() end)
         coroutine.resume(co) -- now suspended
         local ok = coroutine.close(co)
         return ok, coroutine.status(co)
-    "#);
+    "#,
+    );
     assert_bool(&r, 0, true);
     // After close, status should be "dead"
 }
@@ -198,24 +202,28 @@ fn test_coroutine_close() {
 
 #[test]
 fn test_coroutine_resume_dead() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local co = coroutine.create(function() return 1 end)
         coroutine.resume(co)
         local ok, msg = coroutine.resume(co)
         return ok
-    "#);
+    "#,
+    );
     assert_bool(&r, 0, false);
 }
 
 #[test]
 fn test_coroutine_error_in_coroutine() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local co = coroutine.create(function()
             error("boom")
         end)
         local ok, msg = coroutine.resume(co)
         return ok
-    "#);
+    "#,
+    );
     assert_bool(&r, 0, false);
 }
 

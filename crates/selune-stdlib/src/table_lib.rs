@@ -27,22 +27,26 @@ pub fn register(
     let insert_idx = gc.alloc_native(native_table_insert_stub, "insert");
     let insert_val = TValue::from_native(insert_idx);
     let insert_name = strings.intern(b"insert");
-    gc.get_table_mut(table_table).raw_set_str(insert_name, insert_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(insert_name, insert_val);
 
     let remove_idx = gc.alloc_native(native_table_remove_stub, "remove");
     let remove_val = TValue::from_native(remove_idx);
     let remove_name = strings.intern(b"remove");
-    gc.get_table_mut(table_table).raw_set_str(remove_name, remove_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(remove_name, remove_val);
     // table.concat/unpack are special — need VM access for __len/__index metamethods
     let concat_idx = gc.alloc_native(native_table_concat_stub, "concat");
     let concat_val = TValue::from_native(concat_idx);
     let concat_name = strings.intern(b"concat");
-    gc.get_table_mut(table_table).raw_set_str(concat_name, concat_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(concat_name, concat_val);
 
     let unpack_idx = gc.alloc_native(native_table_unpack_stub, "unpack");
     let unpack_val = TValue::from_native(unpack_idx);
     let unpack_name = strings.intern(b"unpack");
-    gc.get_table_mut(table_table).raw_set_str(unpack_name, unpack_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(unpack_name, unpack_val);
 
     register_fn(gc, table_table, strings, "pack", native_table_pack);
 
@@ -50,19 +54,28 @@ pub fn register(
     let sort_idx = gc.alloc_native(native_table_sort_stub, "sort");
     let sort_val = TValue::from_native(sort_idx);
     let sort_name = strings.intern(b"sort");
-    gc.get_table_mut(table_table).raw_set_str(sort_name, sort_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(sort_name, sort_val);
 
     // table.move is special — needs VM access for metamethods (__index/__newindex)
     let move_idx = gc.alloc_native(native_table_move_stub, "move");
     let move_val = TValue::from_native(move_idx);
     let move_name = strings.intern(b"move");
-    gc.get_table_mut(table_table).raw_set_str(move_name, move_val);
+    gc.get_table_mut(table_table)
+        .raw_set_str(move_name, move_val);
 
     let name = strings.intern(b"table");
     gc.get_table_mut(env_idx)
         .raw_set_str(name, TValue::from_table(table_table));
 
-    TableLibIndices { sort_idx, move_idx, insert_idx, remove_idx, concat_idx, unpack_idx }
+    TableLibIndices {
+        sort_idx,
+        move_idx,
+        insert_idx,
+        remove_idx,
+        concat_idx,
+        unpack_idx,
+    }
 }
 
 fn register_fn(
@@ -78,7 +91,12 @@ fn register_fn(
     gc.get_table_mut(table).raw_set_str(key, val);
 }
 
-fn get_table_arg(ctx: &NativeContext, idx: usize, fname: &str) -> Result<GcIdx<Table>, NativeError> {
+#[allow(dead_code)]
+fn get_table_arg(
+    ctx: &NativeContext,
+    idx: usize,
+    fname: &str,
+) -> Result<GcIdx<Table>, NativeError> {
     let val = ctx.args.get(idx).copied().unwrap_or(TValue::nil());
     val.as_table_idx().ok_or_else(|| {
         NativeError::String(format!(
@@ -90,6 +108,7 @@ fn get_table_arg(ctx: &NativeContext, idx: usize, fname: &str) -> Result<GcIdx<T
     })
 }
 
+#[allow(dead_code)]
 fn get_int_arg(ctx: &NativeContext, idx: usize, fname: &str) -> Result<i64, NativeError> {
     let val = ctx.args.get(idx).copied().unwrap_or(TValue::nil());
     val.as_full_integer(ctx.gc).ok_or_else(|| {
@@ -102,6 +121,7 @@ fn get_int_arg(ctx: &NativeContext, idx: usize, fname: &str) -> Result<i64, Nati
     })
 }
 
+#[allow(dead_code)]
 fn type_name(val: TValue) -> &'static str {
     if val.is_nil() {
         "nil"
@@ -121,6 +141,7 @@ fn type_name(val: TValue) -> &'static str {
 }
 
 /// Get table length, respecting __len metamethod. Returns error if __len returns non-integer.
+#[allow(dead_code)]
 fn get_table_len(ctx: &mut NativeContext, table_idx: GcIdx<Table>) -> Result<i64, NativeError> {
     let mt = ctx.gc.get_table(table_idx).metatable;
     if let Some(mt_idx) = mt {
@@ -138,8 +159,8 @@ fn get_table_len(ctx: &mut NativeContext, table_idx: GcIdx<Table>) -> Result<i64
                     strings: ctx.strings,
                     upvalue: TValue::nil(),
                 };
-                let results = native_fn(&mut sub_ctx)
-                    .map_err(|e| NativeError::String(format!("{:?}", e)))?;
+                let results =
+                    native_fn(&mut sub_ctx).map_err(|e| NativeError::String(format!("{:?}", e)))?;
                 let result = results.first().copied().unwrap_or(TValue::nil());
                 // Must be an integer
                 if let Some(i) = result.as_full_integer(ctx.gc) {
@@ -162,6 +183,7 @@ fn get_table_len(ctx: &mut NativeContext, table_idx: GcIdx<Table>) -> Result<i64
 }
 
 /// table.insert(t [,pos], val)
+#[allow(dead_code)]
 fn native_table_insert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = get_table_arg(ctx, 0, "insert")?;
     let len = get_table_len(ctx, table_idx)?;
@@ -169,7 +191,9 @@ fn native_table_insert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     if ctx.args.len() == 2 {
         // table.insert(t, val) — append at end (wrapping for overflow)
         let val = ctx.args[1];
-        ctx.gc.get_table_mut(table_idx).raw_seti(len.wrapping_add(1), val);
+        ctx.gc
+            .get_table_mut(table_idx)
+            .raw_seti(len.wrapping_add(1), val);
     } else if ctx.args.len() == 3 {
         // table.insert(t, pos, val) — insert at pos, shift right
         let pos = get_int_arg(ctx, 1, "insert")?;
@@ -179,7 +203,7 @@ fn native_table_insert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
         // (pos - 1) as u64 < e as u64  (note: strict less-than)
         // where e = #t + 1
         let e = len.wrapping_add(1);
-        if !((pos.wrapping_sub(1) as u64) < (e as u64)) {
+        if (pos.wrapping_sub(1) as u64) >= (e as u64) {
             return Err(NativeError::String(
                 "bad argument #2 to 'insert' (position out of bounds)".to_string(),
             ));
@@ -203,6 +227,7 @@ fn native_table_insert(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 }
 
 /// table.remove(t [,pos])
+#[allow(dead_code)]
 fn native_table_remove(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = get_table_arg(ctx, 0, "remove")?;
     let len = get_table_len(ctx, table_idx)?;
@@ -214,12 +239,10 @@ fn native_table_remove(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     };
 
     // Validate position when pos != size (matches PUC Lua)
-    if pos != len {
-        if !((pos.wrapping_sub(1) as u64) <= (len as u64)) {
-            return Err(NativeError::String(
-                "bad argument #1 to 'remove' (position out of bounds)".to_string(),
-            ));
-        }
+    if pos != len && (pos.wrapping_sub(1) as u64) > (len as u64) {
+        return Err(NativeError::String(
+            "bad argument #1 to 'remove' (position out of bounds)".to_string(),
+        ));
     }
 
     let removed = ctx.gc.get_table(table_idx).raw_geti(pos);
@@ -238,6 +261,7 @@ fn native_table_remove(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 }
 
 /// table.concat(t [,sep [,i [,j]]])
+#[allow(dead_code)]
 fn native_table_concat(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = get_table_arg(ctx, 0, "concat")?;
 
@@ -297,6 +321,7 @@ fn native_table_concat(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     Ok(vec![TValue::from_string_id(sid)])
 }
 
+#[allow(dead_code)]
 fn format_float(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e15 && !f.is_infinite() && !f.is_nan() {
         // Lua prints 1.0 as "1.0", not "1"
@@ -307,6 +332,7 @@ fn format_float(f: f64) -> String {
 }
 
 /// table.move(a1, f, e, t [,a2])
+#[allow(dead_code)]
 fn native_table_move(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let a1_idx = get_table_arg(ctx, 0, "move")?;
     let f = get_int_arg(ctx, 1, "move")?;
@@ -326,17 +352,13 @@ fn native_table_move(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
     // Check for too many elements (e - f would overflow or is too large)
     let n = (e as i128) - (f as i128); // number of elements minus 1
     if n > i64::MAX as i128 {
-        return Err(NativeError::String(
-            "too many elements to move".to_string(),
-        ));
+        return Err(NativeError::String("too many elements to move".to_string()));
     }
 
     // Check destination wrap around: t + n must not overflow i64
     let last_dest = (t as i128) + n;
     if last_dest > i64::MAX as i128 || last_dest < i64::MIN as i128 {
-        return Err(NativeError::String(
-            "destination wrap around".to_string(),
-        ));
+        return Err(NativeError::String("destination wrap around".to_string()));
     }
 
     // Copy elements (with overflow-safe iteration)
@@ -346,7 +368,9 @@ fn native_table_move(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
         loop {
             let v = ctx.gc.get_table(a1_idx).raw_geti(i);
             ctx.gc.get_table_mut(a2_idx).raw_seti(t + (i - f), v);
-            if i == e { break; }
+            if i == e {
+                break;
+            }
             i += 1;
         }
     } else {
@@ -355,7 +379,9 @@ fn native_table_move(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
         loop {
             let v = ctx.gc.get_table(a1_idx).raw_geti(i);
             ctx.gc.get_table_mut(a2_idx).raw_seti(t + (i - f), v);
-            if i == f { break; }
+            if i == f {
+                break;
+            }
             i -= 1;
         }
     }
@@ -377,6 +403,7 @@ fn native_table_pack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
 }
 
 /// table.unpack(t [,i [,j]])
+#[allow(dead_code)]
 fn native_table_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let table_idx = get_table_arg(ctx, 0, "unpack")?;
     let arg1 = ctx.args.get(1).copied().unwrap_or(TValue::nil());
@@ -406,7 +433,9 @@ fn native_table_unpack(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
     let mut k = i;
     while k <= j {
         results.push(ctx.gc.get_table(table_idx).raw_geti(k));
-        if k == j { break; } // avoid overflow when j == i64::MAX
+        if k == j {
+            break;
+        } // avoid overflow when j == i64::MAX
         k += 1;
     }
     Ok(results)

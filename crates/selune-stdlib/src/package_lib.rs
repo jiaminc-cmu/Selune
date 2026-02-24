@@ -109,7 +109,15 @@ fn pre_populate_loaded(
     strings: &mut StringInterner,
 ) {
     let module_names = [
-        "math", "table", "string", "coroutine", "os", "utf8", "debug", "io", "package",
+        "math",
+        "table",
+        "string",
+        "coroutine",
+        "os",
+        "utf8",
+        "debug",
+        "io",
+        "package",
     ];
     for name in &module_names {
         let key = strings.intern(name.as_bytes());

@@ -126,7 +126,11 @@ pub struct Userdata {
 
 impl std::fmt::Debug for Userdata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Userdata {{ data: <dyn Any>, metatable: {:?} }}", self.metatable)
+        write!(
+            f,
+            "Userdata {{ data: <dyn Any>, metatable: {:?} }}",
+            self.metatable
+        )
     }
 }
 
@@ -408,7 +412,11 @@ impl GcHeap {
     ) -> GcIdx<NativeFunction> {
         self.gc_state.total_alloc += 24;
         self.gc_state.debt += 24;
-        let native = NativeFunction { func, name, upvalue: TValue::nil() };
+        let native = NativeFunction {
+            func,
+            name,
+            upvalue: TValue::nil(),
+        };
         if let Some(idx) = self.native_free.pop() {
             self.natives[idx as usize] = Some(native);
             GcIdx(idx, PhantomData)
@@ -427,7 +435,11 @@ impl GcHeap {
     ) -> GcIdx<NativeFunction> {
         self.gc_state.total_alloc += 32;
         self.gc_state.debt += 32;
-        let native = NativeFunction { func, name, upvalue };
+        let native = NativeFunction {
+            func,
+            name,
+            upvalue,
+        };
         if let Some(idx) = self.native_free.pop() {
             self.natives[idx as usize] = Some(native);
             GcIdx(idx, PhantomData)
@@ -470,7 +482,11 @@ impl GcHeap {
             .expect("upval was freed")
     }
 
-    pub fn alloc_userdata(&mut self, data: Box<dyn Any>, metatable: Option<GcIdx<Table>>) -> GcIdx<Userdata> {
+    pub fn alloc_userdata(
+        &mut self,
+        data: Box<dyn Any>,
+        metatable: Option<GcIdx<Table>>,
+    ) -> GcIdx<Userdata> {
         self.gc_state.total_alloc += 64; // rough estimate
         self.gc_state.debt += 64;
         let ud = Userdata {
@@ -544,7 +560,10 @@ impl GcHeap {
                 if idx < self.gc_state.native_marks.len() && !self.gc_state.native_marks[idx] {
                     self.gc_state.native_marks[idx] = true;
                     // Trace the native's upvalue if it references a GC object
-                    let upval = self.natives[idx].as_ref().map(|n| n.upvalue).unwrap_or(TValue::nil());
+                    let upval = self.natives[idx]
+                        .as_ref()
+                        .map(|n| n.upvalue)
+                        .unwrap_or(TValue::nil());
                     if upval.is_gc() {
                         self.gc_mark_value(upval);
                     }
@@ -584,15 +603,15 @@ impl GcHeap {
         while let Some(idx) = self.gc_state.gray_tables.pop() {
             let i = idx as usize;
             if let Some(table) = &self.tables[i] {
-                let weak_k = i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
-                let weak_v = i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
+                let weak_k =
+                    i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
+                let weak_v =
+                    i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
 
                 // Mark metatable (always, even for weak tables)
                 if let Some(mt_idx) = table.metatable {
                     let mt_i = mt_idx.0 as usize;
-                    if mt_i < self.gc_state.table_marks.len()
-                        && !self.gc_state.table_marks[mt_i]
-                    {
+                    if mt_i < self.gc_state.table_marks.len() && !self.gc_state.table_marks[mt_i] {
                         self.gc_state.table_marks[mt_i] = true;
                         self.gc_state.gray_tables.push(mt_idx.0);
                     }
@@ -623,7 +642,9 @@ impl GcHeap {
                         }
                     }
                     for (key, &v) in table.hash_entries() {
-                        if v.is_nil() { continue; }
+                        if v.is_nil() {
+                            continue;
+                        }
                         let key_is_marked = match key {
                             crate::table::TableKey::GcPtr(bits) => {
                                 let kv = TValue::from_raw_bits(*bits);
@@ -669,9 +690,7 @@ impl GcHeap {
                 let upval_indices: Vec<GcIdx<UpVal>> = closure.upvalues.clone();
                 for uv_idx in upval_indices {
                     let uv_i = uv_idx.0 as usize;
-                    if uv_i < self.gc_state.upval_marks.len()
-                        && !self.gc_state.upval_marks[uv_i]
-                    {
+                    if uv_i < self.gc_state.upval_marks.len() && !self.gc_state.upval_marks[uv_i] {
                         self.gc_state.upval_marks[uv_i] = true;
                         self.gc_state.gray_upvals.push(uv_idx.0);
                     }
@@ -687,9 +706,7 @@ impl GcHeap {
                 // Mark metatable
                 if let Some(mt_idx) = ud.metatable {
                     let mt_i = mt_idx.0 as usize;
-                    if mt_i < self.gc_state.table_marks.len()
-                        && !self.gc_state.table_marks[mt_i]
-                    {
+                    if mt_i < self.gc_state.table_marks.len() && !self.gc_state.table_marks[mt_i] {
                         self.gc_state.table_marks[mt_i] = true;
                         self.gc_state.gray_tables.push(mt_idx.0);
                     }
@@ -740,11 +757,19 @@ impl GcHeap {
         };
         match sub {
             GC_SUB_TABLE => idx < self.gc_state.table_marks.len() && self.gc_state.table_marks[idx],
-            GC_SUB_CLOSURE => idx < self.gc_state.closure_marks.len() && self.gc_state.closure_marks[idx],
-            GC_SUB_NATIVE => idx < self.gc_state.native_marks.len() && self.gc_state.native_marks[idx],
+            GC_SUB_CLOSURE => {
+                idx < self.gc_state.closure_marks.len() && self.gc_state.closure_marks[idx]
+            }
+            GC_SUB_NATIVE => {
+                idx < self.gc_state.native_marks.len() && self.gc_state.native_marks[idx]
+            }
             GC_SUB_UPVAL => idx < self.gc_state.upval_marks.len() && self.gc_state.upval_marks[idx],
-            GC_SUB_BOXED_INT => idx < self.gc_state.boxed_int_marks.len() && self.gc_state.boxed_int_marks[idx],
-            GC_SUB_USERDATA => idx < self.gc_state.userdata_marks.len() && self.gc_state.userdata_marks[idx],
+            GC_SUB_BOXED_INT => {
+                idx < self.gc_state.boxed_int_marks.len() && self.gc_state.boxed_int_marks[idx]
+            }
+            GC_SUB_USERDATA => {
+                idx < self.gc_state.userdata_marks.len() && self.gc_state.userdata_marks[idx]
+            }
             GC_SUB_STRING => true, // strings are never collected by GC
             _ => true,
         }
@@ -765,12 +790,24 @@ impl GcHeap {
             None => return false,
         };
         match sub {
-            GC_SUB_TABLE => idx < self.gc_state.table_marks.len() && !self.gc_state.table_marks[idx],
-            GC_SUB_CLOSURE => idx < self.gc_state.closure_marks.len() && !self.gc_state.closure_marks[idx],
-            GC_SUB_NATIVE => idx < self.gc_state.native_marks.len() && !self.gc_state.native_marks[idx],
-            GC_SUB_UPVAL => idx < self.gc_state.upval_marks.len() && !self.gc_state.upval_marks[idx],
-            GC_SUB_BOXED_INT => idx < self.gc_state.boxed_int_marks.len() && !self.gc_state.boxed_int_marks[idx],
-            GC_SUB_USERDATA => idx < self.gc_state.userdata_marks.len() && !self.gc_state.userdata_marks[idx],
+            GC_SUB_TABLE => {
+                idx < self.gc_state.table_marks.len() && !self.gc_state.table_marks[idx]
+            }
+            GC_SUB_CLOSURE => {
+                idx < self.gc_state.closure_marks.len() && !self.gc_state.closure_marks[idx]
+            }
+            GC_SUB_NATIVE => {
+                idx < self.gc_state.native_marks.len() && !self.gc_state.native_marks[idx]
+            }
+            GC_SUB_UPVAL => {
+                idx < self.gc_state.upval_marks.len() && !self.gc_state.upval_marks[idx]
+            }
+            GC_SUB_BOXED_INT => {
+                idx < self.gc_state.boxed_int_marks.len() && !self.gc_state.boxed_int_marks[idx]
+            }
+            GC_SUB_USERDATA => {
+                idx < self.gc_state.userdata_marks.len() && !self.gc_state.userdata_marks[idx]
+            }
             GC_SUB_STRING => false, // strings are never dead
             _ => false,
         }
@@ -781,16 +818,26 @@ impl GcHeap {
     pub fn gc_propagate_ephemerons(&mut self) -> bool {
         let mut changed = false;
         for i in 0..self.tables.len() {
-            if self.tables[i].is_none() { continue; }
-            if i >= self.gc_state.table_marks.len() || !self.gc_state.table_marks[i] { continue; }
-            let weak_k = i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
-            let weak_v = i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
-            if !weak_k || weak_v { continue; } // only ephemerons (weak keys, strong values)
+            if self.tables[i].is_none() {
+                continue;
+            }
+            if i >= self.gc_state.table_marks.len() || !self.gc_state.table_marks[i] {
+                continue;
+            }
+            let weak_k =
+                i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
+            let weak_v =
+                i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
+            if !weak_k || weak_v {
+                continue;
+            } // only ephemerons (weak keys, strong values)
 
             let table = self.tables[i].as_ref().unwrap();
             let mut children = Vec::new();
             for (key, &v) in table.hash_entries() {
-                if v.is_nil() { continue; }
+                if v.is_nil() {
+                    continue;
+                }
                 let key_is_marked = match key {
                     crate::table::TableKey::GcPtr(bits) => {
                         let kv = TValue::from_raw_bits(*bits);
@@ -813,11 +860,19 @@ impl GcHeap {
     /// Clear dead entries from weak tables after propagation is complete.
     pub fn gc_clear_weak_tables(&mut self) {
         for i in 0..self.tables.len() {
-            if self.tables[i].is_none() { continue; }
-            if i >= self.gc_state.table_marks.len() || !self.gc_state.table_marks[i] { continue; }
-            let weak_k = i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
-            let weak_v = i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
-            if !weak_k && !weak_v { continue; }
+            if self.tables[i].is_none() {
+                continue;
+            }
+            if i >= self.gc_state.table_marks.len() || !self.gc_state.table_marks[i] {
+                continue;
+            }
+            let weak_k =
+                i < self.gc_state.table_weak_keys.len() && self.gc_state.table_weak_keys[i];
+            let weak_v =
+                i < self.gc_state.table_weak_values.len() && self.gc_state.table_weak_values[i];
+            if !weak_k && !weak_v {
+                continue;
+            }
 
             // Need to collect dead status before mutating
             let table = self.tables[i].as_ref().unwrap();
@@ -833,12 +888,13 @@ impl GcHeap {
             }
 
             for (key, &v) in table.hash_entries() {
-                let key_dead = weak_k && match key {
-                    crate::table::TableKey::GcPtr(bits) => {
-                        self.is_collectable_dead(TValue::from_raw_bits(*bits))
-                    }
-                    _ => false,
-                };
+                let key_dead = weak_k
+                    && match key {
+                        crate::table::TableKey::GcPtr(bits) => {
+                            self.is_collectable_dead(TValue::from_raw_bits(*bits))
+                        }
+                        _ => false,
+                    };
                 let val_dead = weak_v && !v.is_nil() && self.is_collectable_dead(v);
                 if key_dead || val_dead {
                     dead_hash_keys.push(*key);
@@ -866,69 +922,73 @@ impl GcHeap {
 
         // Sweep tables
         for i in 0..self.tables.len() {
-            if self.tables[i].is_some() {
-                if i < self.gc_state.table_marks.len() && !self.gc_state.table_marks[i] {
-                    self.tables[i] = None;
-                    self.table_free.push(i as u32);
-                    freed += 64; // approximate
-                }
+            if self.tables[i].is_some()
+                && i < self.gc_state.table_marks.len()
+                && !self.gc_state.table_marks[i]
+            {
+                self.tables[i] = None;
+                self.table_free.push(i as u32);
+                freed += 64; // approximate
             }
         }
 
         // Sweep closures
         for i in 0..self.closures.len() {
-            if self.closures[i].is_some() {
-                if i < self.gc_state.closure_marks.len() && !self.gc_state.closure_marks[i] {
-                    self.closures[i] = None;
-                    self.closure_free.push(i as u32);
-                    freed += 32;
-                }
+            if self.closures[i].is_some()
+                && i < self.gc_state.closure_marks.len()
+                && !self.gc_state.closure_marks[i]
+            {
+                self.closures[i] = None;
+                self.closure_free.push(i as u32);
+                freed += 32;
             }
         }
 
         // Sweep upvalues
         for i in 0..self.upvals.len() {
-            if self.upvals[i].is_some() {
-                if i < self.gc_state.upval_marks.len() && !self.gc_state.upval_marks[i] {
-                    self.upvals[i] = None;
-                    self.upval_free.push(i as u32);
-                    freed += 16;
-                }
+            if self.upvals[i].is_some()
+                && i < self.gc_state.upval_marks.len()
+                && !self.gc_state.upval_marks[i]
+            {
+                self.upvals[i] = None;
+                self.upval_free.push(i as u32);
+                freed += 16;
             }
         }
 
         // Sweep natives
         for i in 0..self.natives.len() {
-            if self.natives[i].is_some() {
-                if i < self.gc_state.native_marks.len() && !self.gc_state.native_marks[i] {
-                    self.natives[i] = None;
-                    self.native_free.push(i as u32);
-                    freed += 24;
-                }
+            if self.natives[i].is_some()
+                && i < self.gc_state.native_marks.len()
+                && !self.gc_state.native_marks[i]
+            {
+                self.natives[i] = None;
+                self.native_free.push(i as u32);
+                freed += 24;
             }
         }
 
         // Sweep userdata
         for i in 0..self.userdata.len() {
-            if self.userdata[i].is_some() {
-                if i < self.gc_state.userdata_marks.len() && !self.gc_state.userdata_marks[i] {
-                    self.userdata[i] = None;
-                    self.userdata_free.push(i as u32);
-                    freed += 64;
-                }
+            if self.userdata[i].is_some()
+                && i < self.gc_state.userdata_marks.len()
+                && !self.gc_state.userdata_marks[i]
+            {
+                self.userdata[i] = None;
+                self.userdata_free.push(i as u32);
+                freed += 64;
             }
         }
 
         // Sweep boxed ints
         for i in 0..self.boxed_ints.len() {
-            if self.boxed_ints[i].is_some() {
-                if i < self.gc_state.boxed_int_marks.len()
-                    && !self.gc_state.boxed_int_marks[i]
-                {
-                    self.boxed_ints[i] = None;
-                    self.boxed_int_free.push(i as u32);
-                    freed += 16;
-                }
+            if self.boxed_ints[i].is_some()
+                && i < self.gc_state.boxed_int_marks.len()
+                && !self.gc_state.boxed_int_marks[i]
+            {
+                self.boxed_ints[i] = None;
+                self.boxed_int_free.push(i as u32);
+                freed += 16;
             }
         }
 
@@ -940,9 +1000,8 @@ impl GcHeap {
         self.gc_state.estimate = self.gc_state.total_alloc;
         self.gc_state.debt = 0;
         // Set next threshold based on pause
-        self.gc_state.threshold = (self.gc_state.estimate as u64
-            * self.gc_state.pause as u64
-            / 100) as usize;
+        self.gc_state.threshold =
+            (self.gc_state.estimate as u64 * self.gc_state.pause as u64 / 100) as usize;
         if self.gc_state.threshold < 4096 {
             self.gc_state.threshold = 4096;
         }

@@ -48,6 +48,11 @@ pub fn lua_eq(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> (b
         return (false, true);
     }
 
+    // Both userdata (different identity) -> might need __eq metamethod
+    if a.as_userdata_idx().is_some() && b.as_userdata_idx().is_some() {
+        return (false, true);
+    }
+
     (false, false)
 }
 
@@ -113,9 +118,9 @@ pub fn lua_le(a: TValue, b: TValue, gc: &GcHeap, strings: &StringInterner) -> Co
 // and using floor/ceil to handle the fractional part.
 
 /// i64::MIN as f64 (exact: -2^63 is representable)
-const IMIN_F: f64 = i64::MIN as f64;   // -9223372036854775808.0
+const IMIN_F: f64 = i64::MIN as f64; // -9223372036854775808.0
 /// (i64::MAX + 1) as f64 (exact: 2^63 is representable)
-const IMAX_P1_F: f64 = (i64::MAX as f64) + 1.0;  // 9223372036854775808.0
+const IMAX_P1_F: f64 = (i64::MAX as f64) + 1.0; // 9223372036854775808.0
 
 /// Precision-safe: integer == float
 fn eq_int_float(i: i64, f: f64) -> bool {
@@ -128,7 +133,7 @@ fn eq_int_float(i: i64, f: f64) -> bool {
         return false;
     }
     // If f is outside i64 range, can't be equal
-    if f < IMIN_F || f >= IMAX_P1_F {
+    if !(IMIN_F..IMAX_P1_F).contains(&f) {
         return false;
     }
     // f is integral and in range, safe to cast to i64

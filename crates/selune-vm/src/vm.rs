@@ -4,8 +4,8 @@ use crate::callinfo::CallInfo;
 use crate::dispatch;
 use crate::error::LuaError;
 use crate::metamethod::MetamethodNames;
-use selune_compiler::proto::Proto;
 use selune_compiler::opcode::OpCode;
+use selune_compiler::proto::Proto;
 use selune_core::gc::{
     GcHeap, GcIdx, NativeContext, NativeError, NativeFunction, UpVal, UpValLocation,
 };
@@ -205,17 +205,15 @@ pub struct Vm {
 /// - otherwise → `[string "first_line..."]` (string chunk)
 pub fn format_source_name(name: &str) -> String {
     const LUA_IDSIZE: usize = 60;
-    if name.starts_with('=') {
+    if let Some(s) = name.strip_prefix('=') {
         // Exact source: use as-is minus the '=', truncated
-        let s = &name[1..];
         if s.len() >= LUA_IDSIZE {
             s[..LUA_IDSIZE - 1].to_string()
         } else {
             s.to_string()
         }
-    } else if name.starts_with('@') {
+    } else if let Some(s) = name.strip_prefix('@') {
         // File source
-        let s = &name[1..];
         if s.len() >= LUA_IDSIZE {
             // Truncate from the end, add "..."
             format!("...{}", &s[s.len() - (LUA_IDSIZE - 4)..])
@@ -390,18 +388,23 @@ impl Vm {
 
         // Create main thread handle (stable identity for coroutine.running() in main thread)
         let main_handle = self.gc.alloc_table(4, 0);
-        self.gc.get_table_mut(main_handle).raw_seti(1, TValue::from_integer(-2)); // special marker for main thread
+        self.gc
+            .get_table_mut(main_handle)
+            .raw_seti(1, TValue::from_integer(-2)); // special marker for main thread
         let running_sid = self.strings.intern(b"running");
-        self.gc.get_table_mut(main_handle).raw_seti(3, TValue::from_string_id(running_sid));
+        self.gc
+            .get_table_mut(main_handle)
+            .raw_seti(3, TValue::from_string_id(running_sid));
         self.gc.get_table_mut(main_handle).metatable = self.gc.thread_metatable;
         self.main_thread_handle = Some(main_handle);
 
         // Create string metatable with __index = string library table
         let string_mt = self.gc.alloc_table(0, 4);
         let index_name = self.strings.intern(b"__index");
-        self.gc
-            .get_table_mut(string_mt)
-            .raw_set_str(index_name, TValue::from_table(stdlib_indices.string_table_idx));
+        self.gc.get_table_mut(string_mt).raw_set_str(
+            index_name,
+            TValue::from_table(stdlib_indices.string_table_idx),
+        );
         self.gc.string_metatable = Some(string_mt);
 
         // Create a top-level closure with _ENV as upvalue[0]
@@ -444,7 +447,8 @@ impl Vm {
 
         // Take ownership of strings for compilation, then put them back
         let strings = std::mem::take(&mut self.strings);
-        let (result, strings) = selune_compiler::compiler::compile_with_strings(compile_source, name, strings);
+        let (result, strings) =
+            selune_compiler::compiler::compile_with_strings(compile_source, name, strings);
         self.strings = strings;
         let proto = result.map_err(|e| {
             // Format: "source:line: message" matching PUC Lua error format
@@ -474,8 +478,8 @@ impl Vm {
         name: &str,
         env: Option<TValue>,
     ) -> Result<TValue, String> {
-        let proto = crate::binary_chunk::undump(data, name, &mut self.strings)
-            .map_err(|e| e.message)?;
+        let proto =
+            crate::binary_chunk::undump(data, name, &mut self.strings).map_err(|e| e.message)?;
 
         // Store the proto
         let proto_idx = self.protos.len();
@@ -631,7 +635,9 @@ impl Vm {
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
 
         // ipairs — stores ipairs_iter singleton as upvalue so it can return the same function
-        let idx = self.gc.alloc_native_with_upvalue(native_ipairs, "ipairs", self.ipairs_iter_val);
+        let idx = self
+            .gc
+            .alloc_native_with_upvalue(native_ipairs, "ipairs", self.ipairs_iter_val);
         let val = TValue::from_native(idx);
         let name = self.strings.intern(b"ipairs");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
@@ -651,7 +657,9 @@ impl Vm {
         self.xpcall_idx = Some(idx);
 
         // collectgarbage - stub; actual dispatch via call_function for full VM access
-        let idx = self.gc.alloc_native(native_collectgarbage_stub, "collectgarbage");
+        let idx = self
+            .gc
+            .alloc_native(native_collectgarbage_stub, "collectgarbage");
         let val = TValue::from_native(idx);
         let name = self.strings.intern(b"collectgarbage");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
@@ -737,7 +745,11 @@ impl Vm {
         }
         // Also check saved coroutine states (for suspended coroutines)
         if thread_id < self.coroutines.len() {
-            return self.coroutines[thread_id].stack.get(stack_idx).copied().unwrap_or(TValue::nil());
+            return self.coroutines[thread_id]
+                .stack
+                .get(stack_idx)
+                .copied()
+                .unwrap_or(TValue::nil());
         }
         TValue::nil()
     }
@@ -754,10 +766,8 @@ impl Vm {
             }
         }
         // Also check saved coroutine states
-        if thread_id < self.coroutines.len() {
-            if stack_idx < self.coroutines[thread_id].stack.len() {
-                self.coroutines[thread_id].stack[stack_idx] = val;
-            }
+        if thread_id < self.coroutines.len() && stack_idx < self.coroutines[thread_id].stack.len() {
+            self.coroutines[thread_id].stack[stack_idx] = val;
         }
     }
 
@@ -809,7 +819,8 @@ impl Vm {
         for &(_stack_idx, uv_idx) in &self.open_upvals {
             let uv = self.gc.get_upval(uv_idx);
             if let UpValLocation::Open(si) = uv.location {
-                self.gc.get_upval_mut(uv_idx).location = UpValLocation::OpenInThread(si, save_thread_id);
+                self.gc.get_upval_mut(uv_idx).location =
+                    UpValLocation::OpenInThread(si, save_thread_id);
             }
         }
     }
@@ -938,7 +949,9 @@ impl Vm {
     fn classify_weak_tables(&mut self) {
         let mode_sid = self.strings.intern(b"__mode");
         for i in 0..self.gc.tables.len() {
-            if self.gc.tables[i].is_none() { continue; }
+            if self.gc.tables[i].is_none() {
+                continue;
+            }
             let mt_idx = match self.gc.tables[i].as_ref().unwrap().metatable {
                 Some(idx) => idx,
                 None => continue,
@@ -950,8 +963,12 @@ impl Vm {
                 let mut weak_k = false;
                 let mut weak_v = false;
                 for &b in bytes {
-                    if b == b'k' { weak_k = true; }
-                    if b == b'v' { weak_v = true; }
+                    if b == b'k' {
+                        weak_k = true;
+                    }
+                    if b == b'v' {
+                        weak_v = true;
+                    }
                 }
                 if i < self.gc.gc_state.table_weak_keys.len() {
                     self.gc.gc_state.table_weak_keys[i] = weak_k;
@@ -969,16 +986,24 @@ impl Vm {
 
         // Check unmarked tables with __gc in their metatable
         for i in 0..self.gc.tables.len() {
-            if self.gc.tables[i].is_none() { continue; }
-            if i < self.gc.gc_state.table_marks.len() && self.gc.gc_state.table_marks[i] { continue; } // already marked
-            if i < self.gc.gc_state.table_finalized.len() && self.gc.gc_state.table_finalized[i] { continue; } // already finalized
+            if self.gc.tables[i].is_none() {
+                continue;
+            }
+            if i < self.gc.gc_state.table_marks.len() && self.gc.gc_state.table_marks[i] {
+                continue;
+            } // already marked
+            if i < self.gc.gc_state.table_finalized.len() && self.gc.gc_state.table_finalized[i] {
+                continue;
+            } // already finalized
 
             let mt_idx = match self.gc.tables[i].as_ref().unwrap().metatable {
                 Some(idx) => idx,
                 None => continue,
             };
             let gc_val = self.gc.get_table(mt_idx).raw_get_str(gc_sid);
-            if gc_val.is_nil() { continue; }
+            if gc_val.is_nil() {
+                continue;
+            }
 
             // Resurrect: mark the table alive and add to finalization queue
             if i < self.gc.gc_state.table_marks.len() {
@@ -991,23 +1016,37 @@ impl Vm {
                 self.gc.gc_state.table_marks[mt_i] = true;
                 self.gc.gc_state.gray_tables.push(mt_idx.0);
             }
-            self.gc.gc_state.finalization_queue.push(TValue::from_table(
-                selune_core::gc::GcIdx(i as u32, std::marker::PhantomData),
-            ));
+            self.gc
+                .gc_state
+                .finalization_queue
+                .push(TValue::from_table(selune_core::gc::GcIdx(
+                    i as u32,
+                    std::marker::PhantomData,
+                )));
         }
 
         // Check unmarked userdata with __gc in their metatable
         for i in 0..self.gc.userdata.len() {
-            if self.gc.userdata[i].is_none() { continue; }
-            if i < self.gc.gc_state.userdata_marks.len() && self.gc.gc_state.userdata_marks[i] { continue; }
-            if i < self.gc.gc_state.userdata_finalized.len() && self.gc.gc_state.userdata_finalized[i] { continue; }
+            if self.gc.userdata[i].is_none() {
+                continue;
+            }
+            if i < self.gc.gc_state.userdata_marks.len() && self.gc.gc_state.userdata_marks[i] {
+                continue;
+            }
+            if i < self.gc.gc_state.userdata_finalized.len()
+                && self.gc.gc_state.userdata_finalized[i]
+            {
+                continue;
+            }
 
             let mt_idx = match self.gc.userdata[i].as_ref().unwrap().metatable {
                 Some(idx) => idx,
                 None => continue,
             };
             let gc_val = self.gc.get_table(mt_idx).raw_get_str(gc_sid);
-            if gc_val.is_nil() { continue; }
+            if gc_val.is_nil() {
+                continue;
+            }
 
             // Resurrect
             if i < self.gc.gc_state.userdata_marks.len() {
@@ -1019,9 +1058,13 @@ impl Vm {
                 self.gc.gc_state.table_marks[mt_i] = true;
                 self.gc.gc_state.gray_tables.push(mt_idx.0);
             }
-            self.gc.gc_state.finalization_queue.push(TValue::from_userdata(
-                selune_core::gc::GcIdx(i as u32, std::marker::PhantomData),
-            ));
+            self.gc
+                .gc_state
+                .finalization_queue
+                .push(TValue::from_userdata(selune_core::gc::GcIdx(
+                    i as u32,
+                    std::marker::PhantomData,
+                )));
         }
     }
 
@@ -1079,7 +1122,9 @@ impl Vm {
         for lv in &proto.local_vars {
             if pc >= lv.start_pc && pc < lv.end_pc {
                 let r = lv.reg as usize + 1;
-                if r > max_live { max_live = r; }
+                if r > max_live {
+                    max_live = r;
+                }
             }
         }
         max_live
@@ -1128,7 +1173,9 @@ impl Vm {
                 Some(cl) => cl.proto_idx,
                 None => continue,
             };
-            if proto_idx >= self.protos.len() { continue; }
+            if proto_idx >= self.protos.len() {
+                continue;
+            }
             let proto = &self.protos[proto_idx];
             let pc = if ci.pc > 0 { ci.pc as u32 - 1 } else { 0 };
 
@@ -1206,10 +1253,7 @@ impl Vm {
 
         // Mark open upvalues (running thread)
         for &(_stack_idx, uv_idx) in &self.open_upvals {
-            let val = TValue::from_gc_sub(
-                selune_core::gc::GC_SUB_UPVAL,
-                uv_idx.0,
-            );
+            let val = TValue::from_gc_sub(selune_core::gc::GC_SUB_UPVAL, uv_idx.0);
             self.gc.gc_mark_value(val);
         }
 
@@ -1225,10 +1269,7 @@ impl Vm {
                 }
             }
             for &(_stack_idx, uv_idx) in &coro.open_upvals {
-                let v = TValue::from_gc_sub(
-                    selune_core::gc::GC_SUB_UPVAL,
-                    uv_idx.0,
-                );
+                let v = TValue::from_gc_sub(selune_core::gc::GC_SUB_UPVAL, uv_idx.0);
                 self.gc.gc_mark_value(v);
             }
         }
@@ -1245,10 +1286,7 @@ impl Vm {
                 }
             }
             for &(_stack_idx, uv_idx) in &caller.open_upvals {
-                let v = TValue::from_gc_sub(
-                    selune_core::gc::GC_SUB_UPVAL,
-                    uv_idx.0,
-                );
+                let v = TValue::from_gc_sub(selune_core::gc::GC_SUB_UPVAL, uv_idx.0);
                 self.gc.gc_mark_value(v);
             }
         }
@@ -1325,6 +1363,79 @@ impl Vm {
         }
         if let Some(idx) = self.error_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.collectgarbage_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_move_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_getupvalue_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_setupvalue_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_getinfo_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_traceback_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_running_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.string_format_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.string_dump_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.pairs_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.ipairs_iter_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_insert_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_remove_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_concat_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.table_unpack_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_isyieldable_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.coro_close_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_sethook_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_gethook_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_getlocal_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_setlocal_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.debug_getregistry_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        // Mark stored TValues for pairs/ipairs singletons
+        if !self.next_val.is_nil() {
+            self.gc.gc_mark_value(self.next_val);
+        }
+        if !self.ipairs_iter_val.is_nil() {
+            self.gc.gc_mark_value(self.ipairs_iter_val);
         }
         // Mark _ENV table
         if let Some(idx) = self.env_idx {
@@ -1437,14 +1548,12 @@ fn native_tonumber(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     // tonumber(s, base) — base conversion
     if let Some(base_val) = base_arg {
         if !base_val.is_nil() {
-            let base = base_val
-                .as_full_integer(ctx.gc)
-                .ok_or_else(|| {
-                    NativeError::String(
-                        "bad argument #2 to 'tonumber' (number has no integer representation)"
-                            .to_string(),
-                    )
-                })?;
+            let base = base_val.as_full_integer(ctx.gc).ok_or_else(|| {
+                NativeError::String(
+                    "bad argument #2 to 'tonumber' (number has no integer representation)"
+                        .to_string(),
+                )
+            })?;
             if !(2..=36).contains(&base) {
                 return Err(NativeError::String(
                     "bad argument #2 to 'tonumber' (invalid base)".to_string(),
@@ -1637,7 +1746,10 @@ fn native_setmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 fn native_getmetatable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let val = ctx.args.first().copied().unwrap_or(TValue::nil());
     // Helper: given a metatable idx, check __metatable and return appropriately
-    let check_mt = |mt_idx: GcIdx<selune_core::table::Table>, gc: &GcHeap, strings: &mut StringInterner| -> Vec<TValue> {
+    let check_mt = |mt_idx: GcIdx<selune_core::table::Table>,
+                    gc: &GcHeap,
+                    strings: &mut StringInterner|
+     -> Vec<TValue> {
         let mm_name = strings.intern(b"__metatable");
         let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
         if !mm_val.is_nil() {
