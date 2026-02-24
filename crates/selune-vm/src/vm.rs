@@ -1110,7 +1110,19 @@ impl Vm {
             // Get closure and proto for Lua frames
             let cl_idx = match ci.closure_idx {
                 Some(idx) => idx,
-                None => continue, // native frame — func_stack_idx already marked
+                None => {
+                    // Native frame: still mark call setup area to next frame
+                    // (e.g., return hook results stored between this frame and the next)
+                    if !is_topmost {
+                        let next_ci = &self.call_stack[frame_idx + 1];
+                        let mark_start = ci.func_stack_idx + 1;
+                        let mark_end = next_ci.base.max(next_ci.func_stack_idx + 1);
+                        for abs in mark_start..mark_end.min(self.stack.len()) {
+                            self.gc.gc_mark_value(self.stack[abs]);
+                        }
+                    }
+                    continue;
+                }
             };
             let proto_idx = match self.gc.closures[cl_idx.0 as usize].as_ref() {
                 Some(cl) => cl.proto_idx,
