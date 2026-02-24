@@ -2688,18 +2688,46 @@ fn close_tbc_variables(
 }
 
 /// Close TBC variables during error unwinding.
-/// Iterates frames from the top of call_stack down to target_depth,
-/// closing TBC variables in each frame. Does NOT pop frames.
-/// Propagates the evolving error through all frames.
+/// Collects all TBC slots from frames [target_depth..len), pops those frames,
+/// then closes TBC variables in reverse order (highest stack slot first).
+/// This matches PUC Lua behavior: callee frames are removed from the call stack
+/// before __close handlers run, so debug.getinfo sees the correct caller (e.g. pcall).
 fn unwind_tbc(vm: &mut Vm, target_depth: usize, error_val: Option<TValue>) -> Option<TValue> {
     let len = vm.call_stack.len();
+    // Collect all TBC slots from frames being unwound
+    let mut all_tbc_slots: Vec<usize> = Vec::new();
+    for ci_idx in target_depth..len {
+        all_tbc_slots.extend(vm.call_stack[ci_idx].tbc_slots.drain(..));
+    }
+    // Sort in descending order (close highest stack slots first)
+    all_tbc_slots.sort_unstable_by(|a, b| b.cmp(a));
+    // Pop the unwinding frames BEFORE calling __close handlers
+    vm.call_stack.truncate(target_depth);
+    // Now close TBC variables with the call stack already unwound
     let mut current_err = error_val;
-    for ci_idx in (target_depth..len).rev() {
-        let base = vm.call_stack[ci_idx].base;
-        match close_tbc_variables(vm, ci_idx, base, current_err) {
-            Ok(()) => { /* current_err was consumed or there was none */ current_err = None; }
-            Err(LuaError::LuaValue(v)) => { current_err = Some(v); }
-            Err(e) => { current_err = Some(e.to_tvalue(&mut vm.strings)); }
+    for slot in all_tbc_slots {
+        let val = vm.stack[slot];
+        if val.is_falsy() {
+            continue;
+        }
+        let mm_name = vm.mm_names.as_ref().unwrap().close;
+        if let Some(mm) = metamethod::get_metamethod(val, mm_name, &vm.gc) {
+            let err_arg = current_err.unwrap_or(TValue::nil());
+            vm.in_tbc_close += 1;
+            let result = call_function(vm, mm, &[val, err_arg]);
+            vm.in_tbc_close -= 1;
+            match result {
+                Ok(_) => { /* __close succeeded; current_err preserved */ }
+                Err(LuaError::Yield(_vals)) => {
+                    // Yield during error unwind TBC — unusual but possible
+                    // For now, treat as error
+                    current_err = Some(TValue::nil());
+                }
+                Err(e) => {
+                    // Error in __close replaces the current error
+                    current_err = Some(e.to_tvalue(&mut vm.strings));
+                }
+            }
         }
     }
     current_err
@@ -5222,6 +5250,10 @@ fn do_debug_getinfo(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErro
                     let frame = &vm.call_stack[frame_idx];
                     let tc_key = vm.strings.intern(b"istailcall");
                     vm.gc.get_table_mut(tbl).raw_set_str(tc_key, TValue::from_bool(frame.is_tail_call));
+                }
+                // 'n' — function name from caller's context (works for C functions too)
+                if what_check.contains('n') {
+                    fill_func_name(vm, tbl, frame_idx);
                 }
                 return Ok(vec![TValue::from_table(tbl)]);
             }

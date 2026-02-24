@@ -5,8 +5,8 @@ A modern Lua 5.4 JIT compiler written in Rust.
 ## Overview
 
 Selune is a high-performance, fully-compatible implementation of the Lua 5.4
-programming language. It passes **27 out of 28** official PUC-Rio Lua 5.4.7 test
-suite files (96.4%), making it the most conformant pure-Rust Lua 5.4 implementation
+programming language. It passes **all 28** applicable official PUC-Rio Lua 5.4.7 test
+suite files (100%), making it the most conformant pure-Rust Lua 5.4 implementation
 available. Built from scratch with no C dependencies.
 
 ## Official Test Suite Compliance
@@ -132,7 +132,7 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 |-------|-------|--------|
 | 1 | Lexer, compiler, bytecode, core types | Done |
 | 2 | Stack-based VM, metamethods, error handling, coroutines, GC, stdlib | Done |
-| 3 | Full Lua 5.4 compliance (27/28 official tests) | Done |
+| 3 | Full Lua 5.4 compliance (28/28 official tests) | Done |
 | 4 | JIT compilation (Cranelift backend) | Planned |
 | 5 | C API / FFI compatibility | Planned |
 
@@ -146,7 +146,7 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 - **48** core type tests (TValue roundtrips, string interning, property tests)
 - **36** standard library tests
 - **2** integration tests (disassembler, debug)
-- **27/28** official Lua 5.4.7 test suite files passing
+- **28/28** official Lua 5.4.7 test suite files passing (100%)
 
 ## License
 
