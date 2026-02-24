@@ -34,6 +34,8 @@ pub struct LuaThread {
     pub hooks_active: bool,
     /// Per-coroutine hook last line.
     pub hook_last_line: i32,
+    /// Per-coroutine hook old PC.
+    pub hook_old_pc: usize,
 }
 
 /// Coroutine lifecycle states.
@@ -117,6 +119,10 @@ pub struct Vm {
     pub env_idx: Option<GcIdx<selune_core::table::Table>>,
     /// Whether warn() output is enabled (controlled by @on/@off).
     pub warn_enabled: bool,
+    /// Whether warn() stores messages in _WARN global (controlled by @store/@normal).
+    pub warn_store: bool,
+    /// Native index for warn (needs VM access for @on/@off/@store/_WARN).
+    pub warn_idx: Option<GcIdx<NativeFunction>>,
     /// Native index for require (needs full VM access for loadfile + call_function).
     pub require_idx: Option<GcIdx<NativeFunction>>,
     /// The package.loaded table, for require() to check/store cached modules.
@@ -191,6 +197,8 @@ pub struct Vm {
     pub hooks_active: bool,
     /// Last line reported by a line hook (to avoid duplicate events).
     pub hook_last_line: i32,
+    /// Previous PC for changedline detection (PUC's L->oldpc equivalent).
+    pub hook_old_pc: usize,
     /// Flag to prevent recursive hooks.
     pub in_hook: bool,
     /// Flag to mark the next pushed call frame as a hook call.
@@ -274,6 +282,8 @@ impl Vm {
             loadfile_idx: None,
             env_idx: None,
             warn_enabled: false,
+            warn_store: false,
+            warn_idx: None,
             require_idx: None,
             package_loaded_idx: None,
             package_preload_idx: None,
@@ -311,6 +321,7 @@ impl Vm {
             hook_counter: 0,
             hooks_active: false,
             hook_last_line: -1,
+            hook_old_pc: 0,
             in_hook: false,
             pending_hook_call: false,
             registry_idx: None,
@@ -691,6 +702,7 @@ impl Vm {
         let val = TValue::from_native(idx);
         let name = self.strings.intern(b"warn");
         self.gc.get_table_mut(env_idx).raw_set_str(name, val);
+        self.warn_idx = Some(idx);
 
         // _VERSION
         let version_sid = self.strings.intern(b"Lua 5.4");
@@ -803,6 +815,7 @@ impl Vm {
             hook_counter: 0,
             hooks_active: false,
             hook_last_line: -1,
+            hook_old_pc: 0,
         };
         // Place the function at R[0]
         thread.stack[0] = func;
@@ -856,6 +869,7 @@ impl Vm {
             hook_counter: self.hook_counter,
             hooks_active: self.hooks_active,
             hook_last_line: self.hook_last_line,
+            hook_old_pc: self.hook_old_pc,
         }
     }
 
@@ -871,6 +885,7 @@ impl Vm {
         self.hook_counter = thread.hook_counter;
         self.hooks_active = thread.hooks_active;
         self.hook_last_line = thread.hook_last_line;
+        self.hook_old_pc = thread.hook_old_pc;
     }
 
     /// Save the current running state back into the coroutine slot.
@@ -885,6 +900,7 @@ impl Vm {
         self.coroutines[coro_id].hook_counter = self.hook_counter;
         self.coroutines[coro_id].hooks_active = self.hooks_active;
         self.coroutines[coro_id].hook_last_line = self.hook_last_line;
+        self.coroutines[coro_id].hook_old_pc = self.hook_old_pc;
     }
 
     // ---- Garbage Collection ----
@@ -1428,6 +1444,9 @@ impl Vm {
             self.gc.gc_mark_value(TValue::from_native(idx));
         }
         if let Some(idx) = self.debug_getregistry_idx {
+            self.gc.gc_mark_value(TValue::from_native(idx));
+        }
+        if let Some(idx) = self.warn_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
         }
         // Mark stored TValues for pairs/ipairs singletons

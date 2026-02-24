@@ -86,6 +86,7 @@ impl MetamethodNames {
 }
 
 /// Look up a metamethod on a TValue. Returns Some(method_value) if found.
+#[inline]
 pub fn get_metamethod(val: TValue, mm_name: StringId, gc: &GcHeap) -> Option<TValue> {
     // Check tables
     if let Some(table_idx) = val.as_table_idx() {

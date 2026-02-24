@@ -26,3 +26,8 @@ selune-ffi = { path = "crates/selune-ffi" }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 indexmap = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

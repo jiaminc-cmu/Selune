@@ -28,6 +28,8 @@ pub struct Lexer<'a> {
     pub strings: StringInterner,
     /// Original text of the current token (used for error messages, e.g., "near '1.000'")
     pub token_text: String,
+    /// Line number of the last consumed token (like PUC's ls->lastline).
+    pub lastline: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -41,6 +43,7 @@ impl<'a> Lexer<'a> {
             current: None,
             strings: StringInterner::new(),
             token_text: String::new(),
+            lastline: 1,
         };
         // Prime the first token
         lexer.current = Some(lexer.scan_token());
@@ -57,6 +60,7 @@ impl<'a> Lexer<'a> {
             current: None,
             strings,
             token_text: String::new(),
+            lastline: 1,
         };
         // Prime the first token using the provided interner
         lexer.current = Some(lexer.scan_token());
@@ -74,6 +78,10 @@ impl<'a> Lexer<'a> {
 
     /// Consume the current token and advance to the next one.
     pub fn advance(&mut self) -> Result<SpannedToken, LexError> {
+        // Record the line of the token being consumed (like PUC's lastline)
+        if let Some(Ok(ref tok)) = self.current {
+            self.lastline = tok.span.line;
+        }
         let prev = self.current.take().unwrap();
         self.current = Some(self.scan_token());
         prev

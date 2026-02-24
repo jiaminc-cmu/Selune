@@ -1798,6 +1798,7 @@ impl<'a> Compiler<'a> {
 
         // Pop FuncState
         let mut child_fs = self.func_stack.pop().unwrap();
+        let child_end_line = child_fs.proto.lastlinedefined;
         let end_pc = child_fs.current_pc() as u32;
         child_fs.scope.leave_block_at_pc(end_pc);
         child_fs.proto.max_stack_size = child_fs.scope.max_reg + 2;
@@ -1835,9 +1836,9 @@ impl<'a> Compiler<'a> {
         let proto_idx = self.fs().proto.protos.len();
         self.fs_mut().proto.protos.push(child_fs.proto);
 
-        // Emit CLOSURE instruction
+        // Emit CLOSURE instruction — PUC uses lastlinedefined (the 'end' line)
         let dest = self.fs_mut().scope.alloc_reg();
-        self.emit_abx(OpCode::Closure, dest, proto_idx as u32, line);
+        self.emit_abx(OpCode::Closure, dest, proto_idx as u32, child_end_line);
         Ok(ExprDesc::Register(dest))
     }
 
@@ -1921,13 +1922,18 @@ impl<'a> Compiler<'a> {
 
         if self.check(&Token::Function) {
             // local function name funcbody
+            // PUC emits Closure directly to the local's register (no extra MOVE)
             self.advance()?;
             let name = self.expect_name()?;
             let pc = self.fs().current_pc() as u32;
             let reg = self.fs_mut().scope.add_local(name, false, false, pc);
+            // Temporarily set free_reg back to reg so function_body's alloc_reg
+            // places the Closure directly into the local's register
+            self.fs_mut().scope.free_reg_to(reg);
             let func_expr = self.function_body(false)?;
-            self.discharge_to_reg(&func_expr, reg, line);
-            self.fs_mut().scope.free_reg_to(reg + 1);
+            // The Closure should now be in `reg`; just fix up free_reg
+            let _ = func_expr; // Result is already in reg
+            self.fs_mut().scope.free_reg = reg + 1;
             return Ok(());
         }
 
@@ -2089,6 +2095,7 @@ impl<'a> Compiler<'a> {
     /// `while exp do block end`
     fn stat_while(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume 'while'
+        let _while_line = self.lexer.lastline; // line of 'while' keyword
         let loop_start = self.fs().current_pc();
         let save_free = self.fs().scope.free_reg;
         let cond = self.expression()?;
@@ -2106,8 +2113,10 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.leave_block_at_pc(pc)
         };
 
-        // Jump back to loop start
-        let back_jump = self.emit_sj(OpCode::Jmp, 0, self.line());
+        // Jump back to loop start — use the last body line so it doesn't
+        // generate an extra line hook event (PUC has no separate back-JMP)
+        let back_line = self.lexer.lastline;
+        let back_jump = self.emit_sj(OpCode::Jmp, 0, back_line);
         self.patch_jump_to(back_jump, loop_start);
 
         self.expect(&Token::End)?;
@@ -2202,8 +2211,8 @@ impl<'a> Compiler<'a> {
             self.fs_mut().scope.leave_block_at_pc(pc)
         };
 
-        // ForLoop: increment and test
-        let loop_pc = self.emit_abx(OpCode::ForLoop, base, 0, self.line());
+        // ForLoop: increment and test — use the 'for' line, not 'end' line (like PUC)
+        let loop_pc = self.emit_abx(OpCode::ForLoop, base, 0, line);
         // Patch ForPrep to jump to ForLoop
         let offset = loop_pc as u32 - prep_pc as u32 - 1;
         self.fs_mut().proto.code[prep_pc] = Instruction::asbx(OpCode::ForPrep, base, offset as i32);
@@ -2466,7 +2475,7 @@ impl<'a> Compiler<'a> {
     /// `return [explist] [';']`
     fn stat_return(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume 'return'
-        let line = self.line();
+        let line = self.lexer.lastline; // line of 'return' keyword (like PUC)
 
         // Check if there are return values
         let is_end = matches!(
@@ -2597,7 +2606,7 @@ impl<'a> Compiler<'a> {
     /// `break`
     fn stat_break(&mut self) -> Result<(), CompileError> {
         self.advance()?; // consume 'break'
-        let line = self.line();
+        let line = self.lexer.lastline; // line of 'break' keyword, not next token
 
         // Close upvalues if breaking over captured/TBC locals
         if let Some(close_reg) = self.fs().scope.break_needs_close() {
@@ -3158,20 +3167,23 @@ fn compile_inner(compiler: &mut Compiler<'_>, name: &str) -> Result<Proto, Compi
         is_const: false,
     });
 
-    // VarArgPrep
-    top.emit(Instruction::abx(OpCode::VarArgPrep, 0, 0), 1);
+    // VarArgPrep — line 0 (not counted in activelines or line hooks)
+    top.emit(Instruction::abx(OpCode::VarArgPrep, 0, 0), 0);
 
     compiler.func_stack.push(top);
 
     // Parse the block
     compiler.block()?;
 
+    // Capture lastline before consuming EOF — this is the line of the last
+    // meaningful token (like PUC's ls->lastline before close_func)
+    let return_line = compiler.lexer.lastline.max(1);
+
     // Expect EOF
     compiler.expect(&Token::Eof)?;
 
-    // Emit RETURN0 — use last emitted line to match PUC Lua behavior
-    let line = compiler.last_emitted_line().max(1);
-    compiler.emit_abc(OpCode::Return0, 0, 0, 0, line);
+    // Emit RETURN0 — use the line of the last consumed token before EOF
+    compiler.emit_abc(OpCode::Return0, 0, 0, 0, return_line);
 
     // Adjust labels at function end and check for unresolved gotos
     compiler.close_block_gotos();

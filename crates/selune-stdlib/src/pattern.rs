@@ -28,6 +28,8 @@ pub struct MatchState {
 /// Internal capture tracking during matching.
 #[derive(Debug, Clone, Copy)]
 enum CapStatus {
+    /// Uninitialized slot.
+    Empty,
     /// Capture opened at `pos` but not yet closed.
     Open(usize),
     /// Capture closed: `(start, end)`.
@@ -37,14 +39,37 @@ enum CapStatus {
 }
 
 /// Internal matcher state. Holds references to subject and pattern along with
-/// mutable capture state.
+/// mutable capture state. Uses a fixed-size array for captures to avoid heap
+/// allocations in the hot matching loop.
 struct Matcher<'a> {
     subject: &'a [u8],
     #[allow(dead_code)]
     pattern: &'a [u8],
-    caps: Vec<CapStatus>,
+    caps: [CapStatus; MAX_CAPTURES],
+    num_caps: usize,
     depth: usize,
     error: Option<String>,
+}
+
+impl<'a> Matcher<'a> {
+    #[inline]
+    fn new(subject: &'a [u8], pattern: &'a [u8]) -> Self {
+        Matcher {
+            subject,
+            pattern,
+            caps: [CapStatus::Empty; MAX_CAPTURES],
+            num_caps: 0,
+            depth: 0,
+            error: None,
+        }
+    }
+
+    /// Reset matcher state for reuse at a new position.
+    #[inline]
+    fn reset(&mut self) {
+        self.num_caps = 0;
+        self.depth = 0;
+    }
 }
 
 /// Find the first match of `pattern` in `subject` starting at byte offset `init`.
@@ -161,19 +186,12 @@ pub fn pattern_find(
     let anchor = !pattern.is_empty() && pattern[0] == b'^';
     let pat = if anchor { &pattern[1..] } else { pattern };
 
-    let mut m = Matcher {
-        subject,
-        pattern: pat,
-        caps: Vec::new(),
-        depth: 0,
-        error: None,
-    };
+    let mut m = Matcher::new(subject, pat);
 
     // Try matching at each starting position.
     let mut si = init;
     loop {
-        m.caps.clear();
-        m.depth = 0;
+        m.reset();
         if let Some(end) = m.match_pattern(pat, si) {
             return Ok(Some(m.build_result(si, end)));
         }
@@ -188,28 +206,26 @@ pub fn pattern_find(
 }
 
 /// A public matcher for gsub that tries matching at a specific position only.
+/// Reuses an internal Matcher to avoid re-allocation across calls.
 pub struct PatternMatcher<'a> {
-    subject: &'a [u8],
+    m: Matcher<'a>,
     pat: &'a [u8],
 }
 
 impl<'a> PatternMatcher<'a> {
     pub fn new(subject: &'a [u8], pat: &'a [u8]) -> Self {
-        PatternMatcher { subject, pat }
+        PatternMatcher {
+            m: Matcher::new(subject, pat),
+            pat,
+        }
     }
 
     /// Try to match the pattern at exactly position `si`. Does NOT search forward.
     pub fn try_match_at(&mut self, si: usize) -> Result<Option<MatchState>, String> {
-        let mut m = Matcher {
-            subject: self.subject,
-            pattern: self.pat,
-            caps: Vec::new(),
-            depth: 0,
-            error: None,
-        };
-        if let Some(end) = m.match_pattern(self.pat, si) {
-            Ok(Some(m.build_result(si, end)))
-        } else if let Some(err) = m.error.take() {
+        self.m.reset();
+        if let Some(end) = self.m.match_pattern(self.pat, si) {
+            Ok(Some(self.m.build_result(si, end)))
+        } else if let Some(err) = self.m.error.take() {
             Err(err)
         } else {
             Ok(None)
@@ -255,13 +271,7 @@ impl<'a> Iterator for GmatchIter<'a> {
         }
 
         let pat = &self.pattern[self.pat_start..];
-        let mut m = Matcher {
-            subject: self.subject,
-            pattern: pat,
-            caps: Vec::new(),
-            depth: 0,
-            error: None,
-        };
+        let mut m = Matcher::new(self.subject, pat);
 
         let mut si = self.pos;
         loop {
@@ -269,8 +279,7 @@ impl<'a> Iterator for GmatchIter<'a> {
                 self.finished = true;
                 return None;
             }
-            m.caps.clear();
-            m.depth = 0;
+            m.reset();
             if let Some(end) = m.match_pattern(pat, si) {
                 // Guard against repeated empty match at same position (Lua 5.3.3+).
                 if end != si || self.lastmatch != Some(end) {
@@ -298,6 +307,7 @@ impl<'a> Iterator for GmatchIter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Classifies a single character class like `%a`, `%d`, etc.
+#[inline]
 fn match_class(ch: u8, class: u8) -> bool {
     let lower = class.to_ascii_lowercase();
     let result = match lower {
@@ -325,6 +335,7 @@ fn match_class(ch: u8, class: u8) -> bool {
 /// Check if `ch` matches a character set `[...]` starting at `pattern[pp]`.
 /// `pp` should point to the first byte after the opening `[`.
 /// Returns `(matched, end_of_set)` where `end_of_set` is the index after `]`.
+#[inline]
 fn match_set(pattern: &[u8], mut pp: usize, ch: u8) -> (bool, usize) {
     let complement = pp < pattern.len() && pattern[pp] == b'^';
     if complement {
@@ -378,6 +389,7 @@ fn match_set(pattern: &[u8], mut pp: usize, ch: u8) -> (bool, usize) {
 /// This does NOT handle sets `[...]` -- the caller must handle those separately
 /// because they span variable lengths. For single-char elements like `.`, `%a`, or
 /// literal bytes, this works.
+#[inline]
 fn match_single(pattern: &[u8], pp: usize, ch: u8) -> bool {
     match pattern[pp] {
         b'.' => true,
@@ -395,6 +407,7 @@ fn match_single(pattern: &[u8], pp: usize, ch: u8) -> bool {
 /// Return the number of bytes consumed by one pattern element starting at
 /// `pattern[pp]`. For `%x` it's 2, for `[...]` it's the whole set including
 /// brackets, for anything else it's 1.
+#[inline]
 fn element_len(pattern: &[u8], pp: usize) -> usize {
     if pp >= pattern.len() {
         return 0;
@@ -443,6 +456,7 @@ fn element_len(pattern: &[u8], pp: usize) -> usize {
 
 /// Test if subject byte `ch` matches the pattern element starting at
 /// `pattern[pp]`, handling single chars, `%x` classes, and `[set]`.
+#[inline]
 fn singlematch(pattern: &[u8], pp: usize, ch: u8) -> bool {
     if pp >= pattern.len() {
         return false;
@@ -546,7 +560,7 @@ impl<'a> Matcher<'a> {
                 }
                 let cap_idx = n - 1; // %1 = index 0, etc.
                                      // Check if this capture exists and is closed
-                if cap_idx >= self.caps.len() {
+                if cap_idx >= self.num_caps {
                     self.error = Some(format!("invalid capture index %{}", n));
                     return None;
                 }
@@ -569,6 +583,10 @@ impl<'a> Matcher<'a> {
                     }
                     CapStatus::Position(_) => {
                         // Position captures can't be used as back-references
+                        self.error = Some(format!("invalid capture index %{}", n));
+                        return None;
+                    }
+                    CapStatus::Empty => {
                         self.error = Some(format!("invalid capture index %{}", n));
                         return None;
                     }
@@ -623,8 +641,10 @@ impl<'a> Matcher<'a> {
         }
 
         // Try matching the rest from the longest match downward.
+        // Save/restore caps using fixed-size array copy (no heap allocation).
         while count >= min_count {
-            let saved_caps = self.caps.clone();
+            let saved_caps = self.caps;
+            let saved_num = self.num_caps;
             if let Some(end) = self.match_recurse(pattern, rest_pp, si + count) {
                 return Some(end);
             }
@@ -632,6 +652,7 @@ impl<'a> Matcher<'a> {
                 return None;
             }
             self.caps = saved_caps;
+            self.num_caps = saved_num;
             if count == 0 {
                 break;
             }
@@ -651,7 +672,8 @@ impl<'a> Matcher<'a> {
     ) -> Option<usize> {
         let mut pos = si;
         loop {
-            let saved_caps = self.caps.clone();
+            let saved_caps = self.caps;
+            let saved_num = self.num_caps;
             if let Some(end) = self.match_recurse(pattern, rest_pp, pos) {
                 return Some(end);
             }
@@ -659,6 +681,7 @@ impl<'a> Matcher<'a> {
                 return None;
             }
             self.caps = saved_caps;
+            self.num_caps = saved_num;
             if pos < self.subject.len() && singlematch(pattern, pp, self.subject[pos]) {
                 pos += 1;
             } else {
@@ -678,7 +701,8 @@ impl<'a> Matcher<'a> {
     ) -> Option<usize> {
         // Try with the element first (greedy).
         if si < self.subject.len() && singlematch(pattern, pp, self.subject[si]) {
-            let saved_caps = self.caps.clone();
+            let saved_caps = self.caps;
+            let saved_num = self.num_caps;
             if let Some(end) = self.match_recurse(pattern, rest_pp, si + 1) {
                 return Some(end);
             }
@@ -686,6 +710,7 @@ impl<'a> Matcher<'a> {
                 return None;
             }
             self.caps = saved_caps;
+            self.num_caps = saved_num;
         }
         // Try without the element.
         self.match_recurse(pattern, rest_pp, si)
@@ -752,7 +777,7 @@ impl<'a> Matcher<'a> {
     fn get_closed_capture(&self, idx: usize) -> Option<&[u8]> {
         // Find the idx-th capture (skipping open/position captures for counting purposes).
         // In Lua, captures are numbered in order of their opening parenthesis.
-        if idx < self.caps.len() {
+        if idx < self.num_caps {
             match self.caps[idx] {
                 CapStatus::Closed(start, end) => Some(&self.subject[start..end]),
                 _ => None,
@@ -764,16 +789,17 @@ impl<'a> Matcher<'a> {
 
     /// Open a capture group.
     fn match_open_capture(&mut self, pattern: &[u8], rest_pp: usize, si: usize) -> Option<usize> {
-        if self.caps.len() >= MAX_CAPTURES {
+        if self.num_caps >= MAX_CAPTURES {
             return None; // too many captures
         }
-        let idx = self.caps.len();
-        self.caps.push(CapStatus::Open(si));
+        let idx = self.num_caps;
+        self.caps[idx] = CapStatus::Open(si);
+        self.num_caps += 1;
         if let Some(end) = self.match_recurse(pattern, rest_pp, si) {
             return Some(end);
         }
         // Backtrack: remove capture.
-        self.caps.truncate(idx);
+        self.num_caps = idx;
         None
     }
 
@@ -781,7 +807,7 @@ impl<'a> Matcher<'a> {
     fn match_close_capture(&mut self, pattern: &[u8], rest_pp: usize, si: usize) -> Option<usize> {
         // Find the last open capture.
         let mut idx = None;
-        for i in (0..self.caps.len()).rev() {
+        for i in (0..self.num_caps).rev() {
             if matches!(self.caps[i], CapStatus::Open(_)) {
                 idx = Some(i);
                 break;
@@ -809,25 +835,26 @@ impl<'a> Matcher<'a> {
         rest_pp: usize,
         si: usize,
     ) -> Option<usize> {
-        if self.caps.len() >= MAX_CAPTURES {
+        if self.num_caps >= MAX_CAPTURES {
             return None;
         }
-        let idx = self.caps.len();
-        self.caps.push(CapStatus::Position(si));
+        let idx = self.num_caps;
+        self.caps[idx] = CapStatus::Position(si);
+        self.num_caps += 1;
         if let Some(end) = self.match_recurse(pattern, rest_pp, si) {
             return Some(end);
         }
-        self.caps.truncate(idx);
+        self.num_caps = idx;
         None
     }
 
     /// Build the final `MatchState` from the internal capture list.
     fn build_result(&self, match_start: usize, match_end: usize) -> MatchState {
-        let mut captures = Vec::with_capacity(self.caps.len() + 1);
+        let mut captures = Vec::with_capacity(self.num_caps + 1);
         // Capture 0 is always the full match.
         captures.push((match_start, match_end));
-        for cap in &self.caps {
-            match *cap {
+        for i in 0..self.num_caps {
+            match self.caps[i] {
                 CapStatus::Closed(start, end) => captures.push((start, end)),
                 CapStatus::Position(pos) => captures.push((pos, CAP_POSITION)),
                 CapStatus::Open(start) => {
@@ -835,6 +862,7 @@ impl<'a> Matcher<'a> {
                     // but treat as extending to end of match.
                     captures.push((start, match_end));
                 }
+                CapStatus::Empty => {}
             }
         }
         MatchState { captures }

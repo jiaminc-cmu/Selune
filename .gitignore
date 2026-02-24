@@ -5,3 +5,9 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+*.bak
+*.orig
+*.rlib
+luac.out
+PHASE3_PROMPT.md
+benchmarks/results/
