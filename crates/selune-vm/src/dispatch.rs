@@ -517,23 +517,43 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             // Line hook
             if vm.hook_mask & HOOK_LINE != 0 && vm.call_stack[ci_idx].is_lua {
                 let proto = &vm.protos[vm.call_stack[ci_idx].proto_idx];
-                let line = proto.get_line(pc) as i32;
-                if line != vm.hook_last_line && line > 0 {
-                    vm.hook_last_line = line;
-                    // Same stack_top protection for line hooks
-                    let saved_hook_top = vm.stack_top;
-                    let max_stack = proto.max_stack_size as usize;
-                    let frame_top = base + max_stack;
-                    if vm.stack_top < frame_top {
-                        vm.stack_top = frame_top;
+                let raw_line = proto.get_line(pc);
+                // For VarArgPrep (line=0 but NOT stripped code), skip hooks entirely
+                // For stripped code, all instructions have line=0; detect via lineinfo emptiness
+                let is_stripped = proto.line_info.is_empty();
+                if raw_line == 0 && !is_stripped {
+                    // VarArgPrep: just update hook_old_pc
+                    vm.hook_old_pc = pc;
+                } else {
+                    // For stripped code: line = -1 (fire_hook converts to nil)
+                    // For normal code: line = raw_line
+                    let line = if is_stripped { -1i32 } else { raw_line as i32 };
+                    // PUC's line hook logic (luaG_traceexec):
+                    // hook_old_pc is PUC's L->oldpc equivalent (global, not per-frame)
+                    let old_pc = vm.hook_old_pc;
+                    // Validate old_pc is within this proto (may be stale from another frame)
+                    let old_pc = if old_pc < proto.code.len() { old_pc } else { 0 };
+                    // PUC: fire when npci <= oldpc (backward jump) OR changedline
+                    let fire = pc <= old_pc || changedline(proto, old_pc, pc);
+                    vm.hook_old_pc = pc;
+                    if fire {
+                        let new_line = line;
+                        vm.hook_last_line = new_line;
+                        // Same stack_top protection for line hooks
+                        let saved_hook_top = vm.stack_top;
+                        let max_stack = proto.max_stack_size as usize;
+                        let frame_top = base + max_stack;
+                        if vm.stack_top < frame_top {
+                            vm.stack_top = frame_top;
+                        }
+                        fire_hook(vm, "line", new_line, entry_depth)?;
+                        vm.stack_top = saved_hook_top;
+                        // Re-read ci_idx/base/pc after hook
+                        ci_idx = vm.call_stack.len() - 1;
+                        base = vm.call_stack[ci_idx].base;
+                        pc = vm.call_stack[ci_idx].pc;
                     }
-                    fire_hook(vm, "line", line, entry_depth)?;
-                    vm.stack_top = saved_hook_top;
-                    // Re-read ci_idx/base/pc after hook
-                    ci_idx = vm.call_stack.len() - 1;
-                    base = vm.call_stack[ci_idx].base;
-                    pc = vm.call_stack[ci_idx].pc;
-                }
+                } // end else
             }
         }
 
@@ -1486,6 +1506,16 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 }
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
+                    // Fire return hook before early return (e.g., __close called via call_function)
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
+                    {
+                        let ci = vm.call_stack.len() - 1;
+                        vm.call_stack[ci].ntransfer = 0;
+                        let _ = fire_hook(vm, "return", -1, entry_depth);
+                    }
                     return Ok(vec![]);
                 }
                 return_from_call(vm, &[])?;
@@ -1508,6 +1538,16 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 }
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
+                    // Fire return hook before early return
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
+                    {
+                        let ci = vm.call_stack.len() - 1;
+                        vm.call_stack[ci].ntransfer = 1;
+                        let _ = fire_hook(vm, "return", -1, entry_depth);
+                    }
                     return Ok(vec![val]);
                 }
                 return_from_call(vm, &[val])?;
@@ -1542,6 +1582,16 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 }
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
+                    // Fire return hook before early return
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
+                    {
+                        let ci = vm.call_stack.len() - 1;
+                        vm.call_stack[ci].ntransfer = results.len() as u16;
+                        let _ = fire_hook(vm, "return", -1, entry_depth);
+                    }
                     return Ok(results);
                 }
                 return_from_call(vm, &results)?;
@@ -1644,10 +1694,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         ci.vararg_base = Some(new_base);
                         ci.ftransfer = 1;
                         ci.ntransfer = num_params as u16;
+                        ci.saved_hook_line = vm.hook_last_line;
                         vm.call_stack.push(ci);
-                        // Reset hook line tracking for new frame (PUC: oldpc = savedpc)
+                        // Reset hook tracking for new frame (PUC: L->oldpc = 0)
                         if vm.hooks_active {
-                            vm.hook_last_line = vm.protos[child_proto_idx].get_line(0) as i32;
+                            vm.hook_last_line = -1;
+                            vm.hook_old_pc = 0;
                             if vm.hook_mask & HOOK_CALL != 0 {
                                 fire_hook(vm, "call", -1, entry_depth)?;
                             }
@@ -1668,10 +1720,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         ci.func_stack_idx = func_stack_pos;
                         ci.ftransfer = 1;
                         ci.ntransfer = num_params as u16;
+                        ci.saved_hook_line = vm.hook_last_line;
                         vm.call_stack.push(ci);
-                        // Reset hook line tracking for new frame
+                        // Reset hook tracking for new frame (PUC: L->oldpc = 0)
                         if vm.hooks_active {
-                            vm.hook_last_line = vm.protos[child_proto_idx].get_line(0) as i32;
+                            vm.hook_last_line = -1;
+                            vm.hook_old_pc = 0;
                             if vm.hook_mask & HOOK_CALL != 0 {
                                 fire_hook(vm, "call", -1, entry_depth)?;
                             }
@@ -1885,6 +1939,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.table_remove_idx == Some(native_idx)
                         || vm.table_concat_idx == Some(native_idx)
                         || vm.table_unpack_idx == Some(native_idx)
+                        || vm.warn_idx == Some(native_idx)
                     {
                         // Redirect through call_function for full VM access
                         // Collect args BEFORE firing hook
@@ -1977,6 +2032,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         }
                         if num_results < 0 {
                             vm.stack_top = result_base + results.len();
+                        }
+                        // PUC rethook: update L->oldpc after C function returns
+                        if vm.hooks_active {
+                            vm.hook_old_pc = pc;
                         }
                     } else {
                         // Normal native function call
@@ -2074,6 +2133,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
 
                         if num_results < 0 {
                             vm.stack_top = result_base + results.len();
+                        }
+                        // PUC rethook: update L->oldpc after C function returns
+                        if vm.hooks_active {
+                            vm.hook_old_pc = pc;
                         }
                     }
                 } else {
@@ -2176,7 +2239,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         ci.ntransfer = num_params as u16;
                         // Fire "tail call" hook
                         if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                            vm.hook_last_line = vm.protos[child_proto_idx].get_line(0) as i32;
+                            vm.hook_last_line = -1;
                             fire_hook(vm, "tail call", -1, entry_depth)?;
                         }
                     } else {
@@ -2200,7 +2263,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         ci.ntransfer = num_params as u16;
                         // Fire "tail call" hook
                         if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                            vm.hook_last_line = vm.protos[child_proto_idx].get_line(0) as i32;
+                            vm.hook_last_line = -1;
                             fire_hook(vm, "tail call", -1, entry_depth)?;
                         }
                     }
@@ -2243,6 +2306,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         || vm.table_remove_idx == Some(native_idx)
                         || vm.table_concat_idx == Some(native_idx)
                         || vm.table_unpack_idx == Some(native_idx)
+                        || vm.warn_idx == Some(native_idx)
                     {
                         call_function(vm, func_val, &args)?
                     } else {
@@ -2852,15 +2916,24 @@ const MAXTAGLOOP: usize = 2000;
 /// Iterative implementation with MAXTAGLOOP guard to prevent infinite loops.
 fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, LuaError> {
     let mut current = table_val;
+    // Cache mm_name once before the loop to avoid repeated Option unwrap.
+    let mm_name = vm.mm_names.as_ref().unwrap().index;
+    // Pre-check if key is a string for fast-path raw_get_str.
+    let key_sid = key.as_string_id();
+
     for _ in 0..MAXTAGLOOP {
         if let Some(table_idx) = current.as_table_idx() {
-            // Raw get first
-            let result = vm.gc.table_raw_get(table_idx, key);
+            // Fast path: use raw_get_str directly for string keys (skips boxed-int check,
+            // as_integer check, as_float check, and tvalue_to_table_key conversion).
+            let result = if let Some(sid) = key_sid {
+                vm.gc.get_table(table_idx).raw_get_str(sid)
+            } else {
+                vm.gc.table_raw_get(table_idx, key)
+            };
             if !result.is_nil() {
                 return Ok(result);
             }
             // Check __index metamethod
-            let mm_name = vm.mm_names.as_ref().unwrap().index;
             if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
                 if mm.is_gc()
                     && (mm.gc_sub_tag() == Some(selune_core::gc::GC_SUB_CLOSURE)
@@ -2878,7 +2951,6 @@ fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, Lu
             }
         } else {
             // Non-table: check for __index metamethod (valid for userdata, numbers, etc.)
-            let mm_name = vm.mm_names.as_ref().unwrap().index;
             if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
                 if mm.is_gc()
                     && (mm.gc_sub_tag() == Some(selune_core::gc::GC_SUB_CLOSURE)
@@ -2913,10 +2985,19 @@ fn table_newindex(
     val: TValue,
 ) -> Result<(), LuaError> {
     let mut current = table_val;
+    // Cache mm_name once before the loop.
+    let mm_name = vm.mm_names.as_ref().unwrap().newindex;
+    // Pre-check if key is a string for fast-path lookup.
+    let key_sid = key.as_string_id();
+
     for _ in 0..MAXTAGLOOP {
         if let Some(table_idx) = current.as_table_idx() {
-            // Check if key already exists (raw)
-            let existing = vm.gc.table_raw_get(table_idx, key);
+            // Check if key already exists (raw) — fast path for string keys
+            let existing = if let Some(sid) = key_sid {
+                vm.gc.get_table(table_idx).raw_get_str(sid)
+            } else {
+                vm.gc.table_raw_get(table_idx, key)
+            };
             if !existing.is_nil() {
                 // Key exists, just set it (no metamethod)
                 vm.gc
@@ -2925,7 +3006,6 @@ fn table_newindex(
                 return Ok(());
             }
             // Key doesn't exist: check __newindex metamethod
-            let mm_name = vm.mm_names.as_ref().unwrap().newindex;
             if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
                 if mm.is_gc()
                     && (mm.gc_sub_tag() == Some(selune_core::gc::GC_SUB_CLOSURE)
@@ -2947,7 +3027,6 @@ fn table_newindex(
             }
         } else {
             // Non-table: check __newindex metamethod
-            let mm_name = vm.mm_names.as_ref().unwrap().newindex;
             if let Some(mm) = metamethod::get_metamethod(current, mm_name, &vm.gc) {
                 if mm.is_gc()
                     && (mm.gc_sub_tag() == Some(selune_core::gc::GC_SUB_CLOSURE)
@@ -2994,6 +3073,12 @@ fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
         let _ = fire_hook(vm, "return", -1, 0);
     }
 
+    // Save the popped frame's saved_hook_line for restoration
+    let saved_hook_line = vm
+        .call_stack
+        .last()
+        .map(|ci| ci.saved_hook_line)
+        .unwrap_or(-1);
     vm.call_stack.pop();
 
     match call_status {
@@ -3046,12 +3131,16 @@ fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
         }
     }
 
-    // Reset hook_last_line for the caller frame after return (PUC: restore oldpc)
+    // Restore hook_last_line from the popped frame's saved value (PUC: per-CI previousline)
     if vm.hooks_active {
+        vm.hook_last_line = saved_hook_line;
+        // PUC rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
+        // Set hook_old_pc to the CALL instruction (pc - 1) so the next line
+        // hook check compares with the correct baseline. In PUC, savedpc is
+        // one behind npci after vmfetch; our pc is already the next instruction.
         if let Some(caller) = vm.call_stack.last() {
             if caller.is_lua && caller.pc > 0 {
-                let proto = &vm.protos[caller.proto_idx];
-                vm.hook_last_line = proto.get_line(caller.pc - 1) as i32;
+                vm.hook_old_pc = caller.pc - 1;
             }
         }
     }
@@ -3403,16 +3492,16 @@ fn do_string_gsub(
     let anchor = !pat.is_empty() && pat[0] == b'^';
     let match_pat = if anchor { &pat[1..] } else { pat };
 
+    // Create matcher once and reuse across iterations (avoids re-allocation per position).
+    let mut matcher = pattern::PatternMatcher::new(subject, match_pat);
+
     loop {
         if count >= max_replacements || src > subject.len() {
             break;
         }
 
         // Try to match at position `src`.
-        let ms = {
-            let mut matcher = pattern::PatternMatcher::new(subject, match_pat);
-            matcher.try_match_at(src)
-        };
+        let ms = matcher.try_match_at(src);
 
         match ms {
             Err(e) => return Err(LuaError::Runtime(e)),
@@ -3658,6 +3747,7 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
             hook_counter: 0,
             hooks_active: false,
             hook_last_line: -1,
+            hook_old_pc: 0,
         },
     );
     vm.restore_running_state(coro_state);
@@ -4237,13 +4327,28 @@ fn call_function_inner(
                 ci.is_hook_call = true;
                 vm.pending_hook_call = false;
             }
+            if vm.in_tbc_close > 0 {
+                ci.is_tbc_close = true;
+            }
+            ci.saved_hook_line = vm.hook_last_line;
             vm.call_stack.push(ci);
-            // Fire call hook if active
-            if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                let _ = fire_hook(vm, "call", -1, entry_depth);
+            // Reset hook tracking and fire call hook
+            let saved_hook_line = vm.hook_last_line;
+            let saved_hook_old_pc = vm.hook_old_pc;
+            if vm.hooks_active {
+                vm.hook_last_line = -1;
+                vm.hook_old_pc = 0;
+                if !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
+                    let _ = fire_hook(vm, "call", -1, entry_depth);
+                }
             }
 
             let mut result = execute_from(vm, entry_depth);
+            // Restore hook state after call returns
+            if vm.hooks_active {
+                vm.hook_last_line = saved_hook_line;
+                vm.hook_old_pc = saved_hook_old_pc;
+            }
             // For Yield: do NOT clean up — coroutine state must be preserved
             if matches!(&result, Err(LuaError::Yield(_))) {
                 return result;
@@ -4278,13 +4383,28 @@ fn call_function_inner(
                 ci.is_hook_call = true;
                 vm.pending_hook_call = false;
             }
+            if vm.in_tbc_close > 0 {
+                ci.is_tbc_close = true;
+            }
+            ci.saved_hook_line = vm.hook_last_line;
             vm.call_stack.push(ci);
-            // Fire call hook if active
-            if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                let _ = fire_hook(vm, "call", -1, entry_depth);
+            // Reset hook tracking and fire call hook
+            let saved_hook_line2 = vm.hook_last_line;
+            let saved_hook_old_pc2 = vm.hook_old_pc;
+            if vm.hooks_active {
+                vm.hook_last_line = -1;
+                vm.hook_old_pc = 0;
+                if !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
+                    let _ = fire_hook(vm, "call", -1, entry_depth);
+                }
             }
 
             let mut result = execute_from(vm, entry_depth);
+            // Restore hook state after call returns
+            if vm.hooks_active {
+                vm.hook_last_line = saved_hook_line2;
+                vm.hook_old_pc = saved_hook_old_pc2;
+            }
             // For Yield: do NOT clean up — coroutine state must be preserved
             if matches!(&result, Err(LuaError::Yield(_))) {
                 return result;
@@ -4530,6 +4650,8 @@ fn call_function_inner(
             do_table_concat(vm, args)
         } else if vm.table_unpack_idx == Some(native_idx) {
             do_table_unpack(vm, args)
+        } else if vm.warn_idx == Some(native_idx) {
+            do_warn(vm, args)
         } else {
             // Normal native function call
             let native_ref = vm.gc.get_native(native_idx);
@@ -5168,7 +5290,7 @@ fn do_debug_getupvalue(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
         } else {
             None
         };
-        let name_str = name.unwrap_or_else(|| format!("(upvalue {})", n));
+        let name_str = name.unwrap_or_else(|| "(no name)".to_string());
 
         // Get upvalue value
         let uv = vm.gc.get_upval(uv_gc_idx);
@@ -5227,7 +5349,7 @@ fn do_debug_setupvalue(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
         } else {
             None
         };
-        let name_str = name.unwrap_or_else(|| format!("(upvalue {})", n));
+        let name_str = name.unwrap_or_else(|| "(no name)".to_string());
 
         // Set upvalue value
         let uv = vm.gc.get_upval_mut(uv_gc_idx);
@@ -5632,26 +5754,26 @@ fn do_debug_getinfo(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErro
     }
 
     // Ensure namewhat defaults to "" when 'n' is requested (PUC Lua behavior)
-    // For hook functions, set namewhat = "hook" (like PUC's CIST_HOOK)
+    // For hook functions, ALWAYS set namewhat = "hook" (like PUC's CIST_HOOK)
     if what_str.contains('n') {
         let namewhat_key = vm.strings.intern(b"namewhat");
-        let t = vm.gc.get_table(tbl);
-        if t.raw_get_str(namewhat_key).is_nil() {
-            let is_hook_frame = if let Some(cid) = queried_coro {
-                queried_frame_idx
-                    .map(|fi| vm.coroutines[cid].call_stack[fi].is_hook_call)
-                    .unwrap_or(false)
-            } else {
-                queried_frame_idx
-                    .map(|fi| vm.call_stack[fi].is_hook_call)
-                    .unwrap_or(false)
-            };
-            if is_hook_frame {
-                let hook_str = vm.strings.intern(b"hook");
-                vm.gc
-                    .get_table_mut(tbl)
-                    .raw_set_str(namewhat_key, TValue::from_string_id(hook_str));
-            } else {
+        let is_hook_frame = if let Some(cid) = queried_coro {
+            queried_frame_idx
+                .map(|fi| vm.coroutines[cid].call_stack[fi].is_hook_call)
+                .unwrap_or(false)
+        } else {
+            queried_frame_idx
+                .map(|fi| vm.call_stack[fi].is_hook_call)
+                .unwrap_or(false)
+        };
+        if is_hook_frame {
+            let hook_str = vm.strings.intern(b"hook");
+            vm.gc
+                .get_table_mut(tbl)
+                .raw_set_str(namewhat_key, TValue::from_string_id(hook_str));
+        } else {
+            let t = vm.gc.get_table(tbl);
+            if t.raw_get_str(namewhat_key).is_nil() {
                 let empty = vm.strings.intern(b"");
                 vm.gc
                     .get_table_mut(tbl)
@@ -6090,7 +6212,12 @@ fn fill_lua_info(
         let currentline_key = vm.strings.intern(b"currentline");
         let current_line = if let Some(pc) = pc {
             let proto = &vm.protos[proto_idx];
-            proto.get_line(pc) as i64
+            let line = proto.get_line(pc);
+            if line == 0 {
+                -1i64 // stripped code has no line info
+            } else {
+                line as i64
+            }
         } else {
             -1
         };
@@ -6192,6 +6319,12 @@ fn fill_func_name(
     frame_idx: usize,
 ) {
     use selune_compiler::opcode::OpCode;
+
+    // TBC __close calls: report as name="close", namewhat="metamethod"
+    if frame_idx < vm.call_stack.len() && vm.call_stack[frame_idx].is_tbc_close {
+        set_mm_name_on_table(vm, tbl, b"close");
+        return;
+    }
 
     if frame_idx == 0 {
         return;
@@ -6395,6 +6528,12 @@ fn fill_func_name_from_stack(
     call_stack: &[CallInfo],
 ) {
     use selune_compiler::opcode::OpCode;
+
+    // TBC __close calls: report as name="close", namewhat="metamethod"
+    if frame_idx < call_stack.len() && call_stack[frame_idx].is_tbc_close {
+        set_mm_name_on_table(vm, tbl, b"close");
+        return;
+    }
 
     if frame_idx == 0 {
         return;
@@ -6822,6 +6961,7 @@ fn do_coro_close(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> 
             hook_counter: 0,
             hooks_active: false,
             hook_last_line: -1,
+            hook_old_pc: 0,
         },
     );
     vm.restore_running_state(coro_state);
@@ -7326,6 +7466,98 @@ fn do_table_unpack(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError
         k += 1;
     }
     Ok(results)
+}
+
+/// warn(msg1, msg2, ...) — warning system with @on/@off/@store/@normal control
+fn do_warn(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> {
+    if args.is_empty() {
+        return Err(add_error_prefix(
+            vm,
+            LuaError::Runtime(
+                "bad argument #1 to 'warn' (string expected, got no value)".to_string(),
+            ),
+        ));
+    }
+
+    // Get first argument as string
+    let first = args[0];
+    let first_str = if let Some(sid) = first.as_string_id() {
+        String::from_utf8_lossy(vm.strings.get_bytes(sid)).into_owned()
+    } else if let Some(i) = first.as_full_integer(&vm.gc) {
+        i.to_string()
+    } else if let Some(f) = first.as_float() {
+        format!("{}", f)
+    } else {
+        return Err(add_error_prefix(
+            vm,
+            LuaError::Runtime(format!(
+                "bad argument #1 to 'warn' (string expected, got {})",
+                obj_type_name(first, vm)
+            )),
+        ));
+    };
+
+    // Check for control messages (first arg starts with '@')
+    if first_str.starts_with('@') {
+        match first_str.as_str() {
+            "@on" => {
+                vm.warn_enabled = true;
+            }
+            "@off" => {
+                vm.warn_enabled = false;
+            }
+            "@store" => {
+                // Test-suite extension: store messages in _WARN global
+                vm.warn_store = true;
+                vm.warn_enabled = true;
+            }
+            "@normal" => {
+                // Test-suite extension: switch back to stderr output
+                vm.warn_store = false;
+            }
+            _ => {
+                // Unknown control message: ignore (PUC behavior)
+            }
+        }
+        return Ok(vec![]);
+    }
+
+    // Not a control message: concatenate all arguments
+    if !vm.warn_enabled {
+        return Ok(vec![]);
+    }
+
+    let mut message = first_str;
+    for arg in &args[1..] {
+        if let Some(sid) = arg.as_string_id() {
+            message.push_str(&String::from_utf8_lossy(vm.strings.get_bytes(sid)));
+        } else if let Some(i) = arg.as_full_integer(&vm.gc) {
+            message.push_str(&i.to_string());
+        } else if let Some(f) = arg.as_float() {
+            message.push_str(&format!("{}", f));
+        } else {
+            return Err(add_error_prefix(
+                vm,
+                LuaError::Runtime("bad argument to 'warn' (string expected)".to_string()),
+            ));
+        }
+    }
+
+    if vm.warn_store {
+        // Store in _WARN global
+        if let Some(env_idx) = vm.env_idx {
+            let warn_key = vm.strings.intern(b"_WARN");
+            let warn_sid = vm.strings.intern_or_create(message.as_bytes());
+            vm.gc
+                .get_table_mut(env_idx)
+                .raw_set_str(warn_key, TValue::from_string_id(warn_sid));
+        }
+    } else {
+        // Output to stderr: "Lua warning: <message>\n"
+        eprintln!("Lua warning: {}", message);
+    }
+
+    Ok(vec![])
 }
 
 // Hook mask constants
@@ -7992,6 +8224,19 @@ fn do_debug_getregistry(vm: &mut Vm) -> Result<Vec<TValue>, LuaError> {
         vm.registry_idx = Some(reg);
     }
     Ok(vec![TValue::from_table(vm.registry_idx.unwrap())])
+}
+
+/// PUC-style changedline: check if any instruction between old_pc and new_pc
+/// has a non-zero line delta. This catches same-line backward jumps in loops.
+/// PUC's changedline: returns true if the line at old_pc differs from line at new_pc.
+/// Only called for forward movement (new_pc > old_pc). Uses line delta accumulation
+/// like PUC Lua — if net delta from old_pc to new_pc is non-zero, line changed.
+fn changedline(proto: &selune_compiler::proto::Proto, old_pc: usize, new_pc: usize) -> bool {
+    if new_pc <= old_pc {
+        return false;
+    }
+    // Compare lines at old_pc and new_pc directly
+    proto.get_line(old_pc) != proto.get_line(new_pc)
 }
 
 /// Fire a hook event. `event` is "call", "return", "line", "count", "tail call".

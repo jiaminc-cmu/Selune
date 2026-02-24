@@ -1489,10 +1489,11 @@ fn native_string_format(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeEr
 // ---- Pattern functions ----
 
 fn native_string_find(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let (subject, _) = get_string_arg(ctx, 0, "find")?;
-    let (pat, _) = get_string_arg(ctx, 1, "find")?;
-    let subject = subject.to_vec();
-    let pat = pat.to_vec();
+    let (subject_ref, _) = get_string_arg(ctx, 0, "find")?;
+    let (pat_ref, _) = get_string_arg(ctx, 1, "find")?;
+    // Clone subject (needed for interning captures later); pattern only needs a slice for matching.
+    let subject = subject_ref.to_vec();
+    let pat = pat_ref.to_vec();
 
     let init = ctx
         .args
@@ -1563,12 +1564,33 @@ fn find_plain(subject: &[u8], pat: &[u8], start: usize) -> Option<usize> {
     if pat.is_empty() {
         return Some(start);
     }
-    if pat.len() > subject.len() {
+    let slen = subject.len();
+    let plen = pat.len();
+    if plen > slen || start > slen - plen {
         return None;
     }
-    for i in start..=subject.len() - pat.len() {
-        if subject[i..i + pat.len()] == *pat {
-            return Some(i);
+    // Fast path: scan for first byte, then compare rest.
+    let first = pat[0];
+    if plen == 1 {
+        // Single byte search — use memchr via iterator.
+        return subject[start..]
+            .iter()
+            .position(|&b| b == first)
+            .map(|p| p + start);
+    }
+    let mut i = start;
+    let end = slen - plen;
+    while i <= end {
+        // Scan for first byte match using a fast byte search.
+        if let Some(offset) = subject[i..=end].iter().position(|&b| b == first) {
+            i += offset;
+            // Compare remaining bytes.
+            if subject[i + 1..i + plen] == pat[1..] {
+                return Some(i);
+            }
+            i += 1;
+        } else {
+            return None;
         }
     }
     None
@@ -1718,9 +1740,6 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         .as_full_integer(ctx.gc)
         .unwrap_or(0);
 
-    let subject = ctx.strings.get_bytes(subj_sid).to_vec();
-    let pat = ctx.strings.get_bytes(pat_sid).to_vec();
-
     let mut src = if pos >= 1 { (pos as usize) - 1 } else { 0 };
     let lastmatch: Option<usize> = if lastmatch_val > 0 {
         Some((lastmatch_val - 1) as usize)
@@ -1728,65 +1747,94 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         None
     };
 
-    let anchor = !pat.is_empty() && pat[0] == b'^';
-    let match_pat = if anchor { &pat[1..] } else { &pat };
+    // Phase 1: Match using borrowed string data (no cloning of subject/pattern).
+    // We borrow subject and pattern from ctx.strings, do all matching, save the
+    // capture indices, then drop the borrows before interning results.
+    type MatchResult = Result<Option<(usize, Vec<(usize, usize)>)>, String>;
+    let match_result: MatchResult = {
+        let subject = ctx.strings.get_bytes(subj_sid);
+        let pat = ctx.strings.get_bytes(pat_sid);
 
-    // Search forward from src, using lastmatch to avoid repeated empty matches
-    loop {
-        if src > subject.len() {
-            return Ok(vec![TValue::nil()]);
-        }
+        let anchor = !pat.is_empty() && pat[0] == b'^';
+        let match_pat = if anchor { &pat[1..] } else { pat };
 
-        // Try to match at position src
-        let mut matcher = pattern::PatternMatcher::new(&subject, match_pat);
-        let ms = matcher.try_match_at(src).map_err(NativeError::String)?;
-        if let Some(ms) = ms {
-            let (_match_start, match_end) = ms.captures[0];
+        let mut matcher = pattern::PatternMatcher::new(subject, match_pat);
+        let mut result: MatchResult = Ok(None);
 
-            // Guard against repeated empty match at same position
-            if match_end == src && lastmatch == Some(match_end) {
-                // Skip: advance past this position
-                if src < subject.len() {
-                    src += 1;
-                    if anchor {
-                        return Ok(vec![TValue::nil()]);
-                    }
-                    continue;
-                } else {
-                    return Ok(vec![TValue::nil()]);
-                }
+        loop {
+            if src > subject.len() {
+                break;
             }
 
+            match matcher.try_match_at(src) {
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+                Ok(Some(ms)) => {
+                    let (_match_start, match_end) = ms.captures[0];
+
+                    // Guard against repeated empty match at same position
+                    if match_end == src && lastmatch == Some(match_end) {
+                        if src < subject.len() {
+                            src += 1;
+                            if anchor {
+                                break;
+                            }
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Save captures and match_end — we'll intern strings later
+                    result = Ok(Some((match_end, ms.captures)));
+                    break;
+                }
+                Ok(None) => {
+                    if anchor || src >= subject.len() {
+                        break;
+                    }
+                    src += 1;
+                }
+            }
+        }
+        result
+    };
+    // Borrows on ctx.strings are now dropped.
+
+    // Phase 2: Convert match result to TValues (needs &mut ctx.strings for interning).
+    match match_result {
+        Err(e) => Err(NativeError::String(e)),
+        Ok(None) => Ok(vec![TValue::nil()]),
+        Ok(Some((match_end, captures))) => {
             // Update state: new pos (1-based) and lastmatch (1-based)
             let new_pos = TValue::from_full_integer((match_end + 1) as i64, ctx.gc);
             ctx.gc.get_table_mut(state_idx).raw_seti(3, new_pos);
             let new_lastmatch = TValue::from_full_integer((match_end + 1) as i64, ctx.gc);
             ctx.gc.get_table_mut(state_idx).raw_seti(4, new_lastmatch);
 
-            if ms.captures.len() <= 1 {
-                let slice = &subject[src..match_end];
-                let sid = ctx.strings.intern_or_create(slice);
-                return Ok(vec![TValue::from_string_id(sid)]);
+            if captures.len() <= 1 {
+                // No explicit captures — return full match.
+                // Clone only the matched slice (not the whole subject).
+                let slice = ctx.strings.get_bytes(subj_sid)[src..match_end].to_vec();
+                let sid = ctx.strings.intern_or_create(&slice);
+                Ok(vec![TValue::from_string_id(sid)])
             } else {
+                // Return explicit captures
                 let mut results = Vec::new();
-                for i in 1..ms.captures.len() {
-                    let (cs, ce) = ms.captures[i];
+                for &(cs, ce) in captures.iter().skip(1) {
                     if ce == CAP_POSITION {
                         results.push(TValue::from_full_integer((cs + 1) as i64, ctx.gc));
                     } else {
-                        let slice = &subject[cs..ce];
-                        let sid = ctx.strings.intern_or_create(slice);
+                        // Clone only this capture's bytes (not the whole subject).
+                        let slice = ctx.strings.get_bytes(subj_sid)[cs..ce].to_vec();
+                        let sid = ctx.strings.intern_or_create(&slice);
                         results.push(TValue::from_string_id(sid));
                     }
                 }
-                return Ok(results);
+                Ok(results)
             }
-        } else {
-            // No match at src — advance
-            if anchor || src >= subject.len() {
-                return Ok(vec![TValue::nil()]);
-            }
-            src += 1;
         }
     }
 }

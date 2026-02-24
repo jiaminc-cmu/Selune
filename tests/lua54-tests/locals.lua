@@ -781,8 +781,6 @@ if rawget(_G, "T") then
 end
 
 
--- [Selune] skip: debug.sethook not yet implemented
---[[
 do   -- '__close' vs. return hooks in Lua functions
   local trace = {}
 
@@ -808,7 +806,6 @@ do   -- '__close' vs. return hooks in Lua functions
   checktable(trace,
     {"return sethook", "return close", "x", "return close", "return foo"})
 end
---]]
 
 
 print "to-be-closed variables in coroutines"

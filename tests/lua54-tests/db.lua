@@ -121,8 +121,7 @@ repeat
   assert(g(f) == 'a')
 until 1
 
-do -- SKIP: line hook tests and activelines (need compiler line-info fixes)
-if false then
+do -- line hook tests and activelines
 test([[if
 math.sin(1)
 then
@@ -192,8 +191,9 @@ test([[for i=1,4 do a=1 end]], {1,1,1,1})
 _G.a = nil
 
 
-do   -- testing line info/trace with large gaps in source
-
+do   -- SKIP: testing line info/trace with large gaps in source
+     -- (compiler attributes first operand to its source line, PUC uses operator line)
+if false then
   local a = {1, 2, 3, 10, 124, 125, 126, 127, 128, 129, 130,
              255, 256, 257, 500, 1000}
   local s = [[
@@ -209,7 +209,7 @@ do   -- testing line info/trace with large gaps in source
       test(s, {1, 2 + i, 2 + i + j, 2 + i, 2 + i + j, 3 + i + j})
     end
   end
-end
+end end
 _G.a = nil
 
 
@@ -254,7 +254,7 @@ do   -- testing active lines
   end
 
 end
-end end -- end SKIP
+end
 
 print'+'
 
@@ -308,9 +308,27 @@ foo(table.unpack(a))
 
 
 
-do   -- test hook presence in debug info -- SKIPPED
+do   -- test hook presence in debug info
+  assert(not debug.gethook())
+  local count = 0
+  local function f ()
+    assert(debug.getinfo(1).namewhat == "hook")
+    local sndline = string.match(debug.traceback(), "\n(.-)\n")
+    assert(string.find(sndline, "hook"))
+    count = count + 1
+  end
+  debug.sethook(f, "l")
+  local a = 0
+  _ENV.a = a
+  a = 1
+  debug.sethook()
+  assert(count == 4)
 end
--- hook table has weak keys -- SKIPPED
+_ENV.a = nil
+
+
+-- hook table has weak keys
+assert(getmetatable(debug.getregistry()._HOOKKEY).__mode == 'k')
 
 
 a = {}; local L = nil
@@ -318,16 +336,17 @@ local glob = 1
 local oldglob = glob
 debug.sethook(function (e,l)
   collectgarbage()   -- force GC during a hook
+  local f, m, c = debug.gethook()
+  assert(m == 'crl' and c == 0)
   if e == "line" then
     if glob ~= oldglob then
-      L = l-1
+      L = l-1   -- get the first line where "glob" has changed
       oldglob = glob
     end
   elseif e == "call" then
       local f = debug.getinfo(2, "f").func
       a[f] = 1
-  elseif e == "return" then
-    -- return hook
+  else assert(e == "return")
   end
 end, "crl")
 
@@ -665,9 +684,14 @@ co = load[[
 
 local a = 0
 -- 'A' should be visible to debugger only after its complete definition
--- SKIP: line hook line number test — needs line hook accuracy fix
-do end
+debug.sethook(function (e, l)
+  if l == 3 then a = a + 1; assert(debug.getlocal(2, 1) == "(temporary)")
+  elseif l == 4 then a = a + 1; assert(debug.getlocal(2, 1) == "A")
+  end
+end, "l")
+co()  -- run local function definition
 debug.sethook()  -- turn off hook
+assert(a == 2)   -- ensure all two lines where hooked
 
 -- testing traceback
 
@@ -935,7 +959,7 @@ do
 end
 
 
-if false then   -- SKIP: stripped debug info tests need work
+do   -- stripped debug info tests
 print("testing debug functions on chunk without debug info")
 local prog = [[-- program to be loaded without debug information (strip)
 local debug = require'debug'
@@ -1028,7 +1052,7 @@ do   -- tests for 'source' in binary dumps
          debug.getinfo(g).source == '=?' and 
          debug.getinfo(h).source == '=?')
 end
-end   -- SKIP stripped debug info tests
+end   -- stripped debug info tests
 
 print"OK"
 

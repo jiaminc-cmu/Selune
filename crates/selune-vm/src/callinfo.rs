@@ -64,6 +64,11 @@ pub struct CallInfo {
     pub ftransfer: u16,
     /// Number of transferred values for call/return hook inspection.
     pub ntransfer: u16,
+    /// Saved hook_last_line from caller frame (restored on return).
+    pub saved_hook_line: i32,
+    /// Whether this frame is a __close (TBC) metamethod call.
+    /// Used by debug.getinfo to report name="close", namewhat="metamethod".
+    pub is_tbc_close: bool,
 }
 
 impl CallInfo {
@@ -84,6 +89,8 @@ impl CallInfo {
             is_tail_call: false,
             ftransfer: 0,
             ntransfer: 0,
+            saved_hook_line: -1,
+            is_tbc_close: false,
         }
     }
 }

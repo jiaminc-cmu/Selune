@@ -12,10 +12,6 @@ mt.__index = nil
 
 local function checkerr (msg, f, ...)
   local st, err = pcall(f, ...)
-  if st or not string.find(err, msg) then
-    print("CHECKERR FAILED: msg=" .. tostring(msg))
-    print("  st=" .. tostring(st) .. " err=" .. tostring(err))
-  end
   assert(not st and string.find(err, msg))
 end
 
@@ -31,14 +27,6 @@ end
 local function checkmessage (prog, msg, debug)
   local m = doit(prog)
   if debug then print(m, msg) end
-  if type(m) ~= "string" then
-    print("CHECKMESSAGE: doit returned " .. type(m) .. " for prog=" .. prog:sub(1,80))
-    print("  expected error containing: " .. msg)
-  elseif not string.find(m, msg, 1, true) then
-    print("CHECKMESSAGE MISMATCH: prog=" .. prog:sub(1,80))
-    print("  expected: " .. msg)
-    print("  got: " .. m)
-  end
   assert(string.find(m, msg, 1, true))
 end
 
@@ -375,7 +363,6 @@ local function f (n)
   return b
 end
 assert(string.find(f(), "C stack overflow"))
-print("DBG: after coro test, doit type=", type(doit))
 
 checkmessage("coroutine.yield()", "outside a coroutine")
 
