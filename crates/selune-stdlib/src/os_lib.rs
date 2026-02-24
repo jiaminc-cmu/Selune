@@ -76,18 +76,57 @@ fn native_os_time(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     } else if let Some(tbl_idx) = arg.as_table_idx() {
         // Construct time from table fields: year, month, day, hour, min, sec
         let year = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "year")?
-            .ok_or_else(|| NativeError::String("field 'year' missing from date table".into()))?;
+            .ok_or_else(|| NativeError::String("field 'year' is missing in date table".into()))?;
         let month = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "month")?
-            .ok_or_else(|| NativeError::String("field 'month' missing from date table".into()))?;
+            .ok_or_else(|| NativeError::String("field 'month' is missing in date table".into()))?;
         let day = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "day")?
-            .ok_or_else(|| NativeError::String("field 'day' missing from date table".into()))?;
+            .ok_or_else(|| NativeError::String("field 'day' is missing in date table".into()))?;
         let hour = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "hour")?.unwrap_or(12);
         let min = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "min")?.unwrap_or(0);
         let sec = get_table_int_field(ctx.gc, ctx.strings, tbl_idx, "sec")?.unwrap_or(0);
 
+        // Validate field ranges (matching PUC Lua's struct tm int range checks)
+        let check_int_range = |val: i64, name: &str| -> Result<(), NativeError> {
+            if val < i32::MIN as i64 || val > i32::MAX as i64 {
+                Err(NativeError::String(format!(
+                    "field '{}' is out-of-bound", name
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        // year - 1900 must fit in i32 (tm_year)
+        let tm_year = year.checked_sub(1900).ok_or_else(|| {
+            NativeError::String("field 'year' is out-of-bound".to_string())
+        })?;
+        check_int_range(tm_year, "year")?;
+        // month - 1 must fit in i32 (tm_mon)
+        check_int_range(month - 1, "month")?;
+        check_int_range(day, "day")?;
+        check_int_range(hour, "hour")?;
+        check_int_range(min, "min")?;
+        check_int_range(sec, "sec")?;
+
         // Convert to Unix timestamp using a simplified calculation.
         // This handles dates from 1970 onwards correctly.
         let ts = datetime_to_timestamp(year, month, day, hour, min, sec);
+
+        // Normalize the table fields (PUC Lua 5.3.3+)
+        let norm = timestamp_to_datetime(ts);
+        let set_field = |gc: &mut GcHeap, strings: &mut StringInterner, name: &str, val: i64| {
+            let key = strings.intern(name.as_bytes());
+            let tval = TValue::from_full_integer(val, gc);
+            gc.get_table_mut(tbl_idx).raw_set_str(key, tval);
+        };
+        set_field(ctx.gc, ctx.strings, "year", norm.year);
+        set_field(ctx.gc, ctx.strings, "month", norm.month);
+        set_field(ctx.gc, ctx.strings, "day", norm.day);
+        set_field(ctx.gc, ctx.strings, "hour", norm.hour);
+        set_field(ctx.gc, ctx.strings, "min", norm.min);
+        set_field(ctx.gc, ctx.strings, "sec", norm.sec);
+        set_field(ctx.gc, ctx.strings, "wday", norm.wday);
+        set_field(ctx.gc, ctx.strings, "yday", norm.yday);
+
         Ok(vec![TValue::from_full_integer(ts, ctx.gc)])
     } else {
         Err(NativeError::String(
@@ -112,10 +151,17 @@ fn get_table_int_field(
         return Ok(Some(i));
     }
     if let Some(f) = val.as_float() {
-        return Ok(Some(f as i64));
+        // Only accept float if it's a whole integer value
+        if f == (f as i64 as f64) && f.is_finite() {
+            return Ok(Some(f as i64));
+        }
+        return Err(NativeError::String(format!(
+            "field '{}' is not an integer",
+            field
+        )));
     }
     Err(NativeError::String(format!(
-        "field '{}' is not a number",
+        "field '{}' is not an integer",
         field
     )))
 }
@@ -232,7 +278,8 @@ fn native_os_date(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     }
 
     // Format the date string
-    let result = format_date(format_str, &dt);
+    let result = format_date(format_str, &dt)
+        .map_err(|e| NativeError::String(e))?;
     let sid = ctx.strings.intern_or_create(result.as_bytes());
     Ok(vec![TValue::from_string_id(sid)])
 }
@@ -347,7 +394,7 @@ static MONTH_ABBR: [&str; 12] = [
 ];
 
 /// Format a date string using strftime-like format codes.
-fn format_date(fmt: &str, dt: &DateTime) -> String {
+fn format_date(fmt: &str, dt: &DateTime) -> Result<String, String> {
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
 
@@ -435,20 +482,20 @@ fn format_date(fmt: &str, dt: &DateTime) -> String {
                     'n' => result.push('\n'),
                     't' => result.push('\t'),
                     _ => {
-                        // Unknown specifier: output as-is
-                        result.push('%');
-                        result.push(spec);
+                        return Err(format!(
+                            "invalid conversion specifier '%{}'", spec
+                        ));
                     }
                 }
             } else {
-                result.push('%');
+                return Err("invalid conversion specifier '%'".to_string());
             }
         } else {
             result.push(c);
         }
     }
 
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

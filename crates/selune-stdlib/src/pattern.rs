@@ -458,13 +458,19 @@ impl<'a> Matcher<'a> {
     /// Returns `Some(end)` on success where `end` is the byte offset in subject
     /// just past the matched portion, or `None` on failure.
     fn match_pattern(&mut self, pattern: &[u8], si: usize) -> Option<usize> {
+        self.match_recurse(pattern, 0, si)
+    }
+
+    /// Recursive entry point — all "recursive" calls from quantifier/capture
+    /// helpers go through here so that depth is tracked correctly.
+    fn match_recurse(&mut self, pattern: &[u8], pp: usize, si: usize) -> Option<usize> {
         self.depth += 1;
         if self.depth > MAX_MATCH_DEPTH {
+            self.error = Some("pattern too complex".to_string());
             self.depth -= 1;
             return None;
         }
-
-        let result = self.match_inner(pattern, 0, si);
+        let result = self.match_inner(pattern, pp, si);
         self.depth -= 1;
         result
     }
@@ -611,8 +617,11 @@ impl<'a> Matcher<'a> {
         // Try matching the rest from the longest match downward.
         while count >= min_count {
             let saved_caps = self.caps.clone();
-            if let Some(end) = self.match_inner(pattern, rest_pp, si + count) {
+            if let Some(end) = self.match_recurse(pattern, rest_pp, si + count) {
                 return Some(end);
+            }
+            if self.error.is_some() {
+                return None;
             }
             self.caps = saved_caps;
             if count == 0 {
@@ -635,8 +644,11 @@ impl<'a> Matcher<'a> {
         let mut pos = si;
         loop {
             let saved_caps = self.caps.clone();
-            if let Some(end) = self.match_inner(pattern, rest_pp, pos) {
+            if let Some(end) = self.match_recurse(pattern, rest_pp, pos) {
                 return Some(end);
+            }
+            if self.error.is_some() {
+                return None;
             }
             self.caps = saved_caps;
             if pos < self.subject.len() && singlematch(pattern, pp, self.subject[pos]) {
@@ -659,13 +671,16 @@ impl<'a> Matcher<'a> {
         // Try with the element first (greedy).
         if si < self.subject.len() && singlematch(pattern, pp, self.subject[si]) {
             let saved_caps = self.caps.clone();
-            if let Some(end) = self.match_inner(pattern, rest_pp, si + 1) {
+            if let Some(end) = self.match_recurse(pattern, rest_pp, si + 1) {
                 return Some(end);
+            }
+            if self.error.is_some() {
+                return None;
             }
             self.caps = saved_caps;
         }
         // Try without the element.
-        self.match_inner(pattern, rest_pp, si)
+        self.match_recurse(pattern, rest_pp, si)
     }
 
     /// `%bxy` balanced match.
@@ -690,7 +705,7 @@ impl<'a> Matcher<'a> {
             if self.subject[pos] == close {
                 count -= 1;
                 if count == 0 {
-                    return self.match_inner(pattern, rest_pp, pos + 1);
+                    return self.match_recurse(pattern, rest_pp, pos + 1);
                 }
             } else if self.subject[pos] == open {
                 count += 1;
@@ -728,7 +743,7 @@ impl<'a> Matcher<'a> {
         let (curr_matches, _) = match_set(pattern, set_inner, curr_ch);
 
         if !prev_matches && curr_matches {
-            self.match_inner(pattern, rest_pp, si)
+            self.match_recurse(pattern, rest_pp, si)
         } else {
             None
         }
@@ -760,7 +775,7 @@ impl<'a> Matcher<'a> {
         }
         let idx = self.caps.len();
         self.caps.push(CapStatus::Open(si));
-        if let Some(end) = self.match_inner(pattern, rest_pp, si) {
+        if let Some(end) = self.match_recurse(pattern, rest_pp, si) {
             return Some(end);
         }
         // Backtrack: remove capture.
@@ -793,7 +808,7 @@ impl<'a> Matcher<'a> {
         };
         let saved = self.caps[idx];
         self.caps[idx] = CapStatus::Closed(start, si);
-        if let Some(end) = self.match_inner(pattern, rest_pp, si) {
+        if let Some(end) = self.match_recurse(pattern, rest_pp, si) {
             return Some(end);
         }
         // Backtrack.
@@ -813,7 +828,7 @@ impl<'a> Matcher<'a> {
         }
         let idx = self.caps.len();
         self.caps.push(CapStatus::Position(si));
-        if let Some(end) = self.match_inner(pattern, rest_pp, si) {
+        if let Some(end) = self.match_recurse(pattern, rest_pp, si) {
             return Some(end);
         }
         self.caps.truncate(idx);

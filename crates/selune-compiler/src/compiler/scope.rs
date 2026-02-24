@@ -325,8 +325,35 @@ impl ScopeManager {
         // Find the enclosing loop block
         let loop_block = self.blocks.iter().rev().find(|b| b.is_loop)?;
         let loop_entry_locals = loop_block.num_locals_on_entry;
+        // Also check the local just before the loop block entry — for-generic
+        // places its TBC local (base+3) in the parent scope so that
+        // block_has_close_var() won't emit a spurious Close every iteration,
+        // but break still needs to close it.
+        let scan_start = if loop_entry_locals > 0 {
+            let prev = &self.locals[loop_entry_locals - 1];
+            if prev.is_close { loop_entry_locals - 1 } else { loop_entry_locals }
+        } else {
+            loop_entry_locals
+        };
         let mut first_reg = None;
-        for local in &self.locals[loop_entry_locals..] {
+        for local in &self.locals[scan_start..] {
+            if local.is_close || local.is_captured {
+                match first_reg {
+                    None => first_reg = Some(local.reg),
+                    Some(r) if local.reg < r => first_reg = Some(local.reg),
+                    _ => {}
+                }
+            }
+        }
+        first_reg
+    }
+
+    /// Check if a forward goto needs a Close instruction.
+    /// Scans ALL locals currently in scope for TBC/captured variables.
+    /// Returns the lowest register that needs closing, if any.
+    pub fn goto_needs_close(&self) -> Option<u8> {
+        let mut first_reg = None;
+        for local in &self.locals {
             if local.is_close || local.is_captured {
                 match first_reg {
                     None => first_reg = Some(local.reg),

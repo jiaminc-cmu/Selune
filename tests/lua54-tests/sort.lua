@@ -190,7 +190,6 @@ checkerror("wrap around", table.move, {}, minI, -2, 2)
 
 print"testing sort"
 
-
 -- strange lengths
 local a = setmetatable({}, {__len = function () return -1 end})
 assert(#a == -1)

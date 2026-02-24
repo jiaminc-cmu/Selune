@@ -432,8 +432,8 @@ do   -- test reuse of original string in gsub
                             return x    -- substitution...
                           end)
   assert(count == 100)
-  -- no reuse in this case
-  assert(r == s and string.format("%p", s) ~= string.format("%p", r))
+  -- no reuse in this case (Selune interns all strings, so %p may be equal)
+  assert(r == s)
 end
 
 print('OK')

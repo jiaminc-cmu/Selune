@@ -15,10 +15,11 @@ pub enum CallStatus {
         result_base: usize,
         num_results: i32,
     },
-    /// Yielded through xpcall — same as PcallYield.
+    /// Yielded through xpcall — includes error handler.
     XpcallYield {
         result_base: usize,
         num_results: i32,
+        handler: TValue,
     },
     /// Yielded during __close in a Return handler.
     /// On resume, after all __close calls complete, finish the return.
@@ -55,6 +56,14 @@ pub struct CallInfo {
     pub tbc_slots: Vec<usize>,
     /// Call status for yield across pcall/xpcall boundaries.
     pub call_status: CallStatus,
+    /// Whether this frame was pushed by the hook dispatcher.
+    pub is_hook_call: bool,
+    /// Whether this frame was entered via a tail call.
+    pub is_tail_call: bool,
+    /// First transferred local (1-based) for call/return hook inspection.
+    pub ftransfer: u16,
+    /// Number of transferred values for call/return hook inspection.
+    pub ntransfer: u16,
 }
 
 impl CallInfo {
@@ -71,6 +80,10 @@ impl CallInfo {
             tail_count: 0,
             tbc_slots: Vec::new(),
             call_status: CallStatus::Normal,
+            is_hook_call: false,
+            is_tail_call: false,
+            ftransfer: 0,
+            ntransfer: 0,
         }
     }
 }

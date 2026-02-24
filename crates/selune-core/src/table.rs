@@ -284,9 +284,61 @@ impl Table {
         }
     }
 
+    /// Clear weak entries: remove entries with dead keys/values.
+    /// `is_dead` returns true if the TValue is a collectable GC object that is unmarked.
+    pub fn clear_weak_entries<F>(&mut self, weak_keys: bool, weak_values: bool, is_dead: &F)
+    where
+        F: Fn(TValue) -> bool,
+    {
+        if weak_values {
+            // Clear dead values in array part (set to nil)
+            for v in self.array.iter_mut() {
+                if !v.is_nil() && is_dead(*v) {
+                    *v = TValue::nil();
+                }
+            }
+            // Trim trailing nils from array
+            while self.array.last().map_or(false, |v| v.is_nil()) {
+                self.array.pop();
+            }
+        }
+        // Clear dead keys/values in hash part
+        let mut to_remove = Vec::new();
+        for (k, v) in self.hash.iter() {
+            let key_dead = weak_keys && match k {
+                TableKey::GcPtr(bits) => is_dead(TValue::from_raw_bits(*bits)),
+                _ => false,
+            };
+            let val_dead = weak_values && !v.is_nil() && is_dead(*v);
+            if key_dead || val_dead {
+                to_remove.push(*k);
+            }
+        }
+        for k in to_remove {
+            self.hash.shift_remove(&k);
+        }
+    }
+
     /// Iterate over all values in the array part (for GC traversal).
     pub fn array_values(&self) -> &[TValue] {
         &self.array
+    }
+
+    /// Mutable access to array values (for GC weak table clearing).
+    pub fn array_values_mut(&mut self) -> &mut [TValue] {
+        &mut self.array
+    }
+
+    /// Remove a hash entry by key (for GC weak table clearing).
+    pub fn remove_hash_entry(&mut self, key: &TableKey) {
+        self.hash.shift_remove(key);
+    }
+
+    /// Trim trailing nil values from the array part.
+    pub fn trim_array(&mut self) {
+        while self.array.last().map_or(false, |v| v.is_nil()) {
+            self.array.pop();
+        }
     }
 
     /// Iterate over all key-value pairs in the hash part (for GC traversal).

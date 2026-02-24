@@ -5,6 +5,7 @@ use crate::dispatch;
 use crate::error::LuaError;
 use crate::metamethod::MetamethodNames;
 use selune_compiler::proto::Proto;
+use selune_compiler::opcode::OpCode;
 use selune_core::gc::{
     GcHeap, GcIdx, NativeContext, NativeError, NativeFunction, UpVal, UpValLocation,
 };
@@ -21,6 +22,18 @@ pub struct LuaThread {
     pub status: CoroutineStatus,
     /// Thread ID for this saved state (usize::MAX = main thread, otherwise coroutine index).
     pub thread_id: usize,
+    /// Per-coroutine hook function.
+    pub hook_func: TValue,
+    /// Per-coroutine hook mask.
+    pub hook_mask: u8,
+    /// Per-coroutine hook count.
+    pub hook_count: u32,
+    /// Per-coroutine hook counter.
+    pub hook_counter: u32,
+    /// Per-coroutine hooks active flag.
+    pub hooks_active: bool,
+    /// Per-coroutine hook last line.
+    pub hook_last_line: i32,
 }
 
 /// Coroutine lifecycle states.
@@ -144,8 +157,46 @@ pub struct Vm {
     pub table_unpack_idx: Option<GcIdx<NativeFunction>>,
     /// Depth counter for __close metamethod calls (for debug.traceback).
     pub in_tbc_close: u32,
+    /// Depth counter for unyieldable native calls (e.g., inside string.gsub callback).
+    pub nonyieldable_depth: u32,
     /// Set when an error originated from a __close metamethod (for traceback).
     pub last_error_from_close: bool,
+    /// Stable main thread handle (coroutine-style table with thread metatable).
+    pub main_thread_handle: Option<GcIdx<selune_core::table::Table>>,
+    /// Handle table for the currently running coroutine (set during resume).
+    pub running_coro_handle: Option<GcIdx<selune_core::table::Table>>,
+    /// Native index for coroutine.isyieldable (needs VM access).
+    pub coro_isyieldable_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for coroutine.close (needs VM access for TBC __close).
+    pub coro_close_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.sethook.
+    pub debug_sethook_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.gethook.
+    pub debug_gethook_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.getlocal.
+    pub debug_getlocal_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.setlocal.
+    pub debug_setlocal_idx: Option<GcIdx<NativeFunction>>,
+    /// Native index for debug.getregistry.
+    pub debug_getregistry_idx: Option<GcIdx<NativeFunction>>,
+    /// Hook function (nil = no hook).
+    pub hook_func: TValue,
+    /// Hook mask: HOOK_CALL=1, HOOK_RETURN=2, HOOK_LINE=4, HOOK_COUNT=8.
+    pub hook_mask: u8,
+    /// Hook count threshold (for count hooks).
+    pub hook_count: u32,
+    /// Hook counter (counts down from hook_count).
+    pub hook_counter: u32,
+    /// Whether hooks are active (fast-path check in dispatch loop).
+    pub hooks_active: bool,
+    /// Last line reported by a line hook (to avoid duplicate events).
+    pub hook_last_line: i32,
+    /// Flag to prevent recursive hooks.
+    pub in_hook: bool,
+    /// Flag to mark the next pushed call frame as a hook call.
+    pub pending_hook_call: bool,
+    /// Registry table for debug.getregistry().
+    pub registry_idx: Option<GcIdx<selune_core::table::Table>>,
 }
 
 /// Format a source name for error messages (matching PUC Lua behavior).
@@ -245,7 +296,26 @@ impl Vm {
             table_concat_idx: None,
             table_unpack_idx: None,
             in_tbc_close: 0,
+            nonyieldable_depth: 0,
             last_error_from_close: false,
+            main_thread_handle: None,
+            running_coro_handle: None,
+            coro_isyieldable_idx: None,
+            coro_close_idx: None,
+            debug_sethook_idx: None,
+            debug_gethook_idx: None,
+            debug_getlocal_idx: None,
+            debug_setlocal_idx: None,
+            debug_getregistry_idx: None,
+            hook_func: TValue::nil(),
+            hook_mask: 0,
+            hook_count: 0,
+            hook_counter: 0,
+            hooks_active: false,
+            hook_last_line: -1,
+            in_hook: false,
+            pending_hook_call: false,
+            registry_idx: None,
         }
     }
 
@@ -303,13 +373,28 @@ impl Vm {
         self.debug_setupvalue_idx = Some(stdlib_indices.debug_setupvalue_idx);
         self.debug_getinfo_idx = Some(stdlib_indices.debug_getinfo_idx);
         self.debug_traceback_idx = Some(stdlib_indices.debug_traceback_idx);
+        self.debug_sethook_idx = Some(stdlib_indices.debug_sethook_idx);
+        self.debug_gethook_idx = Some(stdlib_indices.debug_gethook_idx);
+        self.debug_getlocal_idx = Some(stdlib_indices.debug_getlocal_idx);
+        self.debug_setlocal_idx = Some(stdlib_indices.debug_setlocal_idx);
+        self.debug_getregistry_idx = Some(stdlib_indices.debug_getregistry_idx);
         self.coro_running_idx = Some(stdlib_indices.coro_running_idx);
+        self.coro_isyieldable_idx = Some(stdlib_indices.coro_isyieldable_idx);
+        self.coro_close_idx = Some(stdlib_indices.coro_close_idx);
         self.string_format_idx = Some(stdlib_indices.string_format_idx);
         self.string_dump_idx = Some(stdlib_indices.string_dump_idx);
         self.table_insert_idx = Some(stdlib_indices.table_insert_idx);
         self.table_remove_idx = Some(stdlib_indices.table_remove_idx);
         self.table_concat_idx = Some(stdlib_indices.table_concat_idx);
         self.table_unpack_idx = Some(stdlib_indices.table_unpack_idx);
+
+        // Create main thread handle (stable identity for coroutine.running() in main thread)
+        let main_handle = self.gc.alloc_table(4, 0);
+        self.gc.get_table_mut(main_handle).raw_seti(1, TValue::from_integer(-2)); // special marker for main thread
+        let running_sid = self.strings.intern(b"running");
+        self.gc.get_table_mut(main_handle).raw_seti(3, TValue::from_string_id(running_sid));
+        self.gc.get_table_mut(main_handle).metatable = self.gc.thread_metatable;
+        self.main_thread_handle = Some(main_handle);
 
         // Create string metatable with __index = string library table
         let string_mt = self.gc.alloc_table(0, 4);
@@ -350,9 +435,16 @@ impl Vm {
         name: &str,
         env: Option<TValue>,
     ) -> Result<TValue, String> {
+        // Detect binary chunk (starts with \x1bLua signature)
+        if source.starts_with(b"\x1bLua") {
+            return self.load_binary_chunk(source, name, env);
+        }
+
+        let compile_source = source;
+
         // Take ownership of strings for compilation, then put them back
         let strings = std::mem::take(&mut self.strings);
-        let (result, strings) = selune_compiler::compiler::compile_with_strings(source, name, strings);
+        let (result, strings) = selune_compiler::compiler::compile_with_strings(compile_source, name, strings);
         self.strings = strings;
         let proto = result.map_err(|e| {
             // Format: "source:line: message" matching PUC Lua error format
@@ -695,6 +787,12 @@ impl Vm {
             open_upvals: Vec::new(),
             status: CoroutineStatus::Suspended,
             thread_id: id,
+            hook_func: TValue::nil(),
+            hook_mask: 0,
+            hook_count: 0,
+            hook_counter: 0,
+            hooks_active: false,
+            hook_last_line: -1,
         };
         // Place the function at R[0]
         thread.stack[0] = func;
@@ -741,6 +839,12 @@ impl Vm {
             open_upvals: self.open_upvals.clone(),
             status: CoroutineStatus::Normal, // caller becomes Normal while waiting
             thread_id,
+            hook_func: self.hook_func,
+            hook_mask: self.hook_mask,
+            hook_count: self.hook_count,
+            hook_counter: self.hook_counter,
+            hooks_active: self.hooks_active,
+            hook_last_line: self.hook_last_line,
         }
     }
 
@@ -750,6 +854,12 @@ impl Vm {
         self.call_stack = thread.call_stack;
         self.stack_top = thread.stack_top;
         self.open_upvals = thread.open_upvals;
+        self.hook_func = thread.hook_func;
+        self.hook_mask = thread.hook_mask;
+        self.hook_count = thread.hook_count;
+        self.hook_counter = thread.hook_counter;
+        self.hooks_active = thread.hooks_active;
+        self.hook_last_line = thread.hook_last_line;
     }
 
     /// Save the current running state back into the coroutine slot.
@@ -758,6 +868,12 @@ impl Vm {
         self.coroutines[coro_id].call_stack = self.call_stack.clone();
         self.coroutines[coro_id].stack_top = self.stack_top;
         self.coroutines[coro_id].open_upvals = self.open_upvals.clone();
+        self.coroutines[coro_id].hook_func = self.hook_func;
+        self.coroutines[coro_id].hook_mask = self.hook_mask;
+        self.coroutines[coro_id].hook_count = self.hook_count;
+        self.coroutines[coro_id].hook_counter = self.hook_counter;
+        self.coroutines[coro_id].hooks_active = self.hooks_active;
+        self.coroutines[coro_id].hook_last_line = self.hook_last_line;
     }
 
     // ---- Garbage Collection ----
@@ -766,6 +882,9 @@ impl Vm {
     pub fn gc_collect(&mut self) -> usize {
         // Phase 1: Prepare mark bits
         self.gc.gc_prepare_marks();
+
+        // Phase 1b: Classify weak tables (read __mode from metatables)
+        self.classify_weak_tables();
 
         // Phase 2: Mark roots
         self.gc_mark_roots();
@@ -778,22 +897,291 @@ impl Vm {
             }
         }
 
-        // Phase 4: Sweep
-        self.gc.gc_sweep()
+        // Phase 3b: Ephemeron loop — mark values of ephemeron entries whose keys became marked
+        loop {
+            if !self.gc.gc_propagate_ephemerons() {
+                break;
+            }
+            // Re-propagate any newly marked objects
+            loop {
+                let work = self.gc.gc_propagate();
+                if work == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Phase 3c: Identify finalizable objects (unmarked with __gc) — resurrect them
+        self.identify_finalizable_objects();
+
+        // Phase 3d: Re-propagate finalizable objects' transitive closure
+        loop {
+            let work = self.gc.gc_propagate();
+            if work == 0 {
+                break;
+            }
+        }
+
+        // Phase 4: Clear weak tables (remove entries referencing dead objects)
+        self.gc.gc_clear_weak_tables();
+
+        // Phase 5: Sweep
+        let freed = self.gc.gc_sweep();
+
+        // Phase 6: Run finalizers
+        self.run_finalizers();
+
+        freed
+    }
+
+    /// Classify weak tables: scan all marked tables for __mode metatable field.
+    fn classify_weak_tables(&mut self) {
+        let mode_sid = self.strings.intern(b"__mode");
+        for i in 0..self.gc.tables.len() {
+            if self.gc.tables[i].is_none() { continue; }
+            let mt_idx = match self.gc.tables[i].as_ref().unwrap().metatable {
+                Some(idx) => idx,
+                None => continue,
+            };
+            // Read __mode from metatable
+            let mode_val = self.gc.get_table(mt_idx).raw_get_str(mode_sid);
+            if let Some(sid) = mode_val.as_string_id() {
+                let bytes = self.strings.get_bytes(sid);
+                let mut weak_k = false;
+                let mut weak_v = false;
+                for &b in bytes {
+                    if b == b'k' { weak_k = true; }
+                    if b == b'v' { weak_v = true; }
+                }
+                if i < self.gc.gc_state.table_weak_keys.len() {
+                    self.gc.gc_state.table_weak_keys[i] = weak_k;
+                }
+                if i < self.gc.gc_state.table_weak_values.len() {
+                    self.gc.gc_state.table_weak_values[i] = weak_v;
+                }
+            }
+        }
+    }
+
+    /// Identify unmarked objects with __gc metamethods — resurrect them for finalization.
+    fn identify_finalizable_objects(&mut self) {
+        let gc_sid = self.strings.intern(b"__gc");
+
+        // Check unmarked tables with __gc in their metatable
+        for i in 0..self.gc.tables.len() {
+            if self.gc.tables[i].is_none() { continue; }
+            if i < self.gc.gc_state.table_marks.len() && self.gc.gc_state.table_marks[i] { continue; } // already marked
+            if i < self.gc.gc_state.table_finalized.len() && self.gc.gc_state.table_finalized[i] { continue; } // already finalized
+
+            let mt_idx = match self.gc.tables[i].as_ref().unwrap().metatable {
+                Some(idx) => idx,
+                None => continue,
+            };
+            let gc_val = self.gc.get_table(mt_idx).raw_get_str(gc_sid);
+            if gc_val.is_nil() { continue; }
+
+            // Resurrect: mark the table alive and add to finalization queue
+            if i < self.gc.gc_state.table_marks.len() {
+                self.gc.gc_state.table_marks[i] = true;
+                self.gc.gc_state.gray_tables.push(i as u32);
+            }
+            // Also mark the metatable so __gc can be called
+            let mt_i = mt_idx.0 as usize;
+            if mt_i < self.gc.gc_state.table_marks.len() && !self.gc.gc_state.table_marks[mt_i] {
+                self.gc.gc_state.table_marks[mt_i] = true;
+                self.gc.gc_state.gray_tables.push(mt_idx.0);
+            }
+            self.gc.gc_state.finalization_queue.push(TValue::from_table(
+                selune_core::gc::GcIdx(i as u32, std::marker::PhantomData),
+            ));
+        }
+
+        // Check unmarked userdata with __gc in their metatable
+        for i in 0..self.gc.userdata.len() {
+            if self.gc.userdata[i].is_none() { continue; }
+            if i < self.gc.gc_state.userdata_marks.len() && self.gc.gc_state.userdata_marks[i] { continue; }
+            if i < self.gc.gc_state.userdata_finalized.len() && self.gc.gc_state.userdata_finalized[i] { continue; }
+
+            let mt_idx = match self.gc.userdata[i].as_ref().unwrap().metatable {
+                Some(idx) => idx,
+                None => continue,
+            };
+            let gc_val = self.gc.get_table(mt_idx).raw_get_str(gc_sid);
+            if gc_val.is_nil() { continue; }
+
+            // Resurrect
+            if i < self.gc.gc_state.userdata_marks.len() {
+                self.gc.gc_state.userdata_marks[i] = true;
+                self.gc.gc_state.gray_userdata.push(i as u32);
+            }
+            let mt_i = mt_idx.0 as usize;
+            if mt_i < self.gc.gc_state.table_marks.len() && !self.gc.gc_state.table_marks[mt_i] {
+                self.gc.gc_state.table_marks[mt_i] = true;
+                self.gc.gc_state.gray_tables.push(mt_idx.0);
+            }
+            self.gc.gc_state.finalization_queue.push(TValue::from_userdata(
+                selune_core::gc::GcIdx(i as u32, std::marker::PhantomData),
+            ));
+        }
+    }
+
+    /// Run __gc finalizers for objects in the finalization queue (LIFO order).
+    fn run_finalizers(&mut self) {
+        let queue: Vec<TValue> = self.gc.gc_state.finalization_queue.drain(..).collect();
+        // Run in reverse (LIFO) order
+        for obj in queue.iter().rev() {
+            let gc_sid = self.strings.intern(b"__gc");
+            // Look up __gc in the object's metatable
+            let gc_func = if let Some(table_idx) = obj.as_table_idx() {
+                let i = table_idx.0 as usize;
+                // Mark as finalized
+                if i < self.gc.gc_state.table_finalized.len() {
+                    self.gc.gc_state.table_finalized[i] = true;
+                }
+                let mt_idx = match self.gc.get_table(table_idx).metatable {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                self.gc.get_table(mt_idx).raw_get_str(gc_sid)
+            } else if let Some(ud_idx) = obj.as_userdata_idx() {
+                let i = ud_idx.0 as usize;
+                if i < self.gc.gc_state.userdata_finalized.len() {
+                    self.gc.gc_state.userdata_finalized[i] = true;
+                }
+                let mt_idx = match self.gc.get_userdata(ud_idx).metatable {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                self.gc.get_table(mt_idx).raw_get_str(gc_sid)
+            } else {
+                continue;
+            };
+
+            // Skip if __gc is not callable (e.g., `true` sentinel)
+            if gc_func.as_closure_idx().is_none() && gc_func.as_native_idx().is_none() {
+                // Also check for __call metamethod on the gc_func
+                if gc_func.as_table_idx().is_none() {
+                    continue;
+                }
+            }
+
+            // Call the finalizer, catching any errors (like pcall)
+            let _ = dispatch::call_function(self, gc_func, &[*obj]);
+        }
     }
 
     /// Mark all GC roots: stack values, call frame closures, _ENV, open upvalues,
     /// coroutine stacks, and registered native indices.
+    /// Compute the highest live register (relative to base) for a Lua frame
+    /// at the given PC, using local_vars debug info.
+    fn frame_max_live_reg(proto: &Proto, pc: u32) -> usize {
+        let mut max_live: usize = 0;
+        for lv in &proto.local_vars {
+            if pc >= lv.start_pc && pc < lv.end_pc {
+                let r = lv.reg as usize + 1;
+                if r > max_live { max_live = r; }
+            }
+        }
+        max_live
+    }
+
     fn gc_mark_roots(&mut self) {
-        // Mark running thread's stack
-        let top = self.stack_top.max(
-            self.call_stack
-                .last()
-                .map_or(0, |ci| ci.base + 256 /* max_stack approx */),
-        );
-        for i in 0..top.min(self.stack.len()) {
-            let val = self.stack[i];
-            self.gc.gc_mark_value(val);
+        // Precise per-frame stack marking: only mark live registers per frame.
+        // This prevents dead for-loop body locals from keeping objects alive
+        // in weak tables, matching PUC Lua's precise L->top behavior.
+        let num_frames = self.call_stack.len();
+        for frame_idx in 0..num_frames {
+            let ci = &self.call_stack[frame_idx];
+            let base = ci.base;
+            let is_topmost = frame_idx == num_frames - 1;
+
+            // Always mark the function slot
+            if ci.func_stack_idx < self.stack.len() {
+                self.gc.gc_mark_value(self.stack[ci.func_stack_idx]);
+            }
+
+            // Mark TBC slots (may be in "dead" registers during __close processing)
+            for &slot in &ci.tbc_slots {
+                if slot < self.stack.len() {
+                    self.gc.gc_mark_value(self.stack[slot]);
+                }
+            }
+
+            // Get closure and proto for Lua frames
+            let cl_idx = match ci.closure_idx {
+                Some(idx) => idx,
+                None => continue, // native frame — func_stack_idx already marked
+            };
+            let proto_idx = match self.gc.closures[cl_idx.0 as usize].as_ref() {
+                Some(cl) => cl.proto_idx,
+                None => continue,
+            };
+            if proto_idx >= self.protos.len() { continue; }
+            let proto = &self.protos[proto_idx];
+            let pc = if ci.pc > 0 { ci.pc as u32 - 1 } else { 0 };
+
+            // Mark live locals at current PC
+            let max_live = Self::frame_max_live_reg(proto, pc);
+            for r in 0..max_live {
+                let abs = base + r;
+                if abs < self.stack.len() {
+                    self.gc.gc_mark_value(self.stack[abs]);
+                }
+            }
+
+            if !is_topmost {
+                // Non-topmost frame: suspended at a Call/TailCall.
+                // Mark the call setup area (function + args) between this frame's
+                // live locals and the next frame's base.
+                let next_ci = &self.call_stack[frame_idx + 1];
+                let call_setup_start = base + max_live;
+                let call_setup_end = next_ci.base;
+                // Also include func_stack_idx of the next frame and any vararg area
+                let protect_end = call_setup_end.max(next_ci.func_stack_idx + 1);
+                for abs in call_setup_start..protect_end.min(self.stack.len()) {
+                    self.gc.gc_mark_value(self.stack[abs]);
+                }
+            } else {
+                // Topmost frame: mark expression temporaries.
+                // The current instruction determines what's live above max_live.
+                if pc < proto.code.len() as u32 {
+                    let inst = proto.code[pc as usize];
+                    let op = inst.opcode();
+                    if matches!(op, OpCode::Call | OpCode::TailCall) {
+                        // Mark from Call.A through the call arguments
+                        let inst_a = inst.a() as usize;
+                        let inst_b = inst.b() as usize;
+                        let call_end = if inst_b == 0 {
+                            // Variable args: mark up to stack_top
+                            self.stack_top.saturating_sub(base)
+                        } else {
+                            inst_a + inst_b
+                        };
+                        for r in inst_a..call_end {
+                            let abs = base + r;
+                            if abs < self.stack.len() {
+                                self.gc.gc_mark_value(self.stack[abs]);
+                            }
+                        }
+                    } else {
+                        // Not at a Call: mark up to max_stack conservatively.
+                        // GC can only run at Call instructions (collectgarbage/etc),
+                        // but be safe for auto-GC that could trigger anywhere.
+                        let frame_top = base + proto.max_stack_size as usize;
+                        for abs in (base + max_live)..frame_top.min(self.stack.len()) {
+                            self.gc.gc_mark_value(self.stack[abs]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also mark anything below the first frame's func_stack_idx
+        // (e.g., the main chunk's function value at stack[0])
+        if let Some(first_ci) = self.call_stack.first() {
+            for i in 0..first_ci.func_stack_idx.min(self.stack.len()) {
+                self.gc.gc_mark_value(self.stack[i]);
+            }
         }
 
         // Mark closures in call frames
@@ -870,6 +1258,19 @@ impl Vm {
             self.gc.gc_mark_value(TValue::from_table(idx));
         }
 
+        // Mark thread metatable
+        if let Some(idx) = self.gc.thread_metatable {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark main thread handle
+        if let Some(idx) = self.main_thread_handle {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark running coro handle
+        if let Some(idx) = self.running_coro_handle {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+
         // Mark registered native function indices (these are always roots)
         if let Some(idx) = self.pcall_idx {
             self.gc.gc_mark_value(TValue::from_native(idx));
@@ -923,6 +1324,30 @@ impl Vm {
         }
         if let Some(idx) = self.package_preload_idx {
             self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark hook function
+        if !self.hook_func.is_nil() {
+            self.gc.gc_mark_value(self.hook_func);
+        }
+        // Mark registry table
+        if let Some(idx) = self.registry_idx {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+
+        // Mark io library thread-local roots (default input/output, file metatable)
+        let (io_input, io_output, io_mt) = selune_stdlib::io_lib::gc_roots();
+        if let Some(idx) = io_input {
+            self.gc.gc_mark_value(TValue::from_userdata(idx));
+        }
+        if let Some(idx) = io_output {
+            self.gc.gc_mark_value(TValue::from_userdata(idx));
+        }
+        if let Some(idx) = io_mt {
+            self.gc.gc_mark_value(TValue::from_table(idx));
+        }
+        // Mark io.lines iterator states
+        for idx in selune_stdlib::io_lib::gc_lines_roots(&self.gc) {
+            self.gc.gc_mark_value(TValue::from_userdata(idx));
         }
     }
 
@@ -1401,6 +1826,14 @@ pub fn format_value(
         let bytes = strings.get_bytes(sid);
         String::from_utf8_lossy(bytes).into_owned()
     } else if val.is_table() {
+        // Check if this is a thread (coroutine handle with thread metatable)
+        if let Some(thread_mt) = gc.thread_metatable {
+            if let Some(tbl_idx) = val.as_table_idx() {
+                if gc.get_table(tbl_idx).metatable == Some(thread_mt) {
+                    return format!("thread: 0x{:x}", val.gc_index().unwrap_or(0));
+                }
+            }
+        }
         format!("table: 0x{:x}", val.gc_index().unwrap_or(0))
     } else if val.as_closure_idx().is_some() || val.as_native_idx().is_some() {
         format!("function: 0x{:x}", val.gc_index().unwrap_or(0))

@@ -33,7 +33,7 @@ impl GcObjectType {
 }
 
 /// Get the Lua type name for a TValue.
-pub fn lua_type_name(val: TValue, _heap: &GcHeap) -> &'static str {
+pub fn lua_type_name(val: TValue, heap: &GcHeap) -> &'static str {
     if val.is_nil() {
         "nil"
     } else if val.is_bool() {
@@ -42,7 +42,17 @@ pub fn lua_type_name(val: TValue, _heap: &GcHeap) -> &'static str {
         "number"
     } else if val.is_gc() {
         match val.gc_sub_tag() {
-            Some(GC_SUB_TABLE) => "table",
+            Some(GC_SUB_TABLE) => {
+                // Check if this table has the thread metatable (coroutine handle)
+                if let Some(thread_mt) = heap.thread_metatable {
+                    if let Some(tbl_idx) = val.as_table_idx() {
+                        if heap.get_table(tbl_idx).metatable == Some(thread_mt) {
+                            return "thread";
+                        }
+                    }
+                }
+                "table"
+            }
             Some(GC_SUB_CLOSURE) | Some(GC_SUB_NATIVE) => "function",
             Some(GC_SUB_STRING) => "string",
             Some(GC_SUB_BOXED_INT) => "number",

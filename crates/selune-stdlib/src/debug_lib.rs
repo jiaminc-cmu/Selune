@@ -16,6 +16,11 @@ pub struct DebugIndices {
     pub setupvalue_idx: GcIdx<NativeFunction>,
     pub getinfo_idx: GcIdx<NativeFunction>,
     pub traceback_idx: GcIdx<NativeFunction>,
+    pub sethook_idx: GcIdx<NativeFunction>,
+    pub gethook_idx: GcIdx<NativeFunction>,
+    pub getlocal_idx: GcIdx<NativeFunction>,
+    pub setlocal_idx: GcIdx<NativeFunction>,
+    pub getregistry_idx: GcIdx<NativeFunction>,
 }
 
 pub fn register(
@@ -59,10 +64,32 @@ pub fn register(
         TValue::from_native(traceback_idx),
     );
 
-    // Stubs for functions that need full VM access
-    register_fn(gc, debug_table, strings, "sethook", native_debug_sethook);
-    register_fn(gc, debug_table, strings, "getlocal", native_debug_getlocal);
-    register_fn(gc, debug_table, strings, "setlocal", native_debug_setlocal);
+    // Functions that need full VM access (redirected through dispatch.rs)
+    let sethook_idx = gc.alloc_native(native_debug_sethook, "sethook");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"sethook"),
+        TValue::from_native(sethook_idx),
+    );
+    let gethook_idx = gc.alloc_native(native_debug_gethook, "gethook");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"gethook"),
+        TValue::from_native(gethook_idx),
+    );
+    let getlocal_idx = gc.alloc_native(native_debug_getlocal, "getlocal");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"getlocal"),
+        TValue::from_native(getlocal_idx),
+    );
+    let setlocal_idx = gc.alloc_native(native_debug_setlocal, "setlocal");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"setlocal"),
+        TValue::from_native(setlocal_idx),
+    );
+    let getregistry_idx = gc.alloc_native(native_debug_getregistry, "getregistry");
+    gc.get_table_mut(debug_table).raw_set_str(
+        strings.intern(b"getregistry"),
+        TValue::from_native(getregistry_idx),
+    );
 
     let debug_name = strings.intern(b"debug");
     gc.get_table_mut(env_idx)
@@ -73,6 +100,11 @@ pub fn register(
         setupvalue_idx,
         getinfo_idx,
         traceback_idx,
+        sethook_idx,
+        gethook_idx,
+        getlocal_idx,
+        setlocal_idx,
+        getregistry_idx,
     }
 }
 
@@ -495,9 +527,9 @@ fn native_debug_setuservalue(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nat
         )));
     }
 
-    // Extend user_values if needed to accommodate the index
+    // If index is out of range, return false (fail)
     if idx >= ud.user_values.len() {
-        ud.user_values.resize(idx + 1, TValue::nil());
+        return Ok(vec![TValue::from_bool(false)]);
     }
     ud.user_values[idx] = new_val;
 
@@ -604,5 +636,23 @@ fn native_debug_getlocal(_ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
 // ---------------------------------------------------------------------------
 
 fn native_debug_setlocal(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Ok(vec![TValue::nil()])
+}
+
+// ---------------------------------------------------------------------------
+// debug.gethook([thread])
+// Stub: redirected through dispatch.rs for VM access.
+// ---------------------------------------------------------------------------
+
+fn native_debug_gethook(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    Ok(vec![])
+}
+
+// ---------------------------------------------------------------------------
+// debug.getregistry()
+// Stub: redirected through dispatch.rs for VM access.
+// ---------------------------------------------------------------------------
+
+fn native_debug_getregistry(_ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     Ok(vec![TValue::nil()])
 }

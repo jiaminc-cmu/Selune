@@ -43,7 +43,7 @@ impl fmt::Display for LuaError {
         match self {
             LuaError::Runtime(msg) => write!(f, "{msg}"),
             LuaError::StackOverflow => write!(f, "C stack overflow"),
-            LuaError::LuaValue(v) => write!(f, "{:?}", v),
+            LuaError::LuaValue(v) => write!(f, "(object: {:?})", v),
             LuaError::Yield(_) => write!(f, "cannot yield from main thread"),
         }
     }

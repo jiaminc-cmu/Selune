@@ -18,6 +18,22 @@ thread_local! {
     static FILE_METATABLE: RefCell<Option<GcIdx<Table>>> = RefCell::new(None);
 }
 
+/// Return the GC-relevant roots held by the io library (default input, default output, file metatable).
+/// Called by the VM's GC mark phase so these thread-local handles are not prematurely collected.
+pub fn gc_roots() -> (Option<GcIdx<Userdata>>, Option<GcIdx<Userdata>>, Option<GcIdx<Table>>) {
+    let input = DEFAULT_INPUT.with(|cell| *cell.borrow());
+    let output = DEFAULT_OUTPUT.with(|cell| *cell.borrow());
+    let mt = FILE_METATABLE.with(|cell| *cell.borrow());
+    (input, output, mt)
+}
+
+/// Return GC roots for active lines iterator states (both the state userdata and the file it references).
+/// NOTE: With the upvalue-based approach, lines iterator state is rooted through the native function's
+/// upvalue field, which is traced by the GC automatically. This function now returns an empty vec.
+pub fn gc_lines_roots(_gc: &selune_core::gc::GcHeap) -> Vec<GcIdx<Userdata>> {
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // LuaFile: the data stored inside userdata
 // ---------------------------------------------------------------------------
@@ -27,6 +43,10 @@ pub struct LuaFile {
     pub inner: LuaFileInner,
     pub name: String,
     pub is_closed: bool,
+    /// Pushback byte for ungetc-like behavior (used by read_number).
+    pub ungetc: Option<u8>,
+    /// If true, flush after every write that contains '\n' (line buffering).
+    pub line_buffered: bool,
 }
 
 /// Variants for the backing file stream.
@@ -35,6 +55,9 @@ pub enum LuaFileInner {
     Stdout,
     Stderr,
     File(std::fs::File),
+    /// Buffered file — created by f:setvbuf("full"|"line", size).
+    /// Inner writes go through BufWriter; reads flush first then read from underlying.
+    BufferedFile(std::io::BufWriter<std::fs::File>),
 }
 
 impl LuaFile {
@@ -43,6 +66,8 @@ impl LuaFile {
             inner: LuaFileInner::Stdin(BufReader::new(io::stdin())),
             name: "stdin".to_string(),
             is_closed: false,
+            ungetc: None,
+            line_buffered: false,
         }
     }
 
@@ -51,6 +76,8 @@ impl LuaFile {
             inner: LuaFileInner::Stdout,
             name: "stdout".to_string(),
             is_closed: false,
+            ungetc: None,
+            line_buffered: false,
         }
     }
 
@@ -59,6 +86,8 @@ impl LuaFile {
             inner: LuaFileInner::Stderr,
             name: "stderr".to_string(),
             is_closed: false,
+            ungetc: None,
+            line_buffered: false,
         }
     }
 
@@ -67,6 +96,8 @@ impl LuaFile {
             inner: LuaFileInner::File(file),
             name,
             is_closed: false,
+            ungetc: None,
+            line_buffered: false,
         }
     }
 
@@ -80,6 +111,23 @@ impl LuaFile {
 
 impl Read for LuaFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Handle pushback byte first
+        if let Some(b) = self.ungetc.take() {
+            if !buf.is_empty() {
+                buf[0] = b;
+                if buf.len() == 1 {
+                    return Ok(1);
+                }
+                // Read remaining into rest of buffer
+                let n = match &mut self.inner {
+                    LuaFileInner::Stdin(r) => r.read(&mut buf[1..])?,
+                    LuaFileInner::Stdout | LuaFileInner::Stderr => 0,
+                    LuaFileInner::File(f) => f.read(&mut buf[1..])?,
+                    LuaFileInner::BufferedFile(bw) => bw.get_mut().read(&mut buf[1..])?,
+                };
+                return Ok(1 + n);
+            }
+        }
         match &mut self.inner {
             LuaFileInner::Stdin(r) => r.read(buf),
             LuaFileInner::Stdout => Err(io::Error::new(
@@ -91,21 +139,30 @@ impl Read for LuaFile {
                 "cannot read from stderr",
             )),
             LuaFileInner::File(f) => f.read(buf),
+            LuaFileInner::BufferedFile(bw) => bw.get_mut().read(buf),
         }
     }
 }
 
 impl Write for LuaFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match &mut self.inner {
-            LuaFileInner::Stdin(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "cannot write to stdin",
-            )),
-            LuaFileInner::Stdout => io::stdout().write(buf),
-            LuaFileInner::Stderr => io::stderr().write(buf),
-            LuaFileInner::File(f) => f.write(buf),
+        let n = match &mut self.inner {
+            LuaFileInner::Stdin(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "cannot write to stdin",
+                ));
+            }
+            LuaFileInner::Stdout => io::stdout().write(buf)?,
+            LuaFileInner::Stderr => io::stderr().write(buf)?,
+            LuaFileInner::File(f) => f.write(buf)?,
+            LuaFileInner::BufferedFile(bw) => bw.write(buf)?,
+        };
+        // Line buffering: flush if the written data contains a newline
+        if self.line_buffered && buf.contains(&b'\n') {
+            let _ = self.flush();
         }
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -114,6 +171,7 @@ impl Write for LuaFile {
             LuaFileInner::Stdout => io::stdout().flush(),
             LuaFileInner::Stderr => io::stderr().flush(),
             LuaFileInner::File(f) => f.flush(),
+            LuaFileInner::BufferedFile(bw) => bw.flush(),
         }
     }
 }
@@ -122,6 +180,10 @@ impl Seek for LuaFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match &mut self.inner {
             LuaFileInner::File(f) => f.seek(pos),
+            LuaFileInner::BufferedFile(bw) => {
+                bw.flush()?;
+                bw.get_mut().seek(pos)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "cannot seek on stdio",
@@ -219,18 +281,34 @@ fn get_file_arg(
             return Ok(ud_idx);
         }
     }
+    let got = if ctx.args.get(idx).is_none() {
+        "got no value".to_string()
+    } else {
+        let tname = selune_core::object::obj_type_name(val, &ctx.gc, ctx.strings);
+        format!("FILE* expected, got {}", tname)
+    };
     Err(NativeError::String(format!(
-        "bad argument #{} to '{}' (FILE* expected)",
+        "bad argument #{} to '{}' ({})",
         idx + 1,
-        fname
+        fname,
+        got,
     )))
 }
 
-/// Return a Lua-style I/O error: nil, errmsg.
+/// Return a Lua-style I/O error: nil, errmsg, errno.
 fn io_error_result(strings: &mut StringInterner, err: io::Error) -> Vec<TValue> {
     let msg = err.to_string();
     let sid = strings.intern_or_create(msg.as_bytes());
-    vec![TValue::nil(), TValue::from_string_id(sid)]
+    let errno = err.raw_os_error().unwrap_or(0) as i64;
+    vec![TValue::nil(), TValue::from_string_id(sid), TValue::from_integer(errno)]
+}
+
+/// Return a Lua-style I/O error with filename prefix: nil, "filename: errmsg", errno.
+fn io_error_result_with_name(strings: &mut StringInterner, filename: &str, err: io::Error) -> Vec<TValue> {
+    let msg = format!("{}: {}", filename, err);
+    let sid = strings.intern_or_create(msg.as_bytes());
+    let errno = err.raw_os_error().unwrap_or(0) as i64;
+    vec![TValue::nil(), TValue::from_string_id(sid), TValue::from_integer(errno)]
 }
 
 /// Get a mutable reference to the LuaFile inside a userdata, using a raw pointer
@@ -253,6 +331,7 @@ unsafe fn get_lua_file_ptr(gc: &mut GcHeap, ud_idx: GcIdx<Userdata>) -> *mut Lua
 // Core read implementation (shared by io.read and f:read)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 enum ReadFormat {
     Number,       // "*n" or "n"
     Line,         // "*l" or "l" (default) - line without newline
@@ -289,10 +368,10 @@ fn parse_read_format_full(
         // Strip leading "*" for compat (Lua 5.3 used *n, *l, *L, *a; 5.4 also accepts without *)
         let s = s.strip_prefix('*').unwrap_or(s);
         return match s {
-            "n" => Ok(ReadFormat::Number),
-            "l" => Ok(ReadFormat::Line),
+            "n" | "num" | "number" => Ok(ReadFormat::Number),
+            "l" | "line" => Ok(ReadFormat::Line),
             "L" => Ok(ReadFormat::LineWithNL),
-            "a" => Ok(ReadFormat::All),
+            "a" | "all" => Ok(ReadFormat::All),
             _ => Err(NativeError::String(format!(
                 "bad argument to 'read' (invalid format '{}')",
                 s
@@ -345,33 +424,25 @@ fn read_line(
 
 /// Read bytes until newline or EOF. Returns number of bytes read.
 fn read_line_bytes(lua_file: &mut LuaFile, buf: &mut Vec<u8>) -> Result<usize, NativeError> {
-    match &mut lua_file.inner {
-        LuaFileInner::Stdin(reader) => reader
-            .read_until(b'\n', buf)
-            .map_err(|e| NativeError::String(e.to_string())),
-        LuaFileInner::File(f) => {
-            // Read byte by byte for files.
-            let mut total = 0;
-            let mut byte = [0u8; 1];
-            loop {
-                match f.read(&mut byte) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        buf.push(byte[0]);
-                        total += 1;
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                    }
-                    Err(e) => return Err(NativeError::String(e.to_string())),
+    let mut total = 0;
+    let mut byte = [0u8; 1];
+    loop {
+        match lua_file.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                buf.push(byte[0]);
+                total += 1;
+                if byte[0] == b'\n' {
+                    break;
                 }
             }
-            Ok(total)
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                return Err(NativeError::IoError(e.to_string(), errno));
+            }
         }
-        _ => Err(NativeError::String(
-            "cannot read from this file".to_string(),
-        )),
     }
+    Ok(total)
 }
 
 fn read_all(
@@ -381,59 +452,247 @@ fn read_all(
     let mut buf = Vec::new();
     lua_file
         .read_to_end(&mut buf)
-        .map_err(|e| NativeError::String(e.to_string()))?;
+        .map_err(|e| {
+            let errno = e.raw_os_error().unwrap_or(0);
+            NativeError::IoError(e.to_string(), errno)
+        })?;
     let sid = strings.intern_or_create(&buf);
     Ok(TValue::from_string_id(sid))
 }
 
-fn read_number(lua_file: &mut LuaFile, gc: &mut GcHeap) -> Result<TValue, NativeError> {
-    // Read whitespace-separated token and parse as number.
-    let mut token = String::new();
-    let mut started = false;
+/// Read a single byte from the file, returning None on EOF.
+fn read_byte(lua_file: &mut LuaFile) -> Option<u8> {
+    let mut byte = [0u8; 1];
+    match lua_file.read(&mut byte) {
+        Ok(0) => None,
+        Ok(_) => Some(byte[0]),
+        Err(_) => None,
+    }
+}
 
+/// PUC-compatible number reader. Mirrors liolib.c's read_number with single look-ahead.
+fn read_number(lua_file: &mut LuaFile, gc: &mut GcHeap) -> Result<TValue, NativeError> {
+    const MAX_NUM_LEN: usize = 200;
+    let mut buf = Vec::new();
+    // `c` is the current look-ahead character (like rn.c in PUC)
+    let mut c: Option<u8>;
+
+    // Skip whitespace
     loop {
-        let mut byte = [0u8; 1];
-        match lua_file.read(&mut byte) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                let ch = byte[0] as char;
-                if !started {
-                    if ch.is_ascii_whitespace() {
-                        continue;
-                    }
-                    started = true;
-                }
-                if started {
-                    if ch.is_ascii_whitespace() {
-                        break;
-                    }
-                    token.push(ch);
-                }
-            }
-            Err(_) => break,
+        c = read_byte(lua_file);
+        match c {
+            None => return Ok(TValue::nil()),
+            Some(b) if (b as char).is_ascii_whitespace() => continue,
+            _ => break,
         }
     }
 
-    if token.is_empty() {
+    // Helper: test if current look-ahead matches any char in `chars`. If so, consume it.
+    // Returns true if consumed.
+    macro_rules! test_and_consume {
+        ($c:expr, $lua_file:expr, $buf:expr, $chars:expr) => {{
+            let mut matched = false;
+            if let Some(ch) = $c {
+                for &expected in $chars.as_bytes() {
+                    if ch == expected {
+                        $buf.push(ch);
+                        $c = read_byte($lua_file);
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            matched
+        }};
+    }
+
+    // Read digits (hex or decimal). Returns count of digits read.
+    macro_rules! read_digits {
+        ($c:expr, $lua_file:expr, $buf:expr, $hex:expr) => {{
+            let mut count = 0usize;
+            while $buf.len() < MAX_NUM_LEN {
+                if let Some(ch) = $c {
+                    let is_digit = if $hex {
+                        ch.is_ascii_hexdigit()
+                    } else {
+                        ch.is_ascii_digit()
+                    };
+                    if is_digit {
+                        $buf.push(ch);
+                        $c = read_byte($lua_file);
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            count
+        }};
+    }
+
+    // Optional sign
+    test_and_consume!(c, lua_file, buf, "+-");
+
+    // Check for hex prefix
+    let hex;
+    let mut count;
+    if test_and_consume!(c, lua_file, buf, "0") {
+        if test_and_consume!(c, lua_file, buf, "xX") {
+            hex = true;
+            count = 0;
+        } else {
+            hex = false;
+            count = 1; // the '0' itself counts as a digit
+        }
+    } else {
+        hex = false;
+        count = 0;
+    }
+
+    // Integral part
+    count += read_digits!(c, lua_file, buf, hex);
+
+    // Decimal point
+    if test_and_consume!(c, lua_file, buf, ".") {
+        count += read_digits!(c, lua_file, buf, hex);
+    }
+
+    // Exponent (only if we have at least one digit)
+    if count > 0 {
+        let exp_chars = if hex { "pP" } else { "eE" };
+        if test_and_consume!(c, lua_file, buf, exp_chars) {
+            test_and_consume!(c, lua_file, buf, "+-");
+            read_digits!(c, lua_file, buf, false);
+        }
+    }
+
+    // Push back the look-ahead character
+    if let Some(b) = c {
+        lua_file.ungetc = Some(b);
+    }
+
+    if buf.len() >= MAX_NUM_LEN {
         return Ok(TValue::nil());
     }
 
-    // Try parsing as integer first
-    if let Ok(i) = token.parse::<i64>() {
-        return Ok(TValue::from_full_integer(i, gc));
+    let token = String::from_utf8(buf).unwrap_or_default();
+    match parse_lua_number(&token, gc) {
+        Some(v) => Ok(v),
+        None => Ok(TValue::nil()),
     }
-    // Handle hex integers (0x...)
-    if token.starts_with("0x") || token.starts_with("0X") {
-        if let Ok(i) = i64::from_str_radix(&token[2..], 16) {
-            return Ok(TValue::from_full_integer(i, gc));
+}
+
+/// Parse a Lua number string (decimal int, hex int, decimal float, hex float).
+fn parse_lua_number(s: &str, gc: &mut GcHeap) -> Option<TValue> {
+    let trimmed = s.trim();
+    let is_hex = {
+        let t = if trimmed.starts_with('-') || trimmed.starts_with('+') {
+            &trimmed[1..]
+        } else {
+            trimmed
+        };
+        t.starts_with("0x") || t.starts_with("0X")
+    };
+
+    if is_hex {
+        if trimmed.contains('.') || trimmed.contains('p') || trimmed.contains('P') {
+            return parse_hex_float(trimmed).map(TValue::from_float);
         }
-    }
-    // Try as float
-    if let Ok(f) = token.parse::<f64>() {
-        return Ok(TValue::from_float(f));
+        // Hex integer (wrapping)
+        let (neg, hex_str) = if let Some(r) = trimmed.strip_prefix('-') {
+            (true, r)
+        } else if let Some(r) = trimmed.strip_prefix('+') {
+            (false, r)
+        } else {
+            (false, trimmed)
+        };
+        let hex_digits = hex_str.strip_prefix("0x").or_else(|| hex_str.strip_prefix("0X"))?;
+        let val = u64::from_str_radix(hex_digits, 16).ok()?;
+        let ival = if neg { (val as i64).wrapping_neg() } else { val as i64 };
+        return Some(TValue::from_full_integer(ival, gc));
     }
 
-    Ok(TValue::nil())
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Some(TValue::from_full_integer(i, gc));
+    }
+    // Reject inf/nan which Rust accepts but Lua doesn't
+    let lower = trimmed.to_ascii_lowercase();
+    let stripped = lower.trim_start_matches(['+', '-']);
+    if !stripped.starts_with("inf") && !stripped.starts_with("nan") {
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return Some(TValue::from_float(f));
+        }
+    }
+    None
+}
+
+/// Parse hex float like "0xABCp-3", "-0x1.8p1"
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s)
+    };
+    let rest = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
+
+    let mut mantissa: f64 = 0.0;
+    let mut frac_exp: i32 = 0;
+    let mut in_frac = false;
+    let mut idx = 0;
+    let bytes = rest.as_bytes();
+
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if ch == b'.' {
+            if in_frac {
+                return None;
+            }
+            in_frac = true;
+            idx += 1;
+            continue;
+        }
+        if ch == b'p' || ch == b'P' {
+            break;
+        }
+        let digit = match ch {
+            b'0'..=b'9' => (ch - b'0') as f64,
+            b'a'..=b'f' => (ch - b'a' + 10) as f64,
+            b'A'..=b'F' => (ch - b'A' + 10) as f64,
+            _ => return None,
+        };
+        mantissa = mantissa * 16.0 + digit;
+        if in_frac {
+            frac_exp -= 4;
+        }
+        idx += 1;
+    }
+
+    let mut exp: i32 = 0;
+    if idx < bytes.len() && (bytes[idx] == b'p' || bytes[idx] == b'P') {
+        idx += 1;
+        let mut exp_neg = false;
+        if idx < bytes.len() && bytes[idx] == b'-' {
+            exp_neg = true;
+            idx += 1;
+        } else if idx < bytes.len() && bytes[idx] == b'+' {
+            idx += 1;
+        }
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            exp = exp * 10 + (bytes[idx] - b'0') as i32;
+            idx += 1;
+        }
+        if exp_neg {
+            exp = -exp;
+        }
+    }
+
+    let total_exp = exp + frac_exp;
+    let result = mantissa * (2.0_f64).powi(total_exp);
+    Some(if neg { -result } else { result })
 }
 
 fn read_bytes(
@@ -447,14 +706,15 @@ fn read_bytes(
         match lua_file.read(&mut test) {
             Ok(0) => return Ok(TValue::nil()),
             Ok(_) => {
-                // Seek back if possible
-                if let LuaFileInner::File(f) = &mut lua_file.inner {
-                    let _ = f.seek(SeekFrom::Current(-1));
-                }
+                // Push back the byte we read
+                lua_file.ungetc = Some(test[0]);
                 let sid = strings.intern(b"");
                 return Ok(TValue::from_string_id(sid));
             }
-            Err(e) => return Err(NativeError::String(e.to_string())),
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                return Err(NativeError::IoError(e.to_string(), errno));
+            }
         }
     }
 
@@ -464,7 +724,10 @@ fn read_bytes(
         match lua_file.read(&mut buf[total..]) {
             Ok(0) => break, // EOF
             Ok(read) => total += read,
-            Err(e) => return Err(NativeError::String(e.to_string())),
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                return Err(NativeError::IoError(e.to_string(), errno));
+            }
         }
     }
     if total == 0 {
@@ -496,17 +759,20 @@ fn do_write(
         if let Some(sid) = arg.as_string_id() {
             let bytes = strings.get_bytes(sid);
             lua_file.write_all(bytes).map_err(|e| {
-                NativeError::String(format!("{}: {}", lua_file.name, e))
+                let errno = e.raw_os_error().unwrap_or(0);
+                NativeError::IoError(e.to_string(), errno)
             })?;
         } else if let Some(int_val) = arg.as_full_integer(gc) {
             let s = format!("{}", int_val);
             lua_file.write_all(s.as_bytes()).map_err(|e| {
-                NativeError::String(format!("{}: {}", lua_file.name, e))
+                let errno = e.raw_os_error().unwrap_or(0);
+                NativeError::IoError(e.to_string(), errno)
             })?;
         } else if let Some(f) = arg.as_float() {
             let s = format_lua_float(f);
             lua_file.write_all(s.as_bytes()).map_err(|e| {
-                NativeError::String(format!("{}: {}", lua_file.name, e))
+                let errno = e.raw_os_error().unwrap_or(0);
+                NativeError::IoError(e.to_string(), errno)
             })?;
         } else {
             return Err(NativeError::String(format!(
@@ -676,14 +942,44 @@ fn native_io_open(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let filename = get_string_arg(ctx, 0, "open")?;
     let mode_str = get_opt_string_arg(ctx, 1, "open")?.unwrap_or_else(|| "r".to_string());
 
+    // Validate mode: must match [rwa]\+?b?
+    if !is_valid_mode(&mode_str) {
+        return Err(NativeError::String(format!(
+            "bad argument #2 to 'open' (invalid mode '{}')",
+            mode_str
+        )));
+    }
+
     let file = match open_file(&filename, &mode_str) {
         Ok(f) => f,
-        Err(e) => return Ok(io_error_result(ctx.strings, e)),
+        Err(e) => return Ok(io_error_result_with_name(ctx.strings, &filename, e)),
     };
 
     let lua_file = LuaFile::new_file(file, filename);
     let ud_idx = alloc_file_userdata(ctx.gc, lua_file);
     Ok(vec![TValue::from_userdata(ud_idx)])
+}
+
+fn is_valid_mode(mode: &str) -> bool {
+    let bytes = mode.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    // First char must be r, w, or a
+    if !matches!(bytes[i], b'r' | b'w' | b'a') {
+        return false;
+    }
+    i += 1;
+    // Optional '+'
+    if i < bytes.len() && bytes[i] == b'+' {
+        i += 1;
+    }
+    // Optional 'b'
+    if i < bytes.len() && bytes[i] == b'b' {
+        i += 1;
+    }
+    i == bytes.len()
 }
 
 fn open_file(filename: &str, mode: &str) -> io::Result<std::fs::File> {
@@ -732,11 +1028,12 @@ fn native_io_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         get_file_arg(ctx, 0, "close")?
     };
 
-    close_file(ctx.gc, ud_idx)
+    close_file(ctx.gc, ctx.strings, ud_idx)
 }
 
 fn close_file(
     gc: &mut GcHeap,
+    strings: &mut StringInterner,
     ud_idx: GcIdx<Userdata>,
 ) -> Result<Vec<TValue>, NativeError> {
     let ud = gc.get_userdata_mut(ud_idx);
@@ -752,7 +1049,10 @@ fn close_file(
     }
 
     if lua_file.is_stdio() {
-        return Ok(vec![TValue::from_bool(true)]);
+        return Ok(vec![
+            TValue::nil(),
+            TValue::from_string_id(strings.intern(b"cannot close standard file")),
+        ]);
     }
 
     lua_file.is_closed = true;
@@ -792,14 +1092,20 @@ fn native_io_read(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
 
     if lua_file.is_closed {
         return Err(NativeError::String(
-            "attempt to use a closed file".to_string(),
+            "standard input file is closed".to_string(),
         ));
     }
 
     let mut results = Vec::with_capacity(formats.len());
     for fmt in &formats {
-        let val = read_one_format(lua_file, fmt, ctx.gc, ctx.strings)?;
-        results.push(val);
+        match read_one_format(lua_file, fmt, ctx.gc, ctx.strings) {
+            Ok(val) => results.push(val),
+            Err(NativeError::IoError(msg, errno)) => {
+                let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
+                return Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)]);
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(results)
 }
@@ -824,7 +1130,20 @@ fn native_io_write(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     }
     let lua_file = unsafe { &mut *lua_file_ptr };
 
-    do_write(lua_file, &args, ctx.gc, ctx.strings, file_tval)
+    if lua_file.is_closed {
+        return Err(NativeError::String(
+            "standard output file is closed".to_string(),
+        ));
+    }
+
+    match do_write(lua_file, &args, ctx.gc, ctx.strings, file_tval) {
+        Ok(r) => Ok(r),
+        Err(NativeError::IoError(msg, errno)) => {
+            let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
+            Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)])
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,10 +1336,26 @@ fn native_io_popen(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
 // ---------------------------------------------------------------------------
 
 fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
+    const MAXARGLINE: usize = 250;
     let first_arg = ctx.args.first().copied().unwrap_or(TValue::nil());
 
+    // Parse format arguments (args after filename)
+    let fmt_args = if ctx.args.len() > 1 { &ctx.args[1..] } else { &[] };
+    if fmt_args.len() > MAXARGLINE {
+        return Err(NativeError::String(
+            "too many arguments".to_string(),
+        ));
+    }
+    let formats: Vec<ReadFormat> = {
+        let mut fmts = Vec::with_capacity(fmt_args.len());
+        for &arg in fmt_args {
+            fmts.push(parse_read_format_full(arg, ctx.gc, ctx.strings)?);
+        }
+        fmts
+    };
+
     if first_arg.is_nil() {
-        // No filename: iterate on default input with default "l" format
+        // No filename: iterate on default input
         let ud_idx = DEFAULT_INPUT
             .with(|cell| *cell.borrow())
             .ok_or_else(|| NativeError::String("default input file is not set".to_string()))?;
@@ -1028,16 +1363,14 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         let state = LinesIterState {
             file_ud_idx: ud_idx,
             close_on_eof: false,
+            formats,
         };
         let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
-
-        LINES_ITER_STATE.with(|cell| {
-            cell.borrow_mut().push(state_ud);
-        });
+        let upvalue = TValue::from_userdata(state_ud);
 
         let iter_fn = ctx
             .gc
-            .alloc_native(native_lines_iterator, "io.lines iterator");
+            .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
         return Ok(vec![TValue::from_native(iter_fn)]);
     }
 
@@ -1054,17 +1387,17 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         let state = LinesIterState {
             file_ud_idx: ud_idx,
             close_on_eof: true,
+            formats,
         };
         let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
-
-        LINES_ITER_STATE.with(|cell| {
-            cell.borrow_mut().push(state_ud);
-        });
+        let upvalue = TValue::from_userdata(state_ud);
 
         let iter_fn = ctx
             .gc
-            .alloc_native(native_lines_iterator, "io.lines iterator");
-        return Ok(vec![TValue::from_native(iter_fn)]);
+            .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
+        let file_tval = TValue::from_userdata(ud_idx);
+        // Return 4 values: (iter, file, nil, file) for the to-be-closed protocol
+        return Ok(vec![TValue::from_native(iter_fn), file_tval, TValue::nil(), file_tval]);
     }
 
     Err(NativeError::String(
@@ -1076,16 +1409,13 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
 struct LinesIterState {
     file_ud_idx: GcIdx<Userdata>,
     close_on_eof: bool,
+    /// Read formats for each iteration call. Empty means default "l".
+    formats: Vec<ReadFormat>,
 }
 
-thread_local! {
-    /// Stack of active lines iterator states (most recent = last).
-    static LINES_ITER_STATE: RefCell<Vec<GcIdx<Userdata>>> = RefCell::new(Vec::new());
-}
 
 fn native_lines_iterator(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let state_ud_idx = LINES_ITER_STATE
-        .with(|cell| cell.borrow().last().copied())
+    let state_ud_idx = ctx.upvalue.as_userdata_idx()
         .ok_or_else(|| NativeError::String("lines iterator: no state".to_string()))?;
 
     let state_ud = ctx.gc.get_userdata(state_ud_idx);
@@ -1095,6 +1425,7 @@ fn native_lines_iterator(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
         .ok_or_else(|| NativeError::String("lines iterator: invalid state".to_string()))?;
     let file_ud_idx = state.file_ud_idx;
     let close_on_eof = state.close_on_eof;
+    let formats = state.formats.clone();
 
     // Use unsafe pointer to avoid borrow conflict between userdata and gc/strings
     let lua_file_ptr = unsafe { get_lua_file_ptr(ctx.gc, file_ud_idx) };
@@ -1106,27 +1437,43 @@ fn native_lines_iterator(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
     let lua_file = unsafe { &mut *lua_file_ptr };
 
     if lua_file.is_closed {
-        return Ok(vec![TValue::nil()]);
+        return Err(NativeError::String(
+            "file is already closed".to_string(),
+        ));
     }
 
-    // Read one line (default format)
-    let val = read_one_format(lua_file, &ReadFormat::Line, ctx.gc, ctx.strings)?;
-
-    if val.is_nil() {
-        // EOF reached
-        if close_on_eof {
-            let file_ud = ctx.gc.get_userdata_mut(file_ud_idx);
-            let lua_file2 = file_ud.data.downcast_mut::<LuaFile>().unwrap();
-            let _ = lua_file2.flush();
-            lua_file2.is_closed = true;
+    if formats.is_empty() {
+        // Default: read one line
+        let val = read_one_format(lua_file, &ReadFormat::Line, ctx.gc, ctx.strings)?;
+        if val.is_nil() {
+            if close_on_eof {
+                let file_ud = ctx.gc.get_userdata_mut(file_ud_idx);
+                let lua_file2 = file_ud.data.downcast_mut::<LuaFile>().unwrap();
+                let _ = lua_file2.flush();
+                lua_file2.is_closed = true;
+            }
+            return Ok(vec![TValue::nil()]);
         }
-        LINES_ITER_STATE.with(|cell| {
-            cell.borrow_mut().pop();
-        });
-        return Ok(vec![TValue::nil()]);
+        Ok(vec![val])
+    } else {
+        // Multiple formats: read one value per format
+        let mut results = Vec::with_capacity(formats.len());
+        for fmt in &formats {
+            let val = read_one_format(lua_file, fmt, ctx.gc, ctx.strings)?;
+            results.push(val);
+        }
+        // Check if first result is nil (EOF)
+        if results.first().map_or(true, |v| v.is_nil()) {
+            if close_on_eof {
+                let file_ud = ctx.gc.get_userdata_mut(file_ud_idx);
+                let lua_file2 = file_ud.data.downcast_mut::<LuaFile>().unwrap();
+                let _ = lua_file2.flush();
+                lua_file2.is_closed = true;
+            }
+            return Ok(vec![TValue::nil()]);
+        }
+        Ok(results)
     }
-
-    Ok(vec![val])
 }
 
 // ===========================================================================
@@ -1171,8 +1518,15 @@ fn native_file_read(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
 
     let mut results = Vec::with_capacity(formats.len());
     for fmt in &formats {
-        let val = read_one_format(lua_file, fmt, ctx.gc, ctx.strings)?;
-        results.push(val);
+        match read_one_format(lua_file, fmt, ctx.gc, ctx.strings) {
+            Ok(val) => results.push(val),
+            Err(NativeError::IoError(msg, errno)) => {
+                // IO errors return (nil, msg, errno) instead of raising
+                let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
+                return Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)]);
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(results)
 }
@@ -1196,7 +1550,14 @@ fn native_file_write(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
     }
     let lua_file = unsafe { &mut *lua_file_ptr };
 
-    do_write(lua_file, &args, ctx.gc, ctx.strings, file_tval)
+    match do_write(lua_file, &args, ctx.gc, ctx.strings, file_tval) {
+        Ok(r) => Ok(r),
+        Err(NativeError::IoError(msg, errno)) => {
+            let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
+            Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)])
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,7 +1566,7 @@ fn native_file_write(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
 
 fn native_file_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let ud_idx = get_file_arg(ctx, 0, "close")?;
-    close_file(ctx.gc, ud_idx)
+    close_file(ctx.gc, ctx.strings, ud_idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,8 +1638,74 @@ fn native_file_seek(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
 // ---------------------------------------------------------------------------
 
 fn native_file_setvbuf(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let _ud_idx = get_file_arg(ctx, 0, "setvbuf")?;
-    // No-op, just return the file
+    let ud_idx = get_file_arg(ctx, 0, "setvbuf")?;
+    let mode_sid = ctx.args.get(1).and_then(|v| v.as_string_id()).ok_or_else(|| {
+        NativeError::String("bad argument #1 to 'setvbuf' (string expected)".to_string())
+    })?;
+    let mode_str = std::str::from_utf8(ctx.strings.get_bytes(mode_sid)).unwrap_or("");
+    let size = ctx.args.get(2).and_then(|v| v.as_full_integer(ctx.gc)).unwrap_or(0) as usize;
+
+    let lua_file: &mut LuaFile = ctx.gc.get_userdata_mut(ud_idx)
+        .data.downcast_mut::<LuaFile>()
+        .ok_or_else(|| NativeError::String("not a file".to_string()))?;
+
+    // Helper: extract raw File from BufferedFile
+    fn unwrap_bufwriter(mut bw: std::io::BufWriter<std::fs::File>) -> std::fs::File {
+        let _ = bw.flush();
+        // into_parts extracts the inner writer, discarding any buffered data
+        let (file, _) = bw.into_parts();
+        file
+    }
+
+    match mode_str {
+        "no" => {
+            // Disable buffering — switch back to raw File if currently buffered
+            lua_file.line_buffered = false;
+            let old = std::mem::replace(&mut lua_file.inner, LuaFileInner::Stdout);
+            lua_file.inner = match old {
+                LuaFileInner::BufferedFile(bw) => LuaFileInner::File(unwrap_bufwriter(bw)),
+                other => other,
+            };
+        }
+        "full" => {
+            // Full buffering
+            lua_file.line_buffered = false;
+            let buf_size = if size > 0 { size } else { 8192 };
+            let old = std::mem::replace(&mut lua_file.inner, LuaFileInner::Stdout);
+            lua_file.inner = match old {
+                LuaFileInner::File(f) => {
+                    LuaFileInner::BufferedFile(std::io::BufWriter::with_capacity(buf_size, f))
+                }
+                LuaFileInner::BufferedFile(bw) => {
+                    let f = unwrap_bufwriter(bw);
+                    LuaFileInner::BufferedFile(std::io::BufWriter::with_capacity(buf_size, f))
+                }
+                other => other, // Can't buffer stdio
+            };
+        }
+        "line" => {
+            // Line buffering: use BufWriter + flush on newline
+            lua_file.line_buffered = true;
+            let buf_size = if size > 0 { size } else { 8192 };
+            let old = std::mem::replace(&mut lua_file.inner, LuaFileInner::Stdout);
+            lua_file.inner = match old {
+                LuaFileInner::File(f) => {
+                    LuaFileInner::BufferedFile(std::io::BufWriter::with_capacity(buf_size, f))
+                }
+                LuaFileInner::BufferedFile(bw) => {
+                    let f = unwrap_bufwriter(bw);
+                    LuaFileInner::BufferedFile(std::io::BufWriter::with_capacity(buf_size, f))
+                }
+                other => other,
+            };
+        }
+        _ => {
+            return Err(NativeError::String(format!(
+                "bad argument #1 to 'setvbuf' (invalid option '{}')", mode_str
+            )));
+        }
+    }
+
     Ok(vec![ctx.args[0]])
 }
 
@@ -1289,19 +1716,27 @@ fn native_file_setvbuf(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
 fn native_file_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let ud_idx = get_file_arg(ctx, 0, "lines")?;
 
+    // Parse format arguments (args after self)
+    let fmt_args = if ctx.args.len() > 1 { &ctx.args[1..] } else { &[] };
+    let formats: Vec<ReadFormat> = {
+        let mut fmts = Vec::with_capacity(fmt_args.len());
+        for &arg in fmt_args {
+            fmts.push(parse_read_format_full(arg, ctx.gc, ctx.strings)?);
+        }
+        fmts
+    };
+
     let state = LinesIterState {
         file_ud_idx: ud_idx,
         close_on_eof: false, // f:lines() does NOT close the file on EOF
+        formats,
     };
     let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
-
-    LINES_ITER_STATE.with(|cell| {
-        cell.borrow_mut().push(state_ud);
-    });
+    let upvalue = TValue::from_userdata(state_ud);
 
     let iter_fn = ctx
         .gc
-        .alloc_native(native_lines_iterator, "file:lines iterator");
+        .alloc_native_with_upvalue(native_lines_iterator, "file:lines iterator", upvalue);
     Ok(vec![TValue::from_native(iter_fn)])
 }
 

@@ -290,6 +290,13 @@ impl<'a> Compiler<'a> {
 
     // ---- Code generation helpers ----
 
+    /// Get the line of the last emitted instruction, or 0 if none.
+    fn last_emitted_line(&self) -> u32 {
+        let pc = self.fs().current_pc();
+        if pc == 0 { return 0; }
+        self.fs().proto.get_line(pc - 1)
+    }
+
     fn emit(&mut self, inst: Instruction, line: u32) -> usize {
         self.fs_mut().emit(inst, line)
     }
@@ -481,7 +488,7 @@ impl<'a> Compiler<'a> {
             }
             ExprDesc::Vararg(pc) => {
                 let inst = &mut self.fs_mut().proto.code[*pc];
-                *inst = Instruction::abc(OpCode::VarArg, reg, 2, 0, false);
+                *inst = Instruction::abc(OpCode::VarArg, reg, 0, 2, false);
             }
             ExprDesc::Void => {}
         }
@@ -1014,6 +1021,9 @@ impl<'a> Compiler<'a> {
             let target = base_reg + count + 1;
             if self.fs().scope.free_reg < target {
                 self.fs_mut().scope.free_reg = target;
+                if target > self.fs().scope.max_reg {
+                    self.fs_mut().scope.max_reg = target;
+                }
             }
             count += 1;
             self.check_reg_overflow()?;
@@ -1029,8 +1039,8 @@ impl<'a> Compiler<'a> {
     fn expression_list_adjust(&mut self, base_reg: u8, num_wanted: u8) -> Result<u8, CompileError> {
         let mut count = 0u8;
         loop {
-            let expr = self.expression()?;
             let line = self.line();
+            let expr = self.expression()?;
 
             if !self.check(&Token::Comma) {
                 // Last expression
@@ -1062,8 +1072,8 @@ impl<'a> Compiler<'a> {
                         self.fs_mut().proto.code[pc] = Instruction::abc(
                             OpCode::VarArg,
                             base_reg + count,
-                            remaining + 1,
                             0,
+                            remaining + 1,
                             false,
                         );
                         return Ok(num_wanted);
@@ -1083,6 +1093,9 @@ impl<'a> Compiler<'a> {
             let target = base_reg + count + 1;
             if self.fs().scope.free_reg < target {
                 self.fs_mut().scope.free_reg = target;
+                if target > self.fs().scope.max_reg {
+                    self.fs_mut().scope.max_reg = target;
+                }
             }
             count += 1;
             self.check_reg_overflow()?;
@@ -1726,14 +1739,15 @@ impl<'a> Compiler<'a> {
         self.expect(&Token::RParen)?;
 
         self.block()?;
+        // Capture line of 'end' keyword before consuming it
+        let end_line = self.line();
         self.expect(&Token::End)?;
 
         // Emit RETURN0 if no explicit return
-        let ret_line = self.line();
-        self.emit_abc(OpCode::Return0, 0, 0, 0, ret_line);
+        self.emit_abc(OpCode::Return0, 0, 0, 0, end_line);
 
         // Set lastlinedefined to the line of the 'end' keyword
-        self.fs_mut().proto.lastlinedefined = ret_line;
+        self.fs_mut().proto.lastlinedefined = end_line;
 
         // Adjust labels at function end and check for unresolved gotos
         self.close_block_gotos();
@@ -1950,9 +1964,9 @@ impl<'a> Compiler<'a> {
         // temporaries used for the condition are freed after the test
         let save_free = self.fs().scope.free_reg;
         let cond = self.expression()?;
+        let cond_line = self.line(); // line of 'then' keyword (before consuming it)
         self.expect(&Token::Then)?;
-        let line = self.line();
-        let mut false_jump = self.code_test_jump(&cond, false, line)?;
+        let mut false_jump = self.code_test_jump(&cond, false, cond_line)?;
         self.fs_mut().scope.free_reg_to(save_free);
 
         self.fs_mut().scope.enter_block(false);
@@ -1964,7 +1978,8 @@ impl<'a> Compiler<'a> {
         // Handle elseif chain
         while self.check(&Token::ElseIf) {
             // Escape jump from the end of the previous then-block
-            escape_jumps.push(self.emit_jump(self.line()));
+            // Use the line of the last instruction in the block, not the elseif keyword
+            escape_jumps.push(self.emit_jump(self.last_emitted_line()));
             // Patch the previous false_jump to here (start of the elseif condition)
             if let Some(fj) = false_jump {
                 self.patch_jump(fj);
@@ -1973,8 +1988,8 @@ impl<'a> Compiler<'a> {
             self.advance()?; // consume 'elseif'
             let save_free_ei = self.fs().scope.free_reg;
             let cond = self.expression()?;
+            let cond_line = self.line(); // line of 'then' keyword (before consuming it)
             self.expect(&Token::Then)?;
-            let cond_line = self.line();
             false_jump = self.code_test_jump(&cond, false, cond_line)?;
             self.fs_mut().scope.free_reg_to(save_free_ei);
 
@@ -1987,7 +2002,8 @@ impl<'a> Compiler<'a> {
 
         if self.check(&Token::Else) {
             // Escape jump from the end of the last then/elseif block
-            escape_jumps.push(self.emit_jump(self.line()));
+            // Use the line of the last instruction in the block, not the else keyword
+            escape_jumps.push(self.emit_jump(self.last_emitted_line()));
             // Patch false_jump to the else block
             if let Some(fj) = false_jump {
                 self.patch_jump(fj);
@@ -2185,24 +2201,28 @@ impl<'a> Compiler<'a> {
         // TForPrep
         let prep_pc = self.emit_abx(OpCode::TForPrep, base, 0, line);
 
-        self.fs_mut().scope.enter_block(true);
-
-        // Add hidden TBC local for the 4th for-generic slot (base + 3)
-        // so that break_needs_close() detects it and emits Close before break
+        // Add 4 hidden locals named "(for state)" for debug.getlocal compatibility.
+        // PUC Lua reports all 4 for-generic hidden slots with this name.
+        // The 4th one (TBC) has is_close=true so break_needs_close() detects it.
+        let num_locals_before_hidden = self.fs().scope.locals.len();
         {
-            let tbc_name = self.lexer.strings.intern(b"(for toclose)");
+            let for_state_name = self.lexer.strings.intern(b"(for state)");
             let pc = self.fs().current_pc() as u32;
             let scope_depth = self.fs().scope.scope_depth;
-            self.fs_mut().scope.locals.push(LocalVarInfo {
-                name: tbc_name,
-                reg: (base + 3) as u8,
-                scope_depth,
-                is_const: false,
-                is_close: true,
-                is_captured: false,
-                start_pc: pc,
-            });
+            for i in 0u8..4 {
+                self.fs_mut().scope.locals.push(LocalVarInfo {
+                    name: for_state_name,
+                    reg: base + i,
+                    scope_depth,
+                    is_const: false,
+                    is_close: i == 3,
+                    is_captured: false,
+                    start_pc: pc,
+                });
+            }
         }
+
+        self.fs_mut().scope.enter_block(true);
 
         // Declare loop variables
         for name in &names {
@@ -2212,7 +2232,24 @@ impl<'a> Compiler<'a> {
 
         self.block()?;
         self.close_block_gotos();
-        self.emit_close_if_needed(self.line());
+        // Close user-level captured/TBC variables in the loop body, but NOT the
+        // for-generic's own TBC at base+3. Only close from base+4 onwards.
+        {
+            let block = self.fs().scope.blocks.last().unwrap();
+            let mut close_reg = None;
+            for local in &self.fs().scope.locals[block.num_locals_on_entry..] {
+                if (local.is_close || local.is_captured) && local.reg >= base + 4 {
+                    match close_reg {
+                        None => close_reg = Some(local.reg),
+                        Some(r) if local.reg < r => close_reg = Some(local.reg),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(reg) = close_reg {
+                self.emit_abc(OpCode::Close, reg, 0, 0, self.line());
+            }
+        }
 
         let block = { let pc = self.fs().current_pc() as u32; self.fs_mut().scope.leave_block_at_pc(pc) };
 
@@ -2240,6 +2277,21 @@ impl<'a> Compiler<'a> {
         // Break jumps land here (after Close)
         for brk in block.break_jumps {
             self.patch_jump(brk);
+        }
+
+        // Remove the 4 hidden "(for state)" locals and move to finished_locals
+        {
+            let end_pc = self.fs().current_pc() as u32;
+            let fs = self.fs_mut();
+            for local in &fs.scope.locals[num_locals_before_hidden..] {
+                fs.scope.finished_locals.push(crate::compiler::scope::FinishedLocal {
+                    name: local.name,
+                    reg: local.reg,
+                    start_pc: local.start_pc,
+                    end_pc,
+                });
+            }
+            fs.scope.locals.truncate(num_locals_before_hidden);
         }
 
         self.fs_mut().scope.free_reg_to(base);
@@ -2530,6 +2582,10 @@ impl<'a> Compiler<'a> {
             let pc = self.emit_sj(OpCode::Jmp, 0, line);
             self.patch_jump_to(pc, target_pc);
         } else {
+            // Forward goto: emit Close if there are TBC/captured locals in scope
+            if let Some(close_reg) = self.fs().scope.goto_needs_close() {
+                self.emit_abc(OpCode::Close, close_reg, 0, 0, line);
+            }
             let pc = self.emit_sj(OpCode::Jmp, 0, line);
             // Save as pending goto
             if let Some(block) = self.fs_mut().scope.current_block_mut() {
@@ -3017,8 +3073,8 @@ fn compile_inner(compiler: &mut Compiler<'_>, name: &str) -> Result<Proto, Compi
     // Expect EOF
     compiler.expect(&Token::Eof)?;
 
-    // Emit RETURN0
-    let line = compiler.line();
+    // Emit RETURN0 — use last emitted line to match PUC Lua behavior
+    let line = compiler.last_emitted_line().max(1);
     compiler.emit_abc(OpCode::Return0, 0, 0, 0, line);
 
     // Adjust labels at function end and check for unresolved gotos

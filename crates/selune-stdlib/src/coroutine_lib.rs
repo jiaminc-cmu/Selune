@@ -17,6 +17,8 @@ pub struct CoroutineIndices {
     pub wrap_idx: GcIdx<NativeFunction>,
     pub wrap_resume_idx: GcIdx<NativeFunction>,
     pub running_idx: GcIdx<NativeFunction>,
+    pub isyieldable_idx: GcIdx<NativeFunction>,
+    pub close_idx: GcIdx<NativeFunction>,
 }
 
 pub fn register(
@@ -26,10 +28,18 @@ pub fn register(
 ) -> CoroutineIndices {
     let co_table = gc.alloc_table(0, 10);
 
+    // Create shared thread metatable with __name = "thread"
+    let thread_mt = gc.alloc_table(0, 4);
+    let name_key = strings.intern(b"__name");
+    let name_val_sid = strings.intern(b"thread");
+    gc.get_table_mut(thread_mt).raw_set_str(name_key, TValue::from_string_id(name_val_sid));
+    // Protect the metatable so getmetatable returns nothing useful
+    let metatable_key = strings.intern(b"__metatable");
+    gc.get_table_mut(thread_mt).raw_set_str(metatable_key, TValue::from_string_id(name_val_sid));
+    gc.thread_metatable = Some(thread_mt);
+
     register_fn(gc, co_table, strings, "create", native_coroutine_create);
     register_fn(gc, co_table, strings, "status", native_coroutine_status);
-    register_fn(gc, co_table, strings, "isyieldable", native_coroutine_isyieldable);
-    register_fn(gc, co_table, strings, "close", native_coroutine_close);
 
     // Stubs for VM-dispatched functions
     let resume_idx = gc.alloc_native(native_stub, "coroutine.resume");
@@ -57,6 +67,18 @@ pub fn register(
     let running_name = strings.intern(b"running");
     gc.get_table_mut(co_table).raw_set_str(running_name, running_val);
 
+    // coroutine.isyieldable is VM-dispatched (needs to know current coroutine)
+    let isyieldable_idx = gc.alloc_native(native_stub, "coroutine.isyieldable");
+    let isyieldable_val = TValue::from_native(isyieldable_idx);
+    let isyieldable_name = strings.intern(b"isyieldable");
+    gc.get_table_mut(co_table).raw_set_str(isyieldable_name, isyieldable_val);
+
+    // coroutine.close is VM-dispatched (needs VM access to run TBC __close)
+    let close_idx = gc.alloc_native(native_stub, "coroutine.close");
+    let close_val = TValue::from_native(close_idx);
+    let close_name = strings.intern(b"close");
+    gc.get_table_mut(co_table).raw_set_str(close_name, close_val);
+
     // Register coroutine table into _ENV
     let name = strings.intern(b"coroutine");
     gc.get_table_mut(env_idx).raw_set_str(name, TValue::from_table(co_table));
@@ -67,6 +89,8 @@ pub fn register(
         wrap_idx: wrap_stub,
         wrap_resume_idx,
         running_idx,
+        isyieldable_idx,
+        close_idx,
     }
 }
 
@@ -113,6 +137,8 @@ fn native_coroutine_create(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
     ctx.gc.get_table_mut(handle).raw_seti(2, func);
     let suspended_sid = ctx.strings.intern(b"suspended");
     ctx.gc.get_table_mut(handle).raw_seti(3, TValue::from_string_id(suspended_sid));
+    // Set thread metatable so type() returns "thread"
+    ctx.gc.get_table_mut(handle).metatable = ctx.gc.thread_metatable;
 
     Ok(vec![TValue::from_table(handle)])
 }
@@ -121,8 +147,19 @@ fn native_coroutine_create(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
 fn native_coroutine_status(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let co_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let table_idx = co_val.as_table_idx().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'status' (coroutine expected)".to_string())
+        let type_name = selune_core::object::lua_type_name(co_val, ctx.gc);
+        NativeError::String(format!("bad argument #1 to 'status' (coroutine expected, got {})", type_name))
     })?;
+
+    // Verify it's a thread
+    let is_thread = ctx.gc.thread_metatable.map_or(false, |mt| {
+        ctx.gc.get_table(table_idx).metatable == Some(mt)
+    });
+    if !is_thread {
+        return Err(NativeError::String(
+            "bad argument #1 to 'status' (coroutine expected, got table)".to_string(),
+        ));
+    }
 
     let status_val = ctx.gc.get_table(table_idx).raw_geti(3);
     if status_val.as_string_id().is_some() {
@@ -133,19 +170,23 @@ fn native_coroutine_status(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
     }
 }
 
-/// coroutine.isyieldable() — returns false from main thread.
-/// The VM dispatch overrides this when running in a coroutine.
-fn native_coroutine_isyieldable(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let _ = ctx;
-    Ok(vec![TValue::from_bool(false)])
-}
-
 /// coroutine.close(co) — close a suspended coroutine.
 fn native_coroutine_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let co_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let table_idx = co_val.as_table_idx().ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'close' (coroutine expected)".to_string())
+        let type_name = selune_core::object::lua_type_name(co_val, ctx.gc);
+        NativeError::String(format!("bad argument #1 to 'close' (coroutine expected, got {})", type_name))
     })?;
+
+    // Verify it's a thread
+    let is_thread = ctx.gc.thread_metatable.map_or(false, |mt| {
+        ctx.gc.get_table(table_idx).metatable == Some(mt)
+    });
+    if !is_thread {
+        return Err(NativeError::String(
+            "bad argument #1 to 'close' (coroutine expected, got table)".to_string(),
+        ));
+    }
 
     let status_val = ctx.gc.get_table(table_idx).raw_geti(3);
     if let Some(sid) = status_val.as_string_id() {
@@ -153,9 +194,14 @@ fn native_coroutine_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
         if status == b"dead" {
             return Ok(vec![TValue::from_bool(true)]);
         }
-        if status != b"suspended" {
+        if status == b"running" {
             return Err(NativeError::String(
-                "cannot close a running or normal coroutine".to_string(),
+                "cannot close a running coroutine".to_string(),
+            ));
+        }
+        if status == b"normal" {
+            return Err(NativeError::String(
+                "cannot close a normal coroutine".to_string(),
             ));
         }
     }
