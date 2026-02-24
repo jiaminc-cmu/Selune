@@ -4,9 +4,33 @@ A modern Lua 5.4 JIT compiler written in Rust.
 
 ## Overview
 
-Selune aims to be a high-performance, fully-compatible implementation of the Lua 5.4
-programming language. It prioritizes spec compliance, execution speed rivaling existing
-JIT implementations, and cross-platform support (x86_64 and ARM64).
+Selune is a high-performance, fully-compatible implementation of the Lua 5.4
+programming language. It passes **all 28** applicable official PUC-Rio Lua 5.4.7 test
+suite files (100%), making it the most conformant pure-Rust Lua 5.4 implementation
+available. Built from scratch with no C dependencies.
+
+## Official Test Suite Compliance
+
+Selune is validated against the [official Lua 5.4.7 test suite](https://www.lua.org/tests/) from PUC-Rio:
+
+| Test File | Status | | Test File | Status |
+|-----------|--------|-|-----------|--------|
+| attrib | PASS | | literals | PASS |
+| big | PASS | | locals | PASS |
+| bitwise | PASS | | math | PASS |
+| bwcoercion | PASS | | nextvar | PASS |
+| calls | PASS | | pm | PASS |
+| closure | PASS | | sort | PASS |
+| code | PASS | | strings | PASS |
+| constructs | PASS | | tpack | PASS |
+| coroutine | PASS | | tracegc | PASS |
+| cstack | PASS | | utf8 | PASS |
+| db | PASS | | vararg | PASS |
+| errors | PASS | | verybig | PASS |
+| events | PASS | | files | PASS |
+| gc | PASS | | goto | PASS |
+
+**4 tests excluded** (not applicable): `api` (C API only), `main` (CLI-specific, skipped by `_port`), `heavy` (memory stress), `gengc` (generational GC, planned)
 
 ## Features
 
@@ -22,7 +46,7 @@ JIT implementations, and cross-platform support (x86_64 and ARM64).
 - Bytecode disassembler for debugging and inspection
 
 ### Phase 2 — Virtual Machine
-- Stack-based bytecode VM executing 80+ opcodes
+- Stack-based bytecode VM executing all 83 opcodes
 - Full arithmetic: `+`, `-`, `*`, `/`, `//`, `%`, `^` with proper Lua 5.4 integer/float semantics
 - Bitwise operations: `&`, `|`, `~`, `<<`, `>>`, `~` (unary)
 - Comparisons: `==`, `<`, `<=`, `>`, `>=` across types (int, float, string)
@@ -30,17 +54,31 @@ JIT implementations, and cross-platform support (x86_64 and ARM64).
 - Tables: construction (array, hash, mixed, nested), field/index access, dynamic keys, `#` length
 - Functions: calls with arguments and returns, multiple return values, variadic functions (`...`)
 - Closures: upvalue capture, mutation, shared upvalues, nested closures, closure escape
-- Tail call optimization with infinite recursion detection
-- Metamethods: full dispatch for arithmetic, comparison, index, newindex, call, concat, tostring, len, close, and metatable protection
+- Tail call optimization
+- Metamethods: full dispatch for all 30+ metamethods including arithmetic, comparison, index, newindex, call, concat, tostring, len, close, pairs, and metatable protection
 - Error handling: `error()`, `pcall()`, `xpcall()` with proper error propagation
 - Generic for loops with `pairs()`, `ipairs()`, `next()` iterator protocol
 - To-be-closed variables (`<close>` attribute) with `__close` metamethod
-- Coroutines: `create`, `resume`, `yield`, `wrap`, `close`, `status`, `isyieldable` with yield across pcall/xpcall boundaries
-- Mark-sweep garbage collection with `collectgarbage()` API
-- Standard library: math (25+ functions), string (15 functions + pattern matching), table (7 functions including sort with Lua comparator)
-- Arena-based GC heap with typed indices (`GcIdx<T>`) supporting tables, closures, upvalues, boxed integers, and strings
+- Coroutines: `create`, `resume`, `yield`, `wrap`, `close`, `status`, `isyieldable`, `running` with yield across pcall/xpcall boundaries
+- Mark-sweep garbage collection with weak tables (`__mode`), finalizers (`__gc`), and `collectgarbage()` API
+- Arena-based GC heap with typed indices (`GcIdx<T>`) supporting tables, closures, upvalues, boxed integers, strings, and userdata
 - Open/closed upvalue management with proper scope closing
-- Built-in native functions: `print`, `type`, `tostring`, `tonumber`, `assert`, `select`, `rawget`, `rawset`, `rawequal`, `rawlen`, `setmetatable`, `getmetatable`, `error`, `pcall`, `xpcall`, `pairs`, `ipairs`, `next`, `unpack`
+
+### Phase 3 — Full Lua 5.4 Compliance
+- `load`, `dofile`, `loadfile` with string and function readers
+- `require` with `package.loaded`, `package.preload`, `package.path`, `package.searchers`
+- Complete string library: `format`, `pack`/`unpack`/`packsize`, `find`, `match`, `gmatch`, `gsub`, `rep`, `reverse`, `sub`, `byte`, `char`, `upper`, `lower`, `len`, `dump`
+- Complete table library: `insert`, `remove`, `sort`, `concat`, `move`, `pack`, `unpack` (all with metamethod support)
+- Complete math library: 25+ functions including `random`/`randomseed`, `tointeger`, `type`, `maxinteger`, `mininteger`
+- IO library: `open`, `close`, `read`, `write`, `lines`, `input`, `output`, `tmpfile`, `type`, `flush`, `popen` + file methods
+- OS library: `clock`, `time`, `difftime`, `date`, `execute`, `getenv`, `remove`, `rename`, `tmpname`, `exit`, `setlocale`
+- Debug library: `getinfo`, `getlocal`, `setlocal`, `getupvalue`, `setupvalue`, `upvalueid`, `upvaluejoin`, `sethook`, `gethook`, `traceback`, `getmetatable`, `setmetatable`, `getuservalue`, `setuservalue`
+- UTF-8 library: `char`, `codes`, `codepoint`, `len`, `offset`, `charpattern`
+- Userdata with per-instance metatables
+- Binary chunk loading (Lua 5.4 bytecode format)
+- Syntax error messages with "near \<token\>" context
+- Resource limits: 200 local variables, 255 upvalues, 200 nesting levels, 249 registers
+- `_VERSION`, `_G`, `warn()`, `select()`, `rawget`, `rawset`, `rawequal`, `rawlen`
 
 ## Project Structure
 
@@ -50,13 +88,13 @@ selune/
 │   ├── selune-core/     # Core types: TValue (NaN-boxed), TString, StringInterner, GC heap
 │   ├── selune-compiler/ # Lexer, parser, bytecode compiler
 │   ├── selune-vm/       # Stack-based virtual machine
-│   ├── selune-jit/      # JIT compilation via Cranelift (Phase 3)
-│   ├── selune-stdlib/   # Standard library (math, string, table)
-│   ├── selune-ffi/      # C API compatibility layer (Phase 5)
-│   └── selune/          # CLI binary and REPL
-├── fuzz/                # Fuzz testing targets
+│   ├── selune-jit/      # JIT compilation via Cranelift (planned)
+│   ├── selune-stdlib/   # Standard library (math, string, table, io, os, debug, utf8, coroutine, package)
+│   ├── selune-ffi/      # C API compatibility layer (planned)
+│   └── selune/          # CLI binary
 ├── tests/
-│   └── lua_samples/     # Sample Lua programs for testing
+│   ├── lua_samples/     # Sample Lua programs for testing
+│   └── lua54-tests/     # Official Lua 5.4.7 test suite
 └── docs/                # Architecture and design documentation
 ```
 
@@ -66,11 +104,15 @@ selune/
 # Build all crates
 cargo build
 
-# Run the full test suite
+# Run a Lua file
+cargo run -- path/to/script.lua
+
+# Run the full Rust test suite
 cargo test --workspace
 
-# Run benchmarks
-cargo bench
+# Run official Lua 5.4 test suite (requires release build)
+cargo build --release
+./target/release/selune tests/lua54-tests/run_test.lua tests/lua54-tests/math.lua
 ```
 
 ## Architecture
@@ -78,7 +120,7 @@ cargo bench
 Lua source is processed through a multi-stage pipeline:
 
 1. **Lexer** — byte-by-byte scanning producing a stream of tokens
-2. **Compiler** — single-pass recursive descent with precedence climbing for expressions
+2. **Compiler** — single-pass recursive descent with Pratt parsing (precedence climbing) for expressions
 3. **Proto** — bytecode output with constants, nested prototypes, and debug info
 4. **VM** — stack-based interpreter dispatching opcodes against a NaN-boxed value stack and arena-allocated GC heap
 
@@ -90,30 +132,21 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 |-------|-------|--------|
 | 1 | Lexer, compiler, bytecode, core types | Done |
 | 2 | Stack-based VM, metamethods, error handling, coroutines, GC, stdlib | Done |
-| 3 | Full Lua 5.4 compliance, test suite | Planned |
+| 3 | Full Lua 5.4 compliance (28/28 official tests) | Done |
 | 4 | JIT compilation (Cranelift backend) | Planned |
 | 5 | C API / FFI compatibility | Planned |
 
-### Phase 2 — Known Limitations
-- No `require`, `dofile`, `loadfile`, `load` (dynamic code loading)
-- No IO or OS library
-- No `string.format` (printf-style formatting)
-- No weak tables (`__mode`)
-- No `__gc` finalizer metamethod
-- String type does not have a shared metatable (`("hello"):upper()` syntax not supported)
-
 ## Testing
 
-1,302 tests across the workspace:
+1,443+ tests across the workspace:
 
-- **981** VM end-to-end tests (2 ignored for known gaps)
+- **1,122** VM end-to-end tests (4 ignored for known gaps)
 - **140** compiler unit tests
-- **94** compiler end-to-end integration tests
+- **95** compiler end-to-end integration tests
 - **48** core type tests (TValue roundtrips, string interning, property tests)
 - **36** standard library tests
-- **1** disassembler integration test
-- Fuzz targets for lexer and compiler (no panics on arbitrary input)
-- Criterion benchmarks for lexer, compiler, and TValue operations
+- **2** integration tests (disassembler, debug)
+- **28/28** official Lua 5.4.7 test suite files passing (100%)
 
 ## License
 

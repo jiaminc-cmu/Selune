@@ -1582,9 +1582,18 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (1..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
+                        // Push native frame for pcall so it appears in tracebacks
+                        let pcall_func_pos = base + a;
+                        let mut pcall_ci = CallInfo::new(pcall_func_pos, usize::MAX);
+                        pcall_ci.is_lua = false;
+                        pcall_ci.func_stack_idx = pcall_func_pos;
+                        vm.call_stack.push(pcall_ci);
                         let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, pcall_func, &pcall_args) {
                             Ok(results) => {
+                                vm.call_stack.pop(); // pop pcall frame
+                                ci_idx = vm.call_stack.len() - 1;
+                                base = vm.call_stack[ci_idx].base;
                                 // Place (true, results...)
                                 let mut all = vec![TValue::from_bool(true)];
                                 all.extend(results);
@@ -1606,6 +1615,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 // Mark the direct callee frame (not the top frame, which
                                 // may be deeper in nested pcall) so that when it returns
                                 // on resume, return_from_call wraps results as pcall (true, ...).
+                                // Don't pop pcall frame — it stays for yield continuation
                                 if callee_frame_idx < vm.call_stack.len() {
                                     vm.call_stack[callee_frame_idx].call_status = CallStatus::PcallYield {
                                         result_base,
@@ -1615,6 +1625,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
+                                vm.call_stack.pop(); // pop pcall frame
+                                ci_idx = vm.call_stack.len() - 1;
+                                base = vm.call_stack[ci_idx].base;
                                 // Place (false, error_value)
                                 let err_val = e.to_tvalue(&mut vm.strings);
                                 let all = [TValue::from_bool(false), err_val];
@@ -1648,9 +1661,18 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (2..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
+                        // Push native frame for xpcall so it appears in tracebacks
+                        let xpcall_func_pos = base + a;
+                        let mut xpcall_ci = CallInfo::new(xpcall_func_pos, usize::MAX);
+                        xpcall_ci.is_lua = false;
+                        xpcall_ci.func_stack_idx = xpcall_func_pos;
+                        vm.call_stack.push(xpcall_ci);
                         let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, xpcall_func, &xpcall_args) {
                             Ok(results) => {
+                                vm.call_stack.pop(); // pop xpcall frame
+                                ci_idx = vm.call_stack.len() - 1;
+                                base = vm.call_stack[ci_idx].base;
                                 let mut all = vec![TValue::from_bool(true)];
                                 all.extend(results);
                                 let result_count = if num_results < 0 {
@@ -1669,6 +1691,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             Err(LuaError::Yield(vals)) => {
                                 // Yield must propagate through xpcall.
                                 // Mark the direct callee frame so resume wraps results correctly.
+                                // Don't pop xpcall frame — it stays for yield continuation
                                 if callee_frame_idx < vm.call_stack.len() {
                                     vm.call_stack[callee_frame_idx].call_status = CallStatus::XpcallYield {
                                         result_base,
@@ -1679,6 +1702,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
+                                vm.call_stack.pop(); // pop xpcall frame
+                                ci_idx = vm.call_stack.len() - 1;
+                                base = vm.call_stack[ci_idx].base;
                                 // Call handler with error value
                                 let err_val = e.to_tvalue(&mut vm.strings);
                                 let handler_result = call_function(vm, handler, &[err_val]);
@@ -1762,7 +1788,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
 
                         // Fire call hook for redirect native functions
                         if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                            let mut ci = CallInfo::new(base + a, 0);
+                            let mut ci = CallInfo::new(base + a, usize::MAX);
                             ci.is_lua = false;
                             ci.func_stack_idx = base + a;
                             ci.num_results = num_results;
@@ -1776,7 +1802,34 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             base = vm.call_stack[ci_idx].base;
                         }
 
-                        let results = call_function(vm, func_val, &args)?;
+                        // For error(), push native CI so it appears in tracebacks
+                        let is_error_fn = vm.error_idx == Some(native_idx);
+                        if is_error_fn {
+                            let error_func_pos = base + a;
+                            let mut error_ci = CallInfo::new(error_func_pos, usize::MAX);
+                            error_ci.is_lua = false;
+                            error_ci.func_stack_idx = error_func_pos;
+                            error_ci.num_results = num_results;
+                            vm.call_stack.push(error_ci);
+                        }
+
+                        let results = match call_function(vm, func_val, &args) {
+                            Ok(r) => r,
+                            Err(LuaError::Yield(vals)) => {
+                                if is_error_fn {
+                                    vm.call_stack.pop();
+                                }
+                                return Err(LuaError::Yield(vals));
+                            }
+                            Err(e) => {
+                                // Leave error CI on stack for traceback visibility
+                                // (other redirect natives just propagate the error)
+                                return Err(e);
+                            }
+                        };
+                        if is_error_fn {
+                            vm.call_stack.pop();
+                        }
 
                         // Fire return hook BEFORE placing results in caller's registers
                         // so the hook data doesn't overwrite locals.
@@ -1791,7 +1844,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             }
                             let saved_top = vm.stack_top;
                             vm.stack_top = hook_func_pos + 1 + nres;
-                            let mut ci = CallInfo::new(hook_func_pos, 0);
+                            let mut ci = CallInfo::new(hook_func_pos, usize::MAX);
                             ci.is_lua = false;
                             ci.func_stack_idx = hook_func_pos;
                             ci.ftransfer = 1;
@@ -1827,7 +1880,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
 
                         // Fire call hook for native functions
                         if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_CALL != 0 {
-                            let mut ci = CallInfo::new(base + a, 0);
+                            let mut ci = CallInfo::new(base + a, usize::MAX);
                             ci.is_lua = false;
                             ci.func_stack_idx = base + a;
                             ci.num_results = num_results;
@@ -1841,6 +1894,14 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             base = vm.call_stack[ci_idx].base;
                         }
 
+                        // Push native CI frame so it appears in tracebacks
+                        let native_func_pos = base + a;
+                        let mut native_ci = CallInfo::new(native_func_pos, usize::MAX);
+                        native_ci.is_lua = false;
+                        native_ci.func_stack_idx = native_func_pos;
+                        native_ci.num_results = num_results;
+                        vm.call_stack.push(native_ci);
+
                         let native_ref = vm.gc.get_native(native_idx);
                         let native_fn = native_ref.func;
                         let native_upvalue = native_ref.upvalue;
@@ -1853,12 +1914,18 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let results = match native_fn(&mut ctx) {
                             Ok(r) => r,
                             Err(e) => {
+                                // Leave native CI on stack for traceback visibility
                                 let mut err = map_native_error(e);
+                                // Use original ci_idx (the Lua caller), not the native frame
                                 err = qualify_func_name_in_error(vm, ci_idx, func_val, err);
                                 err = adjust_method_error(vm, ci_idx, err);
                                 return Err(add_error_prefix(vm, err));
                             }
                         };
+                        // Pop native CI frame on success
+                        vm.call_stack.pop();
+                        ci_idx = vm.call_stack.len() - 1;
+                        base = vm.call_stack[ci_idx].base;
 
                         // Fire return hook BEFORE placing results in caller's registers
                         if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_RETURN != 0 {
@@ -1871,7 +1938,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             }
                             let saved_top = vm.stack_top;
                             vm.stack_top = hook_func_pos + 1 + nres;
-                            let mut ci = CallInfo::new(hook_func_pos, 0);
+                            let mut ci = CallInfo::new(hook_func_pos, usize::MAX);
                             ci.is_lua = false;
                             ci.func_stack_idx = hook_func_pos;
                             ci.ftransfer = 1;
@@ -2281,6 +2348,13 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 // (so closures from previous iteration capture the old values,
                 //  not the new values that the iterator is about to produce)
                 vm.close_upvalues(base + a + 4);
+                // Ensure stack_top is above all for-generic slots (including TBC and loop vars)
+                // so that call_function doesn't overwrite them when setting up the call frame
+                let min_top = base + a + 4 + c;
+                if vm.stack_top < min_top {
+                    vm.ensure_stack(base, a + 4 + c + 1);
+                    vm.stack_top = min_top;
+                }
                 let iter_func = vm.stack[base + a];
                 let state = vm.stack[base + a + 1];
                 let control = vm.stack[base + a + 2];
@@ -2614,18 +2688,46 @@ fn close_tbc_variables(
 }
 
 /// Close TBC variables during error unwinding.
-/// Iterates frames from the top of call_stack down to target_depth,
-/// closing TBC variables in each frame. Does NOT pop frames.
-/// Propagates the evolving error through all frames.
+/// Collects all TBC slots from frames [target_depth..len), pops those frames,
+/// then closes TBC variables in reverse order (highest stack slot first).
+/// This matches PUC Lua behavior: callee frames are removed from the call stack
+/// before __close handlers run, so debug.getinfo sees the correct caller (e.g. pcall).
 fn unwind_tbc(vm: &mut Vm, target_depth: usize, error_val: Option<TValue>) -> Option<TValue> {
     let len = vm.call_stack.len();
+    // Collect all TBC slots from frames being unwound
+    let mut all_tbc_slots: Vec<usize> = Vec::new();
+    for ci_idx in target_depth..len {
+        all_tbc_slots.extend(vm.call_stack[ci_idx].tbc_slots.drain(..));
+    }
+    // Sort in descending order (close highest stack slots first)
+    all_tbc_slots.sort_unstable_by(|a, b| b.cmp(a));
+    // Pop the unwinding frames BEFORE calling __close handlers
+    vm.call_stack.truncate(target_depth);
+    // Now close TBC variables with the call stack already unwound
     let mut current_err = error_val;
-    for ci_idx in (target_depth..len).rev() {
-        let base = vm.call_stack[ci_idx].base;
-        match close_tbc_variables(vm, ci_idx, base, current_err) {
-            Ok(()) => { /* current_err was consumed or there was none */ current_err = None; }
-            Err(LuaError::LuaValue(v)) => { current_err = Some(v); }
-            Err(e) => { current_err = Some(e.to_tvalue(&mut vm.strings)); }
+    for slot in all_tbc_slots {
+        let val = vm.stack[slot];
+        if val.is_falsy() {
+            continue;
+        }
+        let mm_name = vm.mm_names.as_ref().unwrap().close;
+        if let Some(mm) = metamethod::get_metamethod(val, mm_name, &vm.gc) {
+            let err_arg = current_err.unwrap_or(TValue::nil());
+            vm.in_tbc_close += 1;
+            let result = call_function(vm, mm, &[val, err_arg]);
+            vm.in_tbc_close -= 1;
+            match result {
+                Ok(_) => { /* __close succeeded; current_err preserved */ }
+                Err(LuaError::Yield(_vals)) => {
+                    // Yield during error unwind TBC — unusual but possible
+                    // For now, treat as error
+                    current_err = Some(TValue::nil());
+                }
+                Err(e) => {
+                    // Error in __close replaces the current error
+                    current_err = Some(e.to_tvalue(&mut vm.strings));
+                }
+            }
         }
     }
     current_err
@@ -2794,6 +2896,13 @@ fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
             }
             if pcall_num_results < 0 {
                 vm.stack_top = result_base + all.len();
+            }
+            // Pop the pcall/xpcall native CI that's now on top of the call stack
+            // (it was left there when yield propagated through pcall)
+            if let Some(top) = vm.call_stack.last() {
+                if top.proto_idx == usize::MAX {
+                    vm.call_stack.pop();
+                }
             }
         }
         CallStatus::Normal | CallStatus::CloseReturnYield { .. } => {
@@ -3735,6 +3844,8 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
             // Coroutine finished normally
             vm.remap_open_upvals_to_thread(coro_idx);
             vm.save_coro_state(coro_idx);
+            // Clear call_stack for dead coroutine so traceback shows no frames
+            vm.coroutines[coro_idx].call_stack.clear();
             vm.coroutines[coro_idx].status = CoroutineStatus::Dead;
             let dead_sid = vm.strings.intern(b"dead");
             vm.gc
@@ -4005,7 +4116,7 @@ fn call_function_inner(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec
             let func_pos = vm.stack_top;
             vm.ensure_stack(func_pos + 1, 0);
             vm.stack[func_pos] = func;
-            let mut pcall_ci = CallInfo::new(func_pos, 0);
+            let mut pcall_ci = CallInfo::new(func_pos, usize::MAX);
             pcall_ci.is_lua = false;
             pcall_ci.func_stack_idx = func_pos;
             vm.call_stack.push(pcall_ci);
@@ -4045,7 +4156,7 @@ fn call_function_inner(vm: &mut Vm, func: TValue, args: &[TValue]) -> Result<Vec
             let func_pos = vm.stack_top;
             vm.ensure_stack(func_pos + 1, 0);
             vm.stack[func_pos] = func;
-            let mut xpcall_ci = CallInfo::new(func_pos, 0);
+            let mut xpcall_ci = CallInfo::new(func_pos, usize::MAX);
             xpcall_ci.is_lua = false;
             xpcall_ci.func_stack_idx = func_pos;
             vm.call_stack.push(xpcall_ci);
@@ -5140,6 +5251,10 @@ fn do_debug_getinfo(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErro
                     let tc_key = vm.strings.intern(b"istailcall");
                     vm.gc.get_table_mut(tbl).raw_set_str(tc_key, TValue::from_bool(frame.is_tail_call));
                 }
+                // 'n' — function name from caller's context (works for C functions too)
+                if what_check.contains('n') {
+                    fill_func_name(vm, tbl, frame_idx);
+                }
                 return Ok(vec![TValue::from_table(tbl)]);
             }
 
@@ -5374,11 +5489,7 @@ fn do_debug_traceback(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaEr
             let short_src = make_short_src(&source_bytes);
 
             let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
-            let current_line = if pc < proto.line_info.len() {
-                proto.line_info[pc] as i64
-            } else {
-                0i64
-            };
+            let current_line = proto.get_line(pc) as i64;
 
             // Determine function description
             let func_name = if proto.linedefined == 0 {
@@ -5386,25 +5497,17 @@ fn do_debug_traceback(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaEr
             } else if coro_id.is_none() && vm.in_tbc_close > 0 && frames_shown == 0 {
                 "in metamethod 'close'".to_string()
             } else if frame.is_hook_call {
-                if coro_id.is_none() {
-                    let name = get_frame_func_name(vm, i);
-                    if let Some(n) = name {
-                        format!("in hook '{}'", n)
-                    } else {
-                        format!("in hook <{}:{}>", short_src, proto.linedefined)
-                    }
+                let name = get_func_name_from_call_stack(vm, i, &call_stack_ref);
+                if let Some(n) = name {
+                    format!("in hook '{}'", n)
                 } else {
                     format!("in hook <{}:{}>", short_src, proto.linedefined)
                 }
             } else {
-                // Try to find function name from caller (only for current thread)
-                if coro_id.is_none() {
-                    let name = get_frame_func_name(vm, i);
-                    if let Some(n) = name {
-                        format!("in function '{}'", n)
-                    } else {
-                        format!("in function <{}:{}>", short_src, proto.linedefined)
-                    }
+                // Try to find function name from caller
+                let name = get_func_name_from_call_stack(vm, i, &call_stack_ref);
+                if let Some(n) = name {
+                    format!("in function '{}'", n)
                 } else {
                     format!("in function <{}:{}>", short_src, proto.linedefined)
                 }
@@ -5431,13 +5534,18 @@ fn do_debug_traceback(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaEr
 
 /// Get function name for a frame by examining the caller's bytecode.
 fn get_frame_func_name(vm: &Vm, frame_idx: usize) -> Option<String> {
+    get_func_name_from_call_stack(vm, frame_idx, &vm.call_stack)
+}
+
+/// Get function name for a frame by examining the caller's bytecode in any call stack.
+fn get_func_name_from_call_stack(vm: &Vm, frame_idx: usize, call_stack: &[CallInfo]) -> Option<String> {
     use selune_compiler::opcode::OpCode;
 
     if frame_idx == 0 {
         return None;
     }
     let caller_idx = frame_idx - 1;
-    let caller = &vm.call_stack[caller_idx];
+    let caller = &call_stack[caller_idx];
     if !caller.is_lua || caller.pc == 0 {
         return None;
     }
@@ -5490,6 +5598,18 @@ fn get_frame_func_name(vm: &Vm, frame_idx: usize) -> Option<String> {
                         caller_proto.constants.get(c)
                     {
                         return Some(String::from_utf8_lossy(vm.strings.get_bytes(*sid)).into_owned());
+                    }
+                    break;
+                }
+                OpCode::GetUpval => {
+                    let upval_idx = prev_inst.b() as usize;
+                    if let Some(upval_desc) = caller_proto.upvalues.get(upval_idx) {
+                        if let Some(name_sid) = upval_desc.name {
+                            let name_bytes = vm.strings.get_bytes(name_sid);
+                            if !name_bytes.starts_with(b"(") && name_bytes != b"_ENV" {
+                                return Some(String::from_utf8_lossy(name_bytes).into_owned());
+                            }
+                        }
                     }
                     break;
                 }
@@ -5663,6 +5783,40 @@ fn fill_lua_info(
     }
 }
 
+/// Map metamethod index (from MMBin/MMBinI/MMBinK C field) to name without __ prefix.
+fn mm_idx_to_name(idx: u8) -> &'static [u8] {
+    match idx {
+        0 => b"add",
+        1 => b"sub",
+        2 => b"mul",
+        3 => b"mod",
+        4 => b"pow",
+        5 => b"div",
+        6 => b"idiv",
+        7 => b"band",
+        8 => b"bor",
+        9 => b"bxor",
+        10 => b"shl",
+        11 => b"shr",
+        12 => b"concat",
+        _ => b"unknown",
+    }
+}
+
+/// Set name and namewhat="metamethod" on a debug.getinfo result table.
+fn set_mm_name_on_table(
+    vm: &mut Vm,
+    tbl: selune_core::gc::GcIdx<selune_core::table::Table>,
+    mm_name: &[u8],
+) {
+    let name_key = vm.strings.intern(b"name");
+    let name_val = vm.strings.intern_or_create(mm_name);
+    vm.gc.get_table_mut(tbl).raw_set_str(name_key, TValue::from_string_id(name_val));
+    let namewhat_key = vm.strings.intern(b"namewhat");
+    let namewhat_val = vm.strings.intern_or_create(b"metamethod");
+    vm.gc.get_table_mut(tbl).raw_set_str(namewhat_key, TValue::from_string_id(namewhat_val));
+}
+
 /// Try to find a function name by examining the calling frame's bytecode.
 /// Sets 'name' and 'namewhat' on the result table if found.
 fn fill_func_name(
@@ -5690,6 +5844,37 @@ fn fill_func_name(
 
     let func_reg = match call_inst.opcode() {
         OpCode::Call | OpCode::TailCall => call_inst.a() as usize,
+        // Metamethod invocations via MMBin/MMBinI/MMBinK (arithmetic/bitwise dispatched through fallthrough)
+        OpCode::MMBin | OpCode::MMBinI | OpCode::MMBinK => {
+            let mm_idx = call_inst.c();
+            let mm_name: &[u8] = mm_idx_to_name(mm_idx);
+            set_mm_name_on_table(vm, tbl, mm_name);
+            return;
+        }
+        // Metamethod invocations from comparison ops (call call_function directly)
+        OpCode::Eq | OpCode::EqI | OpCode::EqK => { set_mm_name_on_table(vm, tbl, b"eq"); return; }
+        OpCode::Lt | OpCode::LtI | OpCode::GtI => { set_mm_name_on_table(vm, tbl, b"lt"); return; }
+        OpCode::Le | OpCode::LeI | OpCode::GeI => { set_mm_name_on_table(vm, tbl, b"le"); return; }
+        // Metamethod invocations from index/newindex ops (call via table_index/table_newindex)
+        OpCode::GetTable | OpCode::GetI | OpCode::GetField => { set_mm_name_on_table(vm, tbl, b"index"); return; }
+        OpCode::SetTable | OpCode::SetI | OpCode::SetField => { set_mm_name_on_table(vm, tbl, b"newindex"); return; }
+        // Unary metamethods (call call_function directly)
+        OpCode::Unm => { set_mm_name_on_table(vm, tbl, b"unm"); return; }
+        OpCode::Len => { set_mm_name_on_table(vm, tbl, b"len"); return; }
+        OpCode::BNot => { set_mm_name_on_table(vm, tbl, b"bnot"); return; }
+        OpCode::Concat => { set_mm_name_on_table(vm, tbl, b"concat"); return; }
+        // ShlI/ShrI call call_function directly (no following MMBinI)
+        OpCode::ShlI => { set_mm_name_on_table(vm, tbl, b"shl"); return; }
+        OpCode::ShrI => { set_mm_name_on_table(vm, tbl, b"shr"); return; }
+        OpCode::TForCall => {
+            let name_key = vm.strings.intern(b"name");
+            let name_val = vm.strings.intern_or_create(b"for iterator");
+            vm.gc.get_table_mut(tbl).raw_set_str(name_key, TValue::from_string_id(name_val));
+            let namewhat_key = vm.strings.intern(b"namewhat");
+            let namewhat_val = vm.strings.intern_or_create(b"");
+            vm.gc.get_table_mut(tbl).raw_set_str(namewhat_key, TValue::from_string_id(namewhat_val));
+            return;
+        }
         _ => return,
     };
 
@@ -5757,6 +5942,18 @@ fn fill_func_name(
                     }
                     break;
                 }
+                OpCode::GetUpval => {
+                    let upval_idx = prev_inst.b() as usize;
+                    if let Some(upval_desc) = caller_proto.upvalues.get(upval_idx) {
+                        if let Some(name_sid) = upval_desc.name {
+                            let name_bytes = vm.strings.get_bytes(name_sid).to_vec();
+                            if !name_bytes.starts_with(b"(") && name_bytes != b"_ENV" {
+                                found_name = Some((name_bytes, b"upvalue"));
+                            }
+                        }
+                    }
+                    break;
+                }
                 OpCode::Move => {
                     // Follow the move: check if source is a named local
                     let src_reg = prev_inst.b() as usize;
@@ -5813,6 +6010,37 @@ fn fill_func_name_from_stack(
 
     let func_reg = match call_inst.opcode() {
         OpCode::Call | OpCode::TailCall => call_inst.a() as usize,
+        // Metamethod invocations via MMBin/MMBinI/MMBinK (arithmetic/bitwise dispatched through fallthrough)
+        OpCode::MMBin | OpCode::MMBinI | OpCode::MMBinK => {
+            let mm_idx = call_inst.c();
+            let mm_name: &[u8] = mm_idx_to_name(mm_idx);
+            set_mm_name_on_table(vm, tbl, mm_name);
+            return;
+        }
+        // Metamethod invocations from comparison ops (call call_function directly)
+        OpCode::Eq | OpCode::EqI | OpCode::EqK => { set_mm_name_on_table(vm, tbl, b"eq"); return; }
+        OpCode::Lt | OpCode::LtI | OpCode::GtI => { set_mm_name_on_table(vm, tbl, b"lt"); return; }
+        OpCode::Le | OpCode::LeI | OpCode::GeI => { set_mm_name_on_table(vm, tbl, b"le"); return; }
+        // Metamethod invocations from index/newindex ops (call via table_index/table_newindex)
+        OpCode::GetTable | OpCode::GetI | OpCode::GetField => { set_mm_name_on_table(vm, tbl, b"index"); return; }
+        OpCode::SetTable | OpCode::SetI | OpCode::SetField => { set_mm_name_on_table(vm, tbl, b"newindex"); return; }
+        // Unary metamethods (call call_function directly)
+        OpCode::Unm => { set_mm_name_on_table(vm, tbl, b"unm"); return; }
+        OpCode::Len => { set_mm_name_on_table(vm, tbl, b"len"); return; }
+        OpCode::BNot => { set_mm_name_on_table(vm, tbl, b"bnot"); return; }
+        OpCode::Concat => { set_mm_name_on_table(vm, tbl, b"concat"); return; }
+        // ShlI/ShrI call call_function directly (no following MMBinI)
+        OpCode::ShlI => { set_mm_name_on_table(vm, tbl, b"shl"); return; }
+        OpCode::ShrI => { set_mm_name_on_table(vm, tbl, b"shr"); return; }
+        OpCode::TForCall => {
+            let name_key = vm.strings.intern(b"name");
+            let name_val = vm.strings.intern_or_create(b"for iterator");
+            vm.gc.get_table_mut(tbl).raw_set_str(name_key, TValue::from_string_id(name_val));
+            let namewhat_key = vm.strings.intern(b"namewhat");
+            let namewhat_val = vm.strings.intern_or_create(b"");
+            vm.gc.get_table_mut(tbl).raw_set_str(namewhat_key, TValue::from_string_id(namewhat_val));
+            return;
+        }
         _ => return,
     };
 
@@ -5873,6 +6101,18 @@ fn fill_func_name_from_stack(
                         {
                             let name_bytes = vm.strings.get_bytes(*sid).to_vec();
                             found_name = Some((name_bytes, b"method"));
+                        }
+                    }
+                    break;
+                }
+                OpCode::GetUpval => {
+                    let upval_idx = prev_inst.b() as usize;
+                    if let Some(upval_desc) = caller_proto.upvalues.get(upval_idx) {
+                        if let Some(name_sid) = upval_desc.name {
+                            let name_bytes = vm.strings.get_bytes(name_sid).to_vec();
+                            if !name_bytes.starts_with(b"(") && name_bytes != b"_ENV" {
+                                found_name = Some((name_bytes, b"upvalue"));
+                            }
                         }
                     }
                     break;
@@ -6897,21 +7137,6 @@ fn do_debug_getlocal(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
             }
         }
 
-        if local_n > count {
-            let reg = (local_n - 1) as usize;
-            let frame_top = if frame_idx + 1 < vm.coroutines[cid].call_stack.len() {
-                vm.coroutines[cid].call_stack[frame_idx + 1].func_stack_idx
-            } else {
-                vm.coroutines[cid].stack_top
-            };
-            let stack_idx = base + reg;
-            if stack_idx < frame_top {
-                let temp_name = vm.strings.intern_or_create(b"(temporary)");
-                let val = vm.coroutines[cid].stack.get(stack_idx).copied().unwrap_or(TValue::nil());
-                return Ok(vec![TValue::from_string_id(temp_name), val]);
-            }
-        }
-
         return Ok(vec![TValue::nil()]);
     }
 
@@ -6999,12 +7224,9 @@ fn do_debug_getlocal(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
         }
     }
 
-    // Check for temporaries (registers beyond named locals)
-    // local_n > count means we want a temporary at register base + (local_n - 1)
+    // Check for temporaries (registers beyond named locals) — current thread only
     if local_n > count {
         let reg = (local_n - 1) as usize;
-        // Determine frame top: if there's a frame above this one, use its func_stack_idx,
-        // otherwise use stack_top
         let frame_top = if frame_idx + 1 < vm.call_stack.len() {
             vm.call_stack[frame_idx + 1].func_stack_idx
         } else {
@@ -7116,21 +7338,6 @@ fn do_debug_setlocal(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
             }
         }
 
-        if local_n > count {
-            let reg = (local_n - 1) as usize;
-            let frame_top = if frame_idx + 1 < vm.coroutines[cid].call_stack.len() {
-                vm.coroutines[cid].call_stack[frame_idx + 1].func_stack_idx
-            } else {
-                vm.coroutines[cid].stack_top
-            };
-            let stack_idx = base + reg;
-            if stack_idx < frame_top && stack_idx < vm.coroutines[cid].stack.len() {
-                let temp_name = vm.strings.intern_or_create(b"(temporary)");
-                vm.coroutines[cid].stack[stack_idx] = value_arg;
-                return Ok(vec![TValue::from_string_id(temp_name)]);
-            }
-        }
-
         return Ok(vec![TValue::nil()]);
     }
 
@@ -7197,7 +7404,7 @@ fn do_debug_setlocal(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaErr
         }
     }
 
-    // Check for temporaries (registers beyond named locals)
+    // Check for temporaries (registers beyond named locals) — current thread only
     if local_n > count {
         let reg = (local_n - 1) as usize;
         let frame_top = if frame_idx + 1 < vm.call_stack.len() {
