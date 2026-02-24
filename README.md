@@ -101,7 +101,7 @@ selune/
 │   ├── selune-core/     # Core types: TValue (NaN-boxed), TString, StringInterner, GC heap
 │   ├── selune-compiler/ # Lexer, parser, bytecode compiler
 │   ├── selune-vm/       # Stack-based virtual machine
-│   ├── selune-jit/      # JIT compilation via Cranelift (planned)
+│   ├── selune-jit/      # JIT compilation via Cranelift (in progress)
 │   ├── selune-stdlib/   # Standard library (math, string, table, io, os, debug, utf8, coroutine, package)
 │   ├── selune-ffi/      # C API compatibility layer (planned)
 │   └── selune/          # CLI binary
@@ -142,6 +142,30 @@ Lua source is processed through a multi-stage pipeline:
 
 Key design details are documented in [docs/architecture.md](docs/architecture.md).
 
+## Performance
+
+Benchmarked on arm64 Apple M3, comparing against PUC Lua 5.4.8 and LuaJIT 2.1:
+
+| Benchmark | Selune/PUC | Selune/LuaJIT | Category |
+|-----------|-----------|---------------|----------|
+| binary_trees | 1.15x | 4.60x | GC/allocation |
+| table_hash | 1.32x | 5.78x | Hash table ops |
+| gc_pressure | 1.37x | 9.72x | GC stress |
+| string_concat | 1.64x | 3.68x | String ops |
+| closures | 1.93x | 3.46x | Function/upvalue |
+| mandelbrot | 2.17x | 25.91x | Float math |
+| ackermann | 2.29x | 19.66x | Deep recursion |
+| table_array | 2.49x | 24.53x | Array ops |
+| spectral_norm | 2.79x | 149.17x | Float math |
+| arithmetic | 3.18x | 41.74x | Integer math |
+| coroutines | 3.54x | — | Yield/resume |
+| fibonacci | 3.92x | 42.30x | Recursion |
+| method_calls | 6.42x | 59.92x | OOP dispatch |
+
+**Geometric mean: 2.61x PUC Lua** (across 16 benchmarks). Lower is better; <1.0x means Selune is faster.
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To regenerate: `./benchmarks/run_benchmarks.sh`
+
 ## Roadmap
 
 | Phase | Scope | Status |
@@ -149,7 +173,8 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 | 1 | Lexer, compiler, bytecode, core types | Done |
 | 2 | Stack-based VM, metamethods, error handling, coroutines, GC, stdlib | Done |
 | 3 | Full Lua 5.4 compliance (28/28 official tests) | Done |
-| 4 | JIT compilation (Cranelift backend) | Planned |
+| 3.5 | Interpreter performance optimization (3.27x → 2.61x vs PUC) | Done |
+| 4 | JIT compilation (Cranelift backend) | In Progress |
 | 5 | C API / FFI compatibility | Planned |
 
 ## Testing

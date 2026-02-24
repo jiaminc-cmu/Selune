@@ -69,22 +69,39 @@
 | GC | gc_pressure, binary_trees | Allocation rate, GC pause time, tree traversal |
 | Math | spectral_norm, mandelbrot | Float-heavy tight loops |
 
-### Optimization Roadmap
+### Optimizations Applied
 
-**Short-term (low-hanging fruit):**
-- NaN-boxing dispatch optimizations (reduce branching in hot paths)
-- Table array pre-allocation hints
-- String interning cache improvements
+**Phase 3.5 interpreter performance work (3.27x → 2.61x geo mean):**
 
-**Medium-term:**
+| Optimization | Impact | Details |
+|-------------|--------|---------|
+| Pattern engine: fixed-size capture array | string_match 78x → 8.5x | Eliminated heap allocs in hot backtrack loop |
+| Pattern engine: zero-copy gmatch | string_match 8.5x → current | Two-phase borrow-match-intern avoids 450KB clones |
+| Inline arithmetic fast paths | mandelbrot 6.6x → 2.2x | Integer+float checks directly in dispatch, bypass arith_op() |
+| Inline comparison fast paths | mandelbrot, spectral_norm | Lt/Le/Eq with direct integer/float compare |
+| Coroutine state swap | coroutines 6.4x → 3.5x | std::mem::swap instead of Vec clone on resume/yield |
+| Pre-flatten protos | closures 2.7x → 1.9x | Proto tree pre-walked, closure uses flat index |
+| Local PC variable | arithmetic 3.6x → 3.2x | Cache pc in local, write back at sync points |
+| Shrink CallInfo | ~5% across the board | 120→80 bytes per frame, packed boolean flags |
+| Table access: skip metamethods | table_array 3.0x → 2.5x | GetI/SetI/GetField/SetField skip chain when no metatable |
+| Self_ fast path | method_calls ~7% | Raw lookup + one-level __index table check |
+| Method dispatch: string key fast path | table ops ~5% | raw_get_str() bypasses boxed-int/float checks |
+| Eliminate get_k clone | minor | Direct &constant reference instead of clone |
+
+### Remaining Optimization Opportunities
+
+**Interpreter-level (diminishing returns):**
 - Inline caching for method calls and table lookups
 - Register allocation improvements in the compiler
-- Specialized fast paths for common patterns (e.g., `for i=1,n`)
+- Further ForLoop specialization
 
-**Long-term:**
-- JIT compilation (selune-jit crate)
-- Generational GC (selune-core)
-- SIMD-accelerated string operations
+**JIT (next phase):**
+- JIT compilation via Cranelift (selune-jit crate) — expected 5-50x on numeric benchmarks
+- Type-specialized native code eliminates all dispatch and type-check overhead
+- Inline caching at JIT level for method dispatch
+
+**GC:**
+- Generational GC (selune-core) — would improve gc_pressure and binary_trees
 
 ### How to Profile
 
