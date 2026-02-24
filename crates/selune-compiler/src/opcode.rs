@@ -162,9 +162,11 @@ impl OpCode {
             ExtraArg => IAx,
             // isJ format
             Jmp => IsJ,
-            // iABx format
-            LoadI | LoadF | LoadK | LoadKX | LoadFalse | LFalseSkip | LoadTrue | LoadNil
-            | ForLoop | ForPrep | TForPrep | TForLoop | Closure | VarArgPrep => IABx,
+            // iAsBx format (signed Bx)
+            LoadI | LoadF | ForLoop | ForPrep => IAsBx,
+            // iABx format (unsigned Bx)
+            LoadK | LoadKX | LoadFalse | LFalseSkip | LoadTrue | LoadNil
+            | TForPrep | TForLoop | Closure | VarArgPrep => IABx,
             // All others are iABC
             _ => IABC,
         }

@@ -109,13 +109,15 @@ pub fn lua_hash(bytes: &[u8]) -> u32 {
     h
 }
 
-/// String interner: owns all strings and provides deduplication for short strings.
+/// String interner: owns all strings and provides deduplication for all strings.
 #[derive(Debug)]
 pub struct StringInterner {
     /// All strings, indexed by StringId.
     strings: Vec<TString>,
     /// Lookup table for short string deduplication: hash → list of StringIds.
     short_lookup: HashMap<u32, Vec<u32>>,
+    /// Lookup table for long string deduplication: hash → list of StringIds.
+    long_lookup: HashMap<u32, Vec<u32>>,
 }
 
 impl StringInterner {
@@ -124,7 +126,21 @@ impl StringInterner {
         StringInterner {
             strings: Vec::new(),
             short_lookup: HashMap::new(),
+            long_lookup: HashMap::new(),
         }
+    }
+
+    /// Look up a short string without creating it. Returns None if not yet interned.
+    pub fn find(&self, bytes: &[u8]) -> Option<StringId> {
+        let hash = lua_hash(bytes);
+        if let Some(ids) = self.short_lookup.get(&hash) {
+            for &id in ids {
+                if self.strings[id as usize].as_bytes() == bytes {
+                    return Some(StringId(id));
+                }
+            }
+        }
+        None
     }
 
     /// Intern a short string (<=40 bytes). Returns existing StringId if already interned.
@@ -157,10 +173,22 @@ impl StringInterner {
         }
     }
 
-    /// Create a long string (>40 bytes). NOT interned — each call returns a unique ID.
+    /// Create a long string (>40 bytes). Now interned for correctness (table key dedup).
     pub fn create_long(&mut self, bytes: &[u8]) -> StringId {
+        let hash = lua_hash(bytes);
+
+        // Check for existing entry
+        if let Some(ids) = self.long_lookup.get(&hash) {
+            for &id in ids {
+                if self.strings[id as usize].as_bytes() == bytes {
+                    return StringId(id);
+                }
+            }
+        }
+
         let id = self.strings.len() as u32;
         self.strings.push(TString::new(bytes));
+        self.long_lookup.entry(hash).or_default().push(id);
         StringId(id)
     }
 
@@ -270,13 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn test_long_string_uniqueness() {
+    fn test_long_string_dedup() {
         let mut interner = StringInterner::new();
         let long = vec![b'a'; 100];
         let id1 = interner.create_long(&long);
         let id2 = interner.create_long(&long);
-        // Long strings are NOT interned — different IDs even for same content
-        assert_ne!(id1, id2);
+        // Long strings are now interned — same content produces same ID
+        assert_eq!(id1, id2);
     }
 
     #[test]
@@ -331,7 +359,7 @@ mod tests {
         let long = vec![b'z'; 100];
         let id1 = interner.intern_or_create(&long);
         let id2 = interner.intern_or_create(&long);
-        // Long strings not interned
-        assert_ne!(id1, id2);
+        // Long strings are now also interned for correctness
+        assert_eq!(id1, id2);
     }
 }

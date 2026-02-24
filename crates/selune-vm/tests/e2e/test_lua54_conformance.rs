@@ -2115,7 +2115,9 @@ fn conformance_assert_with_message() {
     run_lua(
         r#"
         local ok, msg = pcall(assert, false, "custom msg")
-        assert(ok == false and msg == "custom msg")
+        assert(ok == false)
+        -- Lua 5.4: assert with explicit message passes it through unchanged (no prefix)
+        assert(msg == "custom msg")
         "#,
     );
 }
@@ -2125,7 +2127,9 @@ fn conformance_assert_default_message() {
     run_lua(
         r#"
         local ok, msg = pcall(assert, false)
-        assert(ok == false and msg == "assertion failed!")
+        assert(ok == false)
+        -- Lua 5.4: assert calls error() which adds "source:line: " prefix
+        assert(msg == "test:2: assertion failed!")
         "#,
     );
 }

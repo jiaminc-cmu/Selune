@@ -3,7 +3,7 @@
 use crate::gc::GcIdx;
 use crate::string::StringId;
 use crate::value::TValue;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 /// A key in the hash part of a table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,8 +22,8 @@ pub enum TableKey {
 pub struct Table {
     /// Array part (1-indexed: array[0] corresponds to key 1).
     array: Vec<TValue>,
-    /// Hash part for non-sequential keys.
-    hash: HashMap<TableKey, TValue>,
+    /// Hash part for non-sequential keys (insertion-order preserving).
+    hash: IndexMap<TableKey, TValue>,
     /// Metatable (if any).
     pub metatable: Option<GcIdx<Table>>,
 }
@@ -33,7 +33,7 @@ impl Table {
     pub fn new(array_hint: usize, hash_hint: usize) -> Self {
         Table {
             array: Vec::with_capacity(array_hint),
-            hash: HashMap::with_capacity(hash_hint),
+            hash: IndexMap::with_capacity(hash_hint),
             metatable: None,
         }
     }
@@ -95,13 +95,21 @@ impl Table {
             }
         }
 
-        // Float that is a whole integer
+        // Float that is a whole integer — treat like integer key for array
         if let Some(f) = key.as_float() {
-            if f.fract() == 0.0 && f >= 1.0 {
+            if f.fract() == 0.0 && f >= 1.0 && f <= i64::MAX as f64 {
                 let i = f as i64;
                 let idx = (i - 1) as usize;
                 if idx < self.array.len() {
                     self.array[idx] = value;
+                    return Ok(());
+                }
+                if idx == self.array.len() {
+                    if value.is_nil() {
+                        return Ok(());
+                    }
+                    self.array.push(value);
+                    self.rehash_from_hash_to_array();
                     return Ok(());
                 }
             }
@@ -109,7 +117,11 @@ impl Table {
 
         let tk = tvalue_to_table_key(key).unwrap();
         if value.is_nil() {
-            self.hash.remove(&tk);
+            // Keep tombstone (nil value) for iteration safety — next() can find dead keys
+            // Only insert tombstone if the key existed; don't pollute with never-existed keys
+            if self.hash.contains_key(&tk) {
+                self.hash.insert(tk, value);
+            }
         } else {
             self.hash.insert(tk, value);
         }
@@ -143,7 +155,7 @@ impl Table {
             }
         }
         if value.is_nil() {
-            self.hash.remove(&TableKey::Integer(key));
+            self.hash.shift_remove(&TableKey::Integer(key));
         } else {
             self.hash.insert(TableKey::Integer(key), value);
         }
@@ -160,7 +172,7 @@ impl Table {
     /// Fast string key set.
     pub fn raw_set_str(&mut self, key: StringId, value: TValue) {
         if value.is_nil() {
-            self.hash.remove(&TableKey::String(key));
+            self.hash.shift_remove(&TableKey::String(key));
         } else {
             self.hash.insert(TableKey::String(key), value);
         }
@@ -191,56 +203,80 @@ impl Table {
     }
 
     /// Get the next key-value pair after `key` (for iteration).
-    pub fn next(&self, key: TValue) -> Option<(TValue, TValue)> {
+    /// Returns Ok(Some(k,v)) for next pair, Ok(None) for end of iteration,
+    /// Err(()) for invalid key (key not found in table).
+    pub fn next(&self, key: TValue) -> Result<Option<(TValue, TValue)>, ()> {
         if key.is_nil() {
             // Start iteration: first non-nil array element
             for (i, v) in self.array.iter().enumerate() {
                 if !v.is_nil() {
-                    return Some((TValue::from_integer((i + 1) as i64), *v));
+                    return Ok(Some((TValue::from_integer((i + 1) as i64), *v)));
                 }
             }
-            // Then hash elements
-            if let Some((&k, &v)) = self.hash.iter().next() {
-                return Some((table_key_to_tvalue(k), v));
+            // Then non-nil hash elements (skip tombstones)
+            for (&k, &v) in &self.hash {
+                if !v.is_nil() {
+                    return Ok(Some((table_key_to_tvalue(k), v)));
+                }
             }
-            return None;
+            return Ok(None);
         }
         // Find current position and return next
         // This is O(n) but sufficient for now
         if let Some(i) = key.as_integer() {
             if i >= 1 && (i as usize) <= self.array.len() {
+                // Key is in array range — present or tombstoned (nil = deleted during iteration)
                 // Look for next non-nil in array
                 for j in (i as usize)..self.array.len() {
                     if !self.array[j].is_nil() {
-                        return Some((TValue::from_integer((j + 1) as i64), self.array[j]));
+                        return Ok(Some((TValue::from_integer((j + 1) as i64), self.array[j])));
                     }
                 }
-                // Then hash
-                if let Some((&k, &v)) = self.hash.iter().next() {
-                    return Some((table_key_to_tvalue(k), v));
+                // Then non-nil hash elements (skip tombstones)
+                for (&k, &v) in &self.hash {
+                    if !v.is_nil() {
+                        return Ok(Some((table_key_to_tvalue(k), v)));
+                    }
                 }
-                return None;
+                return Ok(None);
             }
         }
-        // Key is in hash: find and return next
-        let tk = tvalue_to_table_key(key)?;
+        // Key is in hash: find and return next non-nil
+        let tk = match tvalue_to_table_key(key) {
+            Some(tk) => tk,
+            None => return Err(()), // NaN or nil — invalid key
+        };
         let mut found = false;
         for (&k, &v) in &self.hash {
             if found {
-                return Some((table_key_to_tvalue(k), v));
+                if !v.is_nil() {
+                    return Ok(Some((table_key_to_tvalue(k), v)));
+                }
+                // Skip tombstoned entries
+                continue;
             }
             if k == tk {
                 found = true;
             }
         }
-        None
+        if found {
+            Ok(None) // was last element (or only tombstones remain)
+        } else {
+            Err(()) // key not in hash
+        }
+    }
+
+    /// Remove tombstones (nil-valued entries) from the hash part.
+    /// Called during GC or rehash to reclaim memory.
+    pub fn compact_hash(&mut self) {
+        self.hash.retain(|_, v| !v.is_nil());
     }
 
     /// Move consecutive integer entries from hash into array.
     fn rehash_from_hash_to_array(&mut self) {
         loop {
             let next_idx = self.array.len() as i64 + 1;
-            if let Some(v) = self.hash.remove(&TableKey::Integer(next_idx)) {
+            if let Some(v) = self.hash.shift_remove(&TableKey::Integer(next_idx)) {
                 self.array.push(v);
             } else {
                 break;
@@ -248,9 +284,61 @@ impl Table {
         }
     }
 
+    /// Clear weak entries: remove entries with dead keys/values.
+    /// `is_dead` returns true if the TValue is a collectable GC object that is unmarked.
+    pub fn clear_weak_entries<F>(&mut self, weak_keys: bool, weak_values: bool, is_dead: &F)
+    where
+        F: Fn(TValue) -> bool,
+    {
+        if weak_values {
+            // Clear dead values in array part (set to nil)
+            for v in self.array.iter_mut() {
+                if !v.is_nil() && is_dead(*v) {
+                    *v = TValue::nil();
+                }
+            }
+            // Trim trailing nils from array
+            while self.array.last().map_or(false, |v| v.is_nil()) {
+                self.array.pop();
+            }
+        }
+        // Clear dead keys/values in hash part
+        let mut to_remove = Vec::new();
+        for (k, v) in self.hash.iter() {
+            let key_dead = weak_keys && match k {
+                TableKey::GcPtr(bits) => is_dead(TValue::from_raw_bits(*bits)),
+                _ => false,
+            };
+            let val_dead = weak_values && !v.is_nil() && is_dead(*v);
+            if key_dead || val_dead {
+                to_remove.push(*k);
+            }
+        }
+        for k in to_remove {
+            self.hash.shift_remove(&k);
+        }
+    }
+
     /// Iterate over all values in the array part (for GC traversal).
     pub fn array_values(&self) -> &[TValue] {
         &self.array
+    }
+
+    /// Mutable access to array values (for GC weak table clearing).
+    pub fn array_values_mut(&mut self) -> &mut [TValue] {
+        &mut self.array
+    }
+
+    /// Remove a hash entry by key (for GC weak table clearing).
+    pub fn remove_hash_entry(&mut self, key: &TableKey) {
+        self.hash.shift_remove(key);
+    }
+
+    /// Trim trailing nil values from the array part.
+    pub fn trim_array(&mut self) {
+        while self.array.last().map_or(false, |v| v.is_nil()) {
+            self.array.pop();
+        }
     }
 
     /// Iterate over all key-value pairs in the hash part (for GC traversal).

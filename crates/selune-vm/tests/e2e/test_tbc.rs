@@ -231,11 +231,11 @@ fn test_tbc_close_error_suppressed_on_error() {
     );
 }
 
-// ── TBC with table that has no __close (should be fine) ─────────
+// ── TBC with table that has no __close is a runtime error ─────────
 
 #[test]
 fn test_tbc_no_close_metamethod() {
-    run_check_ints(
+    let err = run_lua_err(
         r#"
         local ok = 1
         do
@@ -243,8 +243,8 @@ fn test_tbc_no_close_metamethod() {
         end
         return ok
         "#,
-        &[1],
     );
+    assert!(err.contains("non-closable value"), "expected non-closable error, got: {err}");
 }
 
 // ── Multiple TBC in different functions ─────────────────────────

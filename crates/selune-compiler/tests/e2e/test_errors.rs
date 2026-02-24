@@ -3,7 +3,7 @@ use super::helpers::*;
 #[test]
 fn e2e_error_unterminated_string() {
     let err = compile_str_err("local x = \"hello");
-    assert!(err.contains("unterminated string"));
+    assert!(err.contains("unfinished string"));
 }
 
 #[test]
@@ -15,7 +15,7 @@ fn e2e_error_break_outside_loop() {
 #[test]
 fn e2e_error_duplicate_label() {
     let err = compile_str_err("::x:: ::x::");
-    assert!(err.contains("duplicate label"));
+    assert!(err.contains("label 'x' already defined"));
 }
 
 #[test]

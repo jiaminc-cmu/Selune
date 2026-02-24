@@ -117,7 +117,8 @@ fn e2e_break() {
 
 #[test]
 fn e2e_goto_forward() {
-    let (proto, _) = compile_str("goto done\nlocal x = 1\n::done::");
+    // Note: goto cannot jump over local declarations in Lua 5.4
+    let (proto, _) = compile_str("goto done\nprint(1)\n::done::");
     assert!(has_opcode(&proto, OpCode::Jmp));
 }
 
@@ -167,4 +168,26 @@ fn e2e_local_const() {
 fn e2e_nested_blocks() {
     let (proto, _) = compile_str("do\n  do\n    local x = 1\n  end\n  local y = 2\nend");
     assert!(count_opcode(&proto, OpCode::LoadI) >= 2);
+}
+
+#[test]
+fn e2e_debug_local_shadow_call() {
+    let code = r#"local f = function (i)
+  if i < 10 then return 'a'
+  else return 'b'
+  end
+end
+local n = 100
+local i = 3
+local t = {}
+local a = nil
+function f(b) return b end
+local f = function (i) return 'a' end
+f(3)
+"#;
+    let (proto, strings) = compile_str(code);
+    let disasm = selune_compiler::disasm::disassemble(&proto, &strings);
+    eprintln!("{}", disasm);
+    // Just check it compiles
+    assert!(has_opcode(&proto, OpCode::Call));
 }

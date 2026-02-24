@@ -71,7 +71,7 @@ fn int_arith(op: ArithOp, a: i64, b: i64, gc: &mut GcHeap) -> Result<TValue, Lua
         ArithOp::Mul => a.wrapping_mul(b),
         ArithOp::IDiv => {
             if b == 0 {
-                return Err(LuaError::Runtime("attempt to perform 'n//0'".to_string()));
+                return Err(LuaError::Runtime("attempt to divide by zero".to_string()));
             }
             lua_idiv(a, b)
         }
@@ -105,20 +105,18 @@ fn float_arith(op: ArithOp, a: f64, b: f64) -> Result<f64, LuaError> {
         ArithOp::Div => a / b,
         ArithOp::Pow => a.powf(b),
         ArithOp::IDiv => {
-            if b == 0.0 {
-                return Err(LuaError::Runtime("attempt to perform 'n//0'".to_string()));
-            }
+            // Float floor division by zero follows IEEE 754:
+            // produces inf, -inf, or NaN (only integer idiv errors on zero)
             (a / b).floor()
         }
         ArithOp::Mod => {
-            if b == 0.0 {
-                return Err(LuaError::Runtime("attempt to perform 'n%0'".to_string()));
-            }
+            // Float modulo by zero follows IEEE 754:
+            // produces NaN (only integer mod errors on zero)
             lua_fmod(a, b)
         }
         ArithOp::BAnd | ArithOp::BOr | ArithOp::BXor | ArithOp::Shl | ArithOp::Shr => {
             return Err(LuaError::Runtime(
-                "attempt to perform bitwise operation on a float value".to_string(),
+                "number has no integer representation".to_string(),
             ));
         }
     })
@@ -126,9 +124,11 @@ fn float_arith(op: ArithOp, a: f64, b: f64) -> Result<f64, LuaError> {
 
 /// Lua integer division (floor division).
 fn lua_idiv(a: i64, b: i64) -> i64 {
-    let d = a / b;
+    // Use wrapping_div to handle i64::MIN / -1 overflow (produces i64::MIN in Lua)
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
     // If signs differ and there's a remainder, round towards negative infinity
-    if (a ^ b) < 0 && d * b != a {
+    if r != 0 && (r ^ b) < 0 {
         d - 1
     } else {
         d
@@ -137,18 +137,19 @@ fn lua_idiv(a: i64, b: i64) -> i64 {
 
 /// Lua integer modulo.
 fn lua_imod(a: i64, b: i64) -> i64 {
-    let r = a % b;
+    let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
-        r + b
+        r.wrapping_add(b)
     } else {
         r
     }
 }
 
-/// Lua float modulo.
+/// Lua float modulo: a % b = a - floor(a/b)*b
+/// Uses sign comparison instead of r*b to avoid underflow with very small numbers.
 fn lua_fmod(a: f64, b: f64) -> f64 {
-    let r = a % b;
-    if r != 0.0 && (r * b) < 0.0 {
+    let r = a % b;  // IEEE 754 fmod (truncated remainder)
+    if r != 0.0 && ((r > 0.0) != (b > 0.0)) {
         r + b
     } else {
         r
@@ -196,6 +197,11 @@ pub fn arith_bnot(v: TValue, gc: &mut GcHeap, strings: &StringInterner) -> Arith
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
     } else if let Some(i) = coerce::to_integer(v, gc, strings) {
         ArithResult::Ok(TValue::from_full_integer(!i, gc))
+    } else if v.is_float() || v.as_number(gc).is_some() {
+        // Number but can't convert to integer
+        ArithResult::Error(crate::error::LuaError::Runtime(
+            "number has no integer representation".to_string(),
+        ))
     } else {
         ArithResult::NeedMetamethod
     }
@@ -223,7 +229,7 @@ pub fn lua_concat(values: &[TValue], gc: &GcHeap, strings: &mut StringInterner) 
 }
 
 /// Bitwise operations that need integer coercion.
-/// Returns NeedMetamethod on type mismatch.
+/// Returns NeedMetamethod on type mismatch, or Error for float-to-int conversion failures.
 pub fn bitwise_op(
     op: ArithOp,
     a: TValue,
@@ -233,16 +239,58 @@ pub fn bitwise_op(
 ) -> ArithResult {
     let ia = match coerce::to_integer(a, gc, strings) {
         Some(i) => i,
-        None => return ArithResult::NeedMetamethod,
+        None => {
+            // If `a` is a float that can't convert to int, only error
+            // immediately when the other operand (`b`) can't possibly
+            // have a metamethod (is number/string). Otherwise return
+            // NeedMetamethod so dispatch can try `b`'s metamethod.
+            if a.is_float() && !could_have_metamethod(b, gc) {
+                return ArithResult::Error(LuaError::Runtime(
+                    "number has no integer representation".to_string(),
+                ));
+            }
+            return ArithResult::NeedMetamethod;
+        }
     };
     let ib = match coerce::to_integer(b, gc, strings) {
         Some(i) => i,
-        None => return ArithResult::NeedMetamethod,
+        None => {
+            if b.is_float() && !could_have_metamethod(a, gc) {
+                return ArithResult::Error(LuaError::Runtime(
+                    "number has no integer representation".to_string(),
+                ));
+            }
+            return ArithResult::NeedMetamethod;
+        }
     };
     match int_arith(op, ia, ib, gc) {
         Ok(v) => ArithResult::Ok(v),
         Err(e) => ArithResult::Error(e),
     }
+}
+
+/// Check if a value could possibly have metamethods (table, userdata,
+/// or a type with a type-wide metatable set).
+fn could_have_metamethod(v: TValue, gc: &GcHeap) -> bool {
+    if v.is_table() || v.is_userdata() {
+        return true;
+    }
+    // Check for type-wide metatables
+    if (v.is_number() || v.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT))
+        && gc.number_metatable.is_some()
+    {
+        return true;
+    }
+    if v.is_bool() && gc.boolean_metatable.is_some() {
+        return true;
+    }
+    if v.is_nil() && gc.nil_metatable.is_some() {
+        return true;
+    }
+    if v.is_string() && gc.string_metatable.is_some() {
+        return true;
+    }
+    false
 }
 
 /// Arithmetic operation enum.

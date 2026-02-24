@@ -104,9 +104,11 @@ for i = 1, 100 do
 end
 
 -- Goto and labels
-goto skip
-local dead = 999
-::skip::
+do
+  goto skip
+  print("dead code")
+  ::skip::
+end
 
 -- Nested closures with upvalue chain
 local function outer()

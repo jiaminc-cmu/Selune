@@ -30,6 +30,7 @@ pub struct MetamethodNames {
     pub concat: StringId,
     pub tostring: StringId,
     pub close: StringId,
+    pub pairs: StringId,
 }
 
 impl MetamethodNames {
@@ -59,6 +60,7 @@ impl MetamethodNames {
             concat: strings.intern(b"__concat"),
             tostring: strings.intern(b"__tostring"),
             close: strings.intern(b"__close"),
+            pairs: strings.intern(b"__pairs"),
         }
     }
 
@@ -85,13 +87,62 @@ impl MetamethodNames {
 
 /// Look up a metamethod on a TValue. Returns Some(method_value) if found.
 pub fn get_metamethod(val: TValue, mm_name: StringId, gc: &GcHeap) -> Option<TValue> {
-    // Only tables have metatables for now
-    let table_idx = val.as_table_idx()?;
-    let mt_idx = gc.get_table(table_idx).metatable?;
-    let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
-    if mm_val.is_nil() {
-        None
-    } else {
-        Some(mm_val)
+    // Check tables
+    if let Some(table_idx) = val.as_table_idx() {
+        let mt_idx = gc.get_table(table_idx).metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
     }
+    // Check userdata
+    if let Some(ud_idx) = val.as_userdata_idx() {
+        let mt_idx = gc.get_userdata(ud_idx).metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
+    }
+    // Check strings (shared string metatable)
+    if val.is_string() {
+        let mt_idx = gc.string_metatable?;
+        let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+        if mm_val.is_nil() {
+            return None;
+        }
+        return Some(mm_val);
+    }
+    // Check numbers (inline int, float, or boxed int)
+    if val.is_number() || val.gc_sub_tag() == Some(selune_core::gc::GC_SUB_BOXED_INT) {
+        if let Some(mt_idx) = gc.number_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
+    // Check booleans
+    if val.is_bool() {
+        if let Some(mt_idx) = gc.boolean_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
+    // Check nil
+    if val.is_nil() {
+        if let Some(mt_idx) = gc.nil_metatable {
+            let mm_val = gc.get_table(mt_idx).raw_get_str(mm_name);
+            if !mm_val.is_nil() {
+                return Some(mm_val);
+            }
+        }
+        return None;
+    }
+    None
 }

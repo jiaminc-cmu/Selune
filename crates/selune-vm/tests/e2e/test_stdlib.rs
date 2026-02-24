@@ -29,10 +29,13 @@ fn test_assert_fail_default_message() {
 
 #[test]
 fn test_assert_fail_custom_message() {
-    let err = run_lua_err("assert(false, 'custom error')");
-    assert!(
-        err.contains("custom error"),
-        "expected 'custom error', got: {err}"
+    // PUC Lua 5.4: assert with explicit message passes it through unchanged
+    run_lua(
+        r#"
+        local ok, msg = pcall(assert, false, 'custom error')
+        assert(ok == false)
+        assert(msg == 'custom error')
+        "#,
     );
 }
 

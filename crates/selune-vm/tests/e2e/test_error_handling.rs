@@ -10,7 +10,7 @@ fn test_error_string() {
         local ok, msg = pcall(function() error("something went wrong") end)
         return msg
         "#,
-        &["something went wrong"],
+        &["test:2: something went wrong"],
     );
 }
 
@@ -69,7 +69,7 @@ fn test_pcall_catches_error_string() {
         local ok, msg = pcall(function() error("boom") end)
         if ok then return "bad" else return msg end
         "#,
-        &["boom"],
+        &["test:2: boom"],
     );
 }
 
@@ -217,7 +217,7 @@ fn test_xpcall_error_with_handler() {
         )
         if ok then return "bad" else return val end
         "#,
-        &["handled: oops"],
+        &["handled: test:3: oops"],
     );
 }
 
@@ -494,7 +494,7 @@ fn test_assert_false_default_message() {
         local ok, msg = pcall(assert, false)
         return msg
         "#,
-        &["assertion failed!"],
+        &["test:2: assertion failed!"],
     );
 }
 

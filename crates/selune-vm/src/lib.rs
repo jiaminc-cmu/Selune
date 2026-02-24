@@ -1,6 +1,7 @@
 //! Selune virtual machine: bytecode interpreter (Phase 2).
 
 pub mod arith;
+pub mod binary_chunk;
 pub mod callinfo;
 pub mod coerce;
 pub mod compare;
