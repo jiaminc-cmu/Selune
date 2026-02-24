@@ -12,7 +12,7 @@ struct RanState {
 }
 
 thread_local! {
-    static RNG_STATE: RefCell<RanState> = RefCell::new(RanState { s: [0; 4] });
+    static RNG_STATE: RefCell<RanState> = const { RefCell::new(RanState { s: [0; 4] }) };
 }
 
 fn rotl(x: u64, n: i32) -> u64 {
@@ -48,7 +48,11 @@ fn setseed(state: &mut RanState, n1: u64, n2: u64) {
 fn i2d(x: u64) -> f64 {
     let shifted = (x >> 11) as i64; // shift right by (64 - 53)
     let r = (shifted as f64) * (1.0 / 9007199254740992.0); // * 2^(-53)
-    if r < 0.0 { r + 1.0 } else { r }
+    if r < 0.0 {
+        r + 1.0
+    } else {
+        r
+    }
 }
 
 /// Project random u64 into [0, n] with rejection sampling — matches Lua 5.4
@@ -97,11 +101,7 @@ fn float_to_integer(f: f64) -> Option<i64> {
 }
 
 /// Register the math library into _ENV.
-pub fn register(
-    env_idx: GcIdx<Table>,
-    gc: &mut GcHeap,
-    strings: &mut StringInterner,
-) {
+pub fn register(env_idx: GcIdx<Table>, gc: &mut GcHeap, strings: &mut StringInterner) {
     let math_table = gc.alloc_table(0, 32);
 
     register_fn(gc, math_table, strings, "abs", native_math_abs);
@@ -123,7 +123,13 @@ pub fn register(
     register_fn(gc, math_table, strings, "max", native_math_max);
     register_fn(gc, math_table, strings, "min", native_math_min);
     register_fn(gc, math_table, strings, "random", native_math_random);
-    register_fn(gc, math_table, strings, "randomseed", native_math_randomseed);
+    register_fn(
+        gc,
+        math_table,
+        strings,
+        "randomseed",
+        native_math_randomseed,
+    );
     register_fn(gc, math_table, strings, "tointeger", native_math_tointeger);
     register_fn(gc, math_table, strings, "type", native_math_type);
     register_fn(gc, math_table, strings, "ult", native_math_ult);
@@ -336,9 +342,7 @@ fn lua_num_lt(a: TValue, b: TValue, gc: &GcHeap) -> bool {
         (Some(ai), Some(bi)) => ai < bi,
         (Some(ai), None) => (ai as f64) < b.as_float().unwrap_or(f64::NAN),
         (None, Some(bi)) => a.as_float().unwrap_or(f64::NAN) < (bi as f64),
-        (None, None) => {
-            a.as_float().unwrap_or(f64::NAN) < b.as_float().unwrap_or(f64::NAN)
-        }
+        (None, None) => a.as_float().unwrap_or(f64::NAN) < b.as_float().unwrap_or(f64::NAN),
     }
 }
 
@@ -380,9 +384,7 @@ fn native_math_min(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
 fn native_math_random(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let nargs = ctx.args.len();
     if nargs > 2 {
-        return Err(NativeError::String(
-            "wrong number of arguments".to_string(),
-        ));
+        return Err(NativeError::String("wrong number of arguments".to_string()));
     }
     RNG_STATE.with(|state_cell| {
         let mut state = state_cell.borrow_mut();
@@ -392,7 +394,10 @@ fn native_math_random(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
             Ok(vec![TValue::from_float(i2d(rv))])
         } else if nargs == 1 {
             let low_val = ctx.args[0].as_full_integer(ctx.gc).ok_or_else(|| {
-                NativeError::String("bad argument #1 to 'random' (number has no integer representation)".to_string())
+                NativeError::String(
+                    "bad argument #1 to 'random' (number has no integer representation)"
+                        .to_string(),
+                )
             })?;
             let rv = nextrand(&mut state);
             if low_val == 0 {
@@ -411,10 +416,16 @@ fn native_math_random(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         } else {
             // random(m, n): return integer in [m, n]
             let low = ctx.args[0].as_full_integer(ctx.gc).ok_or_else(|| {
-                NativeError::String("bad argument #1 to 'random' (number has no integer representation)".to_string())
+                NativeError::String(
+                    "bad argument #1 to 'random' (number has no integer representation)"
+                        .to_string(),
+                )
             })?;
             let up = ctx.args[1].as_full_integer(ctx.gc).ok_or_else(|| {
-                NativeError::String("bad argument #2 to 'random' (number has no integer representation)".to_string())
+                NativeError::String(
+                    "bad argument #2 to 'random' (number has no integer representation)"
+                        .to_string(),
+                )
             })?;
             // Range as unsigned: (up - low) using wrapping subtraction
             let range = (up as u64).wrapping_sub(low as u64);
@@ -540,10 +551,14 @@ fn native_math_ult(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     let a = ctx.args.first().copied().unwrap_or(TValue::nil());
     let b = ctx.args.get(1).copied().unwrap_or(TValue::nil());
     let ai = a.as_full_integer(ctx.gc).ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'ult' (number has no integer representation)".to_string())
+        NativeError::String(
+            "bad argument #1 to 'ult' (number has no integer representation)".to_string(),
+        )
     })?;
     let bi = b.as_full_integer(ctx.gc).ok_or_else(|| {
-        NativeError::String("bad argument #2 to 'ult' (number has no integer representation)".to_string())
+        NativeError::String(
+            "bad argument #2 to 'ult' (number has no integer representation)".to_string(),
+        )
     })?;
     Ok(vec![TValue::from_bool((ai as u64) < (bi as u64))])
 }

@@ -15,11 +15,13 @@ fn test_gc_collect() {
 
 #[test]
 fn test_gc_count_returns_number() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local kb, bytes = collectgarbage("count")
         -- kb should be a number >= 0
         if kb >= 0 then return 1 else return 0 end
-    "#);
+    "#,
+    );
     assert_int(&r, 0, 1);
 }
 
@@ -49,10 +51,12 @@ fn test_gc_isrunning() {
 
 #[test]
 fn test_gc_step() {
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local ok = collectgarbage("step")
         return ok
-    "#);
+    "#,
+    );
     assert_bool(&r, 0, true);
 }
 
@@ -171,7 +175,8 @@ fn test_gc_metatables_survive() {
 fn test_gc_unreachable_collected() {
     // Create many tables, then make them unreachable, then collect
     // Memory should decrease after collection
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         collectgarbage("collect")
         local before = collectgarbage("count")
         -- Create many tables
@@ -186,14 +191,16 @@ fn test_gc_unreachable_collected() {
         local after_gc = collectgarbage("count")
         -- after_gc should be less than after_alloc
         if after_gc < after_alloc then return 1 else return 0 end
-    "#);
+    "#,
+    );
     assert_int(&r, 0, 1);
 }
 
 #[test]
 fn test_gc_cyclic_references_collected() {
     // Create a cycle and check it gets collected
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         collectgarbage("collect")
         local before = collectgarbage("count")
         -- Create a cycle
@@ -208,7 +215,8 @@ fn test_gc_cyclic_references_collected() {
         local after = collectgarbage("count")
         -- Memory should not grow unboundedly
         return 1
-    "#);
+    "#,
+    );
     assert_int(&r, 0, 1);
 }
 
@@ -328,13 +336,15 @@ fn test_gc_fibonacci_with_gc() {
 #[test]
 fn test_gc_count_basic() {
     // collectgarbage("count") should return two numbers
-    let r = run_lua(r#"
+    let r = run_lua(
+        r#"
         local kb, bytes = collectgarbage("count")
         if type(kb) == "number" and type(bytes) == "number" then
             return 1
         else
             return 0
         end
-    "#);
+    "#,
+    );
     assert_int(&r, 0, 1);
 }

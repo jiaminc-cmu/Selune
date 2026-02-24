@@ -231,6 +231,7 @@ impl<'a> Reader<'a> {
         Reader { data, pos: 0 }
     }
 
+    #[allow(dead_code)]
     fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
@@ -294,7 +295,10 @@ impl<'a> Reader<'a> {
         self.read_size().map(|n| n as i32)
     }
 
-    fn read_lua_string(&mut self, strings: &mut StringInterner) -> Result<Option<StringId>, UndumpError> {
+    fn read_lua_string(
+        &mut self,
+        strings: &mut StringInterner,
+    ) -> Result<Option<StringId>, UndumpError> {
         let size = self.read_size()?;
         if size == 0 {
             return Ok(None);
@@ -440,9 +444,11 @@ fn read_function(
                 Constant::Float(f)
             }
             LUA_VSHRSTR | LUA_VLNGSTR => {
-                let sid = reader.read_lua_string(strings)?.ok_or_else(|| UndumpError {
-                    message: "expected string constant".to_string(),
-                })?;
+                let sid = reader
+                    .read_lua_string(strings)?
+                    .ok_or_else(|| UndumpError {
+                        message: "expected string constant".to_string(),
+                    })?;
                 Constant::String(sid)
             }
             _ => {
@@ -538,7 +544,7 @@ mod tests {
         proto.code.push(Instruction(0x00000046)); // Return0
         proto.line_info.push(1);
         proto.constants.push(Constant::Integer(42));
-        proto.constants.push(Constant::Float(3.14));
+        proto.constants.push(Constant::Float(3.5));
         proto.constants.push(Constant::String(const_str));
         proto.constants.push(Constant::Boolean(true));
         proto.constants.push(Constant::Nil);

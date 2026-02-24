@@ -188,7 +188,8 @@ impl<'a> Lexer<'a> {
         // Set token_text from the source bytes consumed
         let token_end = self.pos;
         if token_start < token_end && token_start < self.source.len() {
-            self.token_text = String::from_utf8_lossy(&self.source[token_start..token_end]).into_owned();
+            self.token_text =
+                String::from_utf8_lossy(&self.source[token_start..token_end]).into_owned();
         }
         result
     }
@@ -826,14 +827,17 @@ impl<'a> Lexer<'a> {
             match self.peek() {
                 None => {
                     return Err(LexError {
-                        message: format!("unfinished string near <eof>"),
+                        message: "unfinished string near <eof>".to_string(),
                         line: span.line,
                         column: span.column,
                     });
                 }
                 Some(ch) if ch == b'\n' || ch == b'\r' => {
                     return Err(LexError {
-                        message: format!("unfinished string near {}", self.string_near_token(string_start, false)),
+                        message: format!(
+                            "unfinished string near {}",
+                            self.string_near_token(string_start, false)
+                        ),
                         line: span.line,
                         column: span.column,
                     });
@@ -897,29 +901,55 @@ impl<'a> Lexer<'a> {
                         Some(b'x') => {
                             self.advance_char();
                             let h1 = match self.peek() {
-                                Some(ch) if ch.is_ascii_hexdigit() => { self.advance_char(); hex_value(ch) }
-                                _ => return Err(LexError {
-                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
-                                    line: span.line, column: span.column,
-                                }),
+                                Some(ch) if ch.is_ascii_hexdigit() => {
+                                    self.advance_char();
+                                    hex_value(ch)
+                                }
+                                _ => {
+                                    return Err(LexError {
+                                        message: format!(
+                                            "invalid escape sequence near {}",
+                                            self.string_near_token(string_start, true)
+                                        ),
+                                        line: span.line,
+                                        column: span.column,
+                                    })
+                                }
                             };
                             let h2 = match self.peek() {
-                                Some(ch) if ch.is_ascii_hexdigit() => { self.advance_char(); hex_value(ch) }
-                                _ => return Err(LexError {
-                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
-                                    line: span.line, column: span.column,
-                                }),
+                                Some(ch) if ch.is_ascii_hexdigit() => {
+                                    self.advance_char();
+                                    hex_value(ch)
+                                }
+                                _ => {
+                                    return Err(LexError {
+                                        message: format!(
+                                            "invalid escape sequence near {}",
+                                            self.string_near_token(string_start, true)
+                                        ),
+                                        line: span.line,
+                                        column: span.column,
+                                    })
+                                }
                             };
                             buf.push((h1 << 4) | h2);
                         }
                         Some(b'u') => {
                             self.advance_char();
                             match self.peek() {
-                                Some(b'{') => { self.advance_char(); }
-                                _ => return Err(LexError {
-                                    message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
-                                    line: span.line, column: span.column,
-                                }),
+                                Some(b'{') => {
+                                    self.advance_char();
+                                }
+                                _ => {
+                                    return Err(LexError {
+                                        message: format!(
+                                            "invalid escape sequence near {}",
+                                            self.string_near_token(string_start, true)
+                                        ),
+                                        line: span.line,
+                                        column: span.column,
+                                    })
+                                }
                             }
                             let mut code: u64 = 0;
                             let mut count = 0;
@@ -935,7 +965,10 @@ impl<'a> Lexer<'a> {
                                         count += 1;
                                         if code > 0x7FFF_FFFF {
                                             return Err(LexError {
-                                                message: format!("UTF-8 value too large near {}", self.string_near_token(string_start, false)),
+                                                message: format!(
+                                                    "UTF-8 value too large near {}",
+                                                    self.string_near_token(string_start, false)
+                                                ),
                                                 line: span.line,
                                                 column: span.column,
                                             });
@@ -943,7 +976,10 @@ impl<'a> Lexer<'a> {
                                     }
                                     _ => {
                                         return Err(LexError {
-                                            message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
+                                            message: format!(
+                                                "invalid escape sequence near {}",
+                                                self.string_near_token(string_start, true)
+                                            ),
                                             line: span.line,
                                             column: span.column,
                                         });
@@ -952,7 +988,10 @@ impl<'a> Lexer<'a> {
                             }
                             if count == 0 {
                                 return Err(LexError {
-                                    message: format!("missing unicode value near {}", self.string_near_token(string_start, true)),
+                                    message: format!(
+                                        "missing unicode value near {}",
+                                        self.string_near_token(string_start, true)
+                                    ),
                                     line: span.line,
                                     column: span.column,
                                 });
@@ -993,7 +1032,10 @@ impl<'a> Lexer<'a> {
                             }
                             if val > 255 {
                                 return Err(LexError {
-                                    message: format!("decimal escape too large near {}", self.string_near_token(string_start, true)),
+                                    message: format!(
+                                        "decimal escape too large near {}",
+                                        self.string_near_token(string_start, true)
+                                    ),
                                     line: span.line,
                                     column: span.column,
                                 });
@@ -1002,7 +1044,10 @@ impl<'a> Lexer<'a> {
                         }
                         Some(_ch) => {
                             return Err(LexError {
-                                message: format!("invalid escape sequence near {}", self.string_near_token(string_start, true)),
+                                message: format!(
+                                    "invalid escape sequence near {}",
+                                    self.string_near_token(string_start, true)
+                                ),
                                 line: span.line,
                                 column: span.column,
                             });
@@ -1104,34 +1149,6 @@ impl<'a> Lexer<'a> {
             offset += 1;
         }
         self.peek_at(offset) == Some(b']')
-    }
-
-    fn expect_hex_digit(&mut self, span: Span) -> Result<u8, LexError> {
-        match self.peek() {
-            Some(ch) if ch.is_ascii_hexdigit() => {
-                self.advance_char();
-                Ok(hex_value(ch))
-            }
-            _ => Err(LexError {
-                message: "expected hex digit in escape sequence".to_string(),
-                line: span.line,
-                column: span.column,
-            }),
-        }
-    }
-
-    fn expect_char(&mut self, expected: u8, span: Span) -> Result<(), LexError> {
-        match self.peek() {
-            Some(ch) if ch == expected => {
-                self.advance_char();
-                Ok(())
-            }
-            _ => Err(LexError {
-                message: format!("expected '{}'", expected as char),
-                line: span.line,
-                column: span.column,
-            }),
-        }
     }
 }
 

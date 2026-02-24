@@ -158,10 +158,12 @@ fn test_warn_does_not_error() {
 #[test]
 fn test_warn_control_messages() {
     // @on and @off should not raise errors
-    let results = run_lua(r#"
+    let results = run_lua(
+        r#"
         warn("@off")
         warn("@on")
-    "#);
+    "#,
+    );
     assert_eq!(results.len(), 0);
 }
 
@@ -245,10 +247,12 @@ fn test_loadfile_basic() {
     writeln!(tmp, "return 77").unwrap();
     let path = tmp.path().to_str().unwrap().replace('\\', "/");
 
-    let source = format!(r#"
+    let source = format!(
+        r#"
         local f = loadfile("{path}")
         return f()
-    "#);
+    "#
+    );
     run_check_ints(&source, &[77]);
 }
 

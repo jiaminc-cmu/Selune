@@ -206,8 +206,14 @@ fn test_debug_traceback_returns_message() {
     );
     let sid = results[0].as_string_id().expect("expected string");
     let s = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap();
-    assert!(s.starts_with("hello"), "traceback should start with message, got: {s}");
-    assert!(s.contains("stack traceback:"), "traceback should contain stack info, got: {s}");
+    assert!(
+        s.starts_with("hello"),
+        "traceback should start with message, got: {s}"
+    );
+    assert!(
+        s.contains("stack traceback:"),
+        "traceback should contain stack info, got: {s}"
+    );
 }
 
 #[test]
@@ -219,7 +225,10 @@ fn test_debug_traceback_nil_returns_empty() {
     );
     let sid = results[0].as_string_id().expect("expected string");
     let s = std::str::from_utf8(vm.strings.get_bytes(sid)).unwrap();
-    assert!(s.contains("stack traceback:"), "traceback should contain stack info, got: {s}");
+    assert!(
+        s.contains("stack traceback:"),
+        "traceback should contain stack info, got: {s}"
+    );
 }
 
 // ---- debug.sethook (stub, no-op) ----
@@ -241,4 +250,3 @@ fn test_debug_sethook_noop() {
 fn test_debug_is_table() {
     run_check_strings("return type(debug)", &["table"]);
 }
-

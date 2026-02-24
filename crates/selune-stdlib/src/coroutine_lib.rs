@@ -32,10 +32,12 @@ pub fn register(
     let thread_mt = gc.alloc_table(0, 4);
     let name_key = strings.intern(b"__name");
     let name_val_sid = strings.intern(b"thread");
-    gc.get_table_mut(thread_mt).raw_set_str(name_key, TValue::from_string_id(name_val_sid));
+    gc.get_table_mut(thread_mt)
+        .raw_set_str(name_key, TValue::from_string_id(name_val_sid));
     // Protect the metatable so getmetatable returns nothing useful
     let metatable_key = strings.intern(b"__metatable");
-    gc.get_table_mut(thread_mt).raw_set_str(metatable_key, TValue::from_string_id(name_val_sid));
+    gc.get_table_mut(thread_mt)
+        .raw_set_str(metatable_key, TValue::from_string_id(name_val_sid));
     gc.thread_metatable = Some(thread_mt);
 
     register_fn(gc, co_table, strings, "create", native_coroutine_create);
@@ -45,12 +47,14 @@ pub fn register(
     let resume_idx = gc.alloc_native(native_stub, "coroutine.resume");
     let resume_val = TValue::from_native(resume_idx);
     let resume_name = strings.intern(b"resume");
-    gc.get_table_mut(co_table).raw_set_str(resume_name, resume_val);
+    gc.get_table_mut(co_table)
+        .raw_set_str(resume_name, resume_val);
 
     let yield_idx = gc.alloc_native(native_stub, "coroutine.yield");
     let yield_val = TValue::from_native(yield_idx);
     let yield_name = strings.intern(b"yield");
-    gc.get_table_mut(co_table).raw_set_str(yield_name, yield_val);
+    gc.get_table_mut(co_table)
+        .raw_set_str(yield_name, yield_val);
 
     // coroutine.wrap is also VM-dispatched (needs wrap_resume_idx to set __call)
     let wrap_stub = gc.alloc_native(native_stub, "coroutine.wrap");
@@ -65,23 +69,27 @@ pub fn register(
     let running_idx = gc.alloc_native(native_stub, "coroutine.running");
     let running_val = TValue::from_native(running_idx);
     let running_name = strings.intern(b"running");
-    gc.get_table_mut(co_table).raw_set_str(running_name, running_val);
+    gc.get_table_mut(co_table)
+        .raw_set_str(running_name, running_val);
 
     // coroutine.isyieldable is VM-dispatched (needs to know current coroutine)
     let isyieldable_idx = gc.alloc_native(native_stub, "coroutine.isyieldable");
     let isyieldable_val = TValue::from_native(isyieldable_idx);
     let isyieldable_name = strings.intern(b"isyieldable");
-    gc.get_table_mut(co_table).raw_set_str(isyieldable_name, isyieldable_val);
+    gc.get_table_mut(co_table)
+        .raw_set_str(isyieldable_name, isyieldable_val);
 
     // coroutine.close is VM-dispatched (needs VM access to run TBC __close)
     let close_idx = gc.alloc_native(native_stub, "coroutine.close");
     let close_val = TValue::from_native(close_idx);
     let close_name = strings.intern(b"close");
-    gc.get_table_mut(co_table).raw_set_str(close_name, close_val);
+    gc.get_table_mut(co_table)
+        .raw_set_str(close_name, close_val);
 
     // Register coroutine table into _ENV
     let name = strings.intern(b"coroutine");
-    gc.get_table_mut(env_idx).raw_set_str(name, TValue::from_table(co_table));
+    gc.get_table_mut(env_idx)
+        .raw_set_str(name, TValue::from_table(co_table));
 
     CoroutineIndices {
         resume_idx,
@@ -118,7 +126,11 @@ pub fn get_coro_id(val: TValue, gc: &GcHeap) -> Option<i64> {
 pub fn get_coro_func(val: TValue, gc: &GcHeap) -> Option<TValue> {
     let table_idx = val.as_table_idx()?;
     let func = gc.get_table(table_idx).raw_geti(2);
-    if func.is_function() { Some(func) } else { None }
+    if func.is_function() {
+        Some(func)
+    } else {
+        None
+    }
 }
 
 // ---- Native implementations ----
@@ -133,10 +145,14 @@ fn native_coroutine_create(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
     }
 
     let handle = ctx.gc.alloc_table(4, 0);
-    ctx.gc.get_table_mut(handle).raw_seti(1, TValue::from_integer(-1)); // coro_id = -1 (unallocated)
+    ctx.gc
+        .get_table_mut(handle)
+        .raw_seti(1, TValue::from_integer(-1)); // coro_id = -1 (unallocated)
     ctx.gc.get_table_mut(handle).raw_seti(2, func);
     let suspended_sid = ctx.strings.intern(b"suspended");
-    ctx.gc.get_table_mut(handle).raw_seti(3, TValue::from_string_id(suspended_sid));
+    ctx.gc
+        .get_table_mut(handle)
+        .raw_seti(3, TValue::from_string_id(suspended_sid));
     // Set thread metatable so type() returns "thread"
     ctx.gc.get_table_mut(handle).metatable = ctx.gc.thread_metatable;
 
@@ -148,13 +164,17 @@ fn native_coroutine_status(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
     let co_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let table_idx = co_val.as_table_idx().ok_or_else(|| {
         let type_name = selune_core::object::lua_type_name(co_val, ctx.gc);
-        NativeError::String(format!("bad argument #1 to 'status' (coroutine expected, got {})", type_name))
+        NativeError::String(format!(
+            "bad argument #1 to 'status' (coroutine expected, got {})",
+            type_name
+        ))
     })?;
 
     // Verify it's a thread
-    let is_thread = ctx.gc.thread_metatable.map_or(false, |mt| {
-        ctx.gc.get_table(table_idx).metatable == Some(mt)
-    });
+    let is_thread = ctx
+        .gc
+        .thread_metatable
+        .is_some_and(|mt| ctx.gc.get_table(table_idx).metatable == Some(mt));
     if !is_thread {
         return Err(NativeError::String(
             "bad argument #1 to 'status' (coroutine expected, got table)".to_string(),
@@ -171,17 +191,22 @@ fn native_coroutine_status(ctx: &mut NativeContext) -> Result<Vec<TValue>, Nativ
 }
 
 /// coroutine.close(co) — close a suspended coroutine.
+#[allow(dead_code)]
 fn native_coroutine_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let co_val = ctx.args.first().copied().unwrap_or(TValue::nil());
     let table_idx = co_val.as_table_idx().ok_or_else(|| {
         let type_name = selune_core::object::lua_type_name(co_val, ctx.gc);
-        NativeError::String(format!("bad argument #1 to 'close' (coroutine expected, got {})", type_name))
+        NativeError::String(format!(
+            "bad argument #1 to 'close' (coroutine expected, got {})",
+            type_name
+        ))
     })?;
 
     // Verify it's a thread
-    let is_thread = ctx.gc.thread_metatable.map_or(false, |mt| {
-        ctx.gc.get_table(table_idx).metatable == Some(mt)
-    });
+    let is_thread = ctx
+        .gc
+        .thread_metatable
+        .is_some_and(|mt| ctx.gc.get_table(table_idx).metatable == Some(mt));
     if !is_thread {
         return Err(NativeError::String(
             "bad argument #1 to 'close' (coroutine expected, got table)".to_string(),
@@ -207,7 +232,9 @@ fn native_coroutine_close(ctx: &mut NativeContext) -> Result<Vec<TValue>, Native
     }
 
     let dead_sid = ctx.strings.intern(b"dead");
-    ctx.gc.get_table_mut(table_idx).raw_seti(3, TValue::from_string_id(dead_sid));
+    ctx.gc
+        .get_table_mut(table_idx)
+        .raw_seti(3, TValue::from_string_id(dead_sid));
 
     Ok(vec![TValue::from_bool(true)])
 }

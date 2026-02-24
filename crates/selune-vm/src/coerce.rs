@@ -19,10 +19,8 @@ pub fn to_number(v: TValue, gc: &GcHeap, strings: &StringInterner) -> Option<f64
             Some(f)
         } else if let Some(result) = parse_hex_number(s) {
             Some(result as f64)
-        } else if let Some(f) = parse_hex_float(s) {
-            Some(f)
         } else {
-            None
+            parse_hex_float(s)
         }
     } else {
         None
@@ -67,9 +65,9 @@ pub fn float_to_integer(f: f64) -> Option<i64> {
     // i64::MAX (2^63-1) is NOT exactly representable, but (i64::MAX as f64) rounds
     // up to 2^63. So we check f < 2^63 (which is i64::MIN as f64, negated)
     // and f >= i64::MIN as f64.
-    const IMIN: f64 = i64::MIN as f64;      // -9223372036854775808.0 (exact)
+    const IMIN: f64 = i64::MIN as f64; // -9223372036854775808.0 (exact)
     const IMAX_P1: f64 = -(i64::MIN as f64); // 9223372036854775808.0 = 2^63 (exact)
-    if f >= IMAX_P1 || f < IMIN {
+    if !(IMIN..IMAX_P1).contains(&f) {
         return None;
     }
     // Safe to cast: f is integral and in [i64::MIN, i64::MAX]
@@ -87,14 +85,20 @@ fn parse_hex_number(s: &str) -> Option<i64> {
     } else {
         (false, s)
     };
-    let hex = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
+    let hex = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))?;
     if hex.is_empty() {
         return None;
     }
     // Also handle hex floats like 0x1.0p10 - parse as float
     if hex.contains('.') || hex.contains('p') || hex.contains('P') {
-        let full = if neg { format!("-0x{}", hex) } else { format!("0x{}", hex) };
-        return parse_hex_float(&full).and_then(|f| float_to_integer(f));
+        let full = if neg {
+            format!("-0x{}", hex)
+        } else {
+            format!("0x{}", hex)
+        };
+        return parse_hex_float(&full).and_then(float_to_integer);
     }
     // Parse hex digits with wrapping (Lua 5.4 wraps large hex integers)
     let mut val: u64 = 0;
@@ -124,7 +128,7 @@ pub fn tonumber_from_str(s: &str, gc: &mut GcHeap) -> Option<TValue> {
         };
         t.starts_with("0x") || t.starts_with("0X")
     };
-    
+
     if is_hex {
         // Check if it's a hex float (has '.' or 'p'/'P')
         if trimmed.contains('.') || trimmed.contains('p') || trimmed.contains('P') {
@@ -133,12 +137,12 @@ pub fn tonumber_from_str(s: &str, gc: &mut GcHeap) -> Option<TValue> {
         // Hex integer (with wrapping on overflow)
         return parse_hex_number(trimmed).map(|i| TValue::from_full_integer(i, gc));
     }
-    
+
     // Try decimal integer first
     if let Ok(i) = trimmed.parse::<i64>() {
         return Some(TValue::from_full_integer(i, gc));
     }
-    
+
     // Try float (but reject "inf", "nan", "infinity" which Rust accepts but Lua doesn't)
     {
         let lower = trimmed.to_ascii_lowercase();
@@ -149,7 +153,7 @@ pub fn tonumber_from_str(s: &str, gc: &mut GcHeap) -> Option<TValue> {
             }
         }
     }
-    
+
     None
 }
 
@@ -164,10 +168,12 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     } else {
         (false, s)
     };
-    let hex = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
+    let hex = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))?;
 
     // Split on 'p' or 'P' for exponent
-    let (mantissa_str, exp) = if let Some(p_pos) = hex.find(|c: char| c == 'p' || c == 'P') {
+    let (mantissa_str, exp) = if let Some(p_pos) = hex.find(['p', 'P']) {
         let exp: i64 = hex[p_pos + 1..].parse().ok()?;
         (&hex[..p_pos], exp)
     } else {
@@ -205,7 +211,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
             let digit = c.to_digit(16)? as f64;
             value = value * 16.0 + digit;
             bin_exp -= 4; // compensate: multiplying by 16 = adding 4 to bin_exp
-            // Renormalize to avoid infinity
+                          // Renormalize to avoid infinity
             if value > 1e18 {
                 value *= 1.0 / (1u64 << 52) as f64;
                 bin_exp += 52;
@@ -278,7 +284,7 @@ fn format_g14(f: f64) -> String {
     // %.14g: use fixed notation if exponent is in [-4, 14), else scientific
     let abs = f.abs();
     let exp = abs.log10().floor() as i32;
-    if exp >= -4 && exp < 14 {
+    if (-4..14).contains(&exp) {
         // Fixed notation: 14 significant digits
         let decimals = (13 - exp).max(0) as usize;
         let mut s = format!("{:.*}", decimals, f);

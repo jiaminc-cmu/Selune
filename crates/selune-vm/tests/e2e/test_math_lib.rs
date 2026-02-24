@@ -19,7 +19,7 @@ fn test_math_abs_zero() {
 
 #[test]
 fn test_math_abs_float() {
-    run_check_floats("return math.abs(-3.14)", &[3.14]);
+    run_check_floats("return math.abs(-3.5)", &[3.5]);
 }
 
 // ---- math.ceil / math.floor ----
@@ -221,7 +221,7 @@ fn test_math_random_no_args() {
     // Should return float in [0, 1)
     let results = run_lua("math.randomseed(42)\nreturn math.random()");
     let f = results[0].as_float().expect("expected float");
-    assert!(f >= 0.0 && f < 1.0, "random() = {f}, expected [0,1)");
+    assert!((0.0..1.0).contains(&f), "random() = {f}, expected [0,1)");
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn test_math_random_one_arg() {
         "#,
     );
     let i = results[0].as_integer().expect("expected integer");
-    assert!(i >= 1 && i <= 10, "random(10) = {i}, expected [1,10]");
+    assert!((1..=10).contains(&i), "random(10) = {i}, expected [1,10]");
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn test_math_random_two_args() {
         "#,
     );
     let i = results[0].as_integer().expect("expected integer");
-    assert!(i >= 5 && i <= 15, "random(5,15) = {i}, expected [5,15]");
+    assert!((5..=15).contains(&i), "random(5,15) = {i}, expected [5,15]");
 }
 
 // ---- math.tointeger ----

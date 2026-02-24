@@ -148,7 +148,7 @@ fn lua_imod(a: i64, b: i64) -> i64 {
 /// Lua float modulo: a % b = a - floor(a/b)*b
 /// Uses sign comparison instead of r*b to avoid underflow with very small numbers.
 fn lua_fmod(a: f64, b: f64) -> f64 {
-    let r = a % b;  // IEEE 754 fmod (truncated remainder)
+    let r = a % b; // IEEE 754 fmod (truncated remainder)
     if r != 0.0 && ((r > 0.0) != (b > 0.0)) {
         r + b
     } else {

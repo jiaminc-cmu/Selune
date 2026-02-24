@@ -31,12 +31,48 @@ pub fn register(
     let debug_table = gc.alloc_table(0, 16);
 
     // Functions implementable with NativeContext
-    register_fn(gc, debug_table, strings, "getmetatable", native_debug_getmetatable);
-    register_fn(gc, debug_table, strings, "setmetatable", native_debug_setmetatable);
-    register_fn(gc, debug_table, strings, "upvalueid", native_debug_upvalueid);
-    register_fn(gc, debug_table, strings, "upvaluejoin", native_debug_upvaluejoin);
-    register_fn(gc, debug_table, strings, "getuservalue", native_debug_getuservalue);
-    register_fn(gc, debug_table, strings, "setuservalue", native_debug_setuservalue);
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "getmetatable",
+        native_debug_getmetatable,
+    );
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "setmetatable",
+        native_debug_setmetatable,
+    );
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "upvalueid",
+        native_debug_upvalueid,
+    );
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "upvaluejoin",
+        native_debug_upvaluejoin,
+    );
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "getuservalue",
+        native_debug_getuservalue,
+    );
+    register_fn(
+        gc,
+        debug_table,
+        strings,
+        "setuservalue",
+        native_debug_setuservalue,
+    );
 
     // getupvalue/setupvalue need full VM access (redirected through dispatch.rs)
     let getupvalue_idx = gc.alloc_native(native_debug_getupvalue, "getupvalue");
@@ -52,10 +88,8 @@ pub fn register(
 
     // getinfo needs full VM access (redirected through dispatch.rs)
     let getinfo_idx = gc.alloc_native(native_debug_getinfo, "getinfo");
-    gc.get_table_mut(debug_table).raw_set_str(
-        strings.intern(b"getinfo"),
-        TValue::from_native(getinfo_idx),
-    );
+    gc.get_table_mut(debug_table)
+        .raw_set_str(strings.intern(b"getinfo"), TValue::from_native(getinfo_idx));
 
     // traceback needs full VM access (redirected through dispatch.rs)
     let traceback_idx = gc.alloc_native(native_debug_traceback, "traceback");
@@ -66,15 +100,11 @@ pub fn register(
 
     // Functions that need full VM access (redirected through dispatch.rs)
     let sethook_idx = gc.alloc_native(native_debug_sethook, "sethook");
-    gc.get_table_mut(debug_table).raw_set_str(
-        strings.intern(b"sethook"),
-        TValue::from_native(sethook_idx),
-    );
+    gc.get_table_mut(debug_table)
+        .raw_set_str(strings.intern(b"sethook"), TValue::from_native(sethook_idx));
     let gethook_idx = gc.alloc_native(native_debug_gethook, "gethook");
-    gc.get_table_mut(debug_table).raw_set_str(
-        strings.intern(b"gethook"),
-        TValue::from_native(gethook_idx),
-    );
+    gc.get_table_mut(debug_table)
+        .raw_set_str(strings.intern(b"gethook"), TValue::from_native(gethook_idx));
     let getlocal_idx = gc.alloc_native(native_debug_getlocal, "getlocal");
     gc.get_table_mut(debug_table).raw_set_str(
         strings.intern(b"getlocal"),

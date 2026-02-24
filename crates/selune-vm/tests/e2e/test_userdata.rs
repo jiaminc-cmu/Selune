@@ -1,7 +1,7 @@
-/// Tests for userdata type infrastructure.
-/// These are Rust-level tests since Lua scripts can't create userdata directly
-/// (userdata is created by native code like io.open).
-/// The Lua-visible behavior is tested through type() and the io library later.
+// Tests for userdata type infrastructure.
+// These are Rust-level tests since Lua scripts can't create userdata directly
+// (userdata is created by native code like io.open).
+// The Lua-visible behavior is tested through type() and the io library later.
 
 #[allow(unused_imports)]
 use super::helpers::*;
@@ -95,8 +95,8 @@ fn test_userdata_gc_mark_preserves() {
 #[test]
 fn test_userdata_gc_marks_metatable() {
     use selune_core::gc::GcHeap;
-    use selune_core::value::TValue;
     use selune_core::string::StringInterner;
+    use selune_core::value::TValue;
 
     let mut gc = GcHeap::new();
     let mut strings = StringInterner::new();
@@ -105,7 +105,8 @@ fn test_userdata_gc_marks_metatable() {
     let mt_idx = gc.alloc_table(0, 4);
     let key = strings.intern(b"__name");
     let name_sid = strings.intern(b"MyType");
-    gc.get_table_mut(mt_idx).raw_set_str(key, TValue::from_string_id(name_sid));
+    gc.get_table_mut(mt_idx)
+        .raw_set_str(key, TValue::from_string_id(name_sid));
 
     // Create userdata with this metatable
     let ud_idx = gc.alloc_userdata(Box::new(0u8), Some(mt_idx));

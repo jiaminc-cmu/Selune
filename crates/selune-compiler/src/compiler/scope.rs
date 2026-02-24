@@ -331,7 +331,11 @@ impl ScopeManager {
         // but break still needs to close it.
         let scan_start = if loop_entry_locals > 0 {
             let prev = &self.locals[loop_entry_locals - 1];
-            if prev.is_close { loop_entry_locals - 1 } else { loop_entry_locals }
+            if prev.is_close {
+                loop_entry_locals - 1
+            } else {
+                loop_entry_locals
+            }
         } else {
             loop_entry_locals
         };

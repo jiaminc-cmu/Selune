@@ -5,22 +5,27 @@ use selune_core::string::StringInterner;
 use selune_core::table::Table;
 use selune_core::value::TValue;
 use std::cell::RefCell;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 
 // ---------------------------------------------------------------------------
 // Thread-local default file handles
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    static DEFAULT_INPUT: RefCell<Option<GcIdx<Userdata>>> = RefCell::new(None);
-    static DEFAULT_OUTPUT: RefCell<Option<GcIdx<Userdata>>> = RefCell::new(None);
+    static DEFAULT_INPUT: RefCell<Option<GcIdx<Userdata>>> = const { RefCell::new(None) };
+    static DEFAULT_OUTPUT: RefCell<Option<GcIdx<Userdata>>> = const { RefCell::new(None) };
     /// Shared metatable for all file handles.
-    static FILE_METATABLE: RefCell<Option<GcIdx<Table>>> = RefCell::new(None);
+    static FILE_METATABLE: RefCell<Option<GcIdx<Table>>> = const { RefCell::new(None) };
 }
 
 /// Return the GC-relevant roots held by the io library (default input, default output, file metatable).
 /// Called by the VM's GC mark phase so these thread-local handles are not prematurely collected.
-pub fn gc_roots() -> (Option<GcIdx<Userdata>>, Option<GcIdx<Userdata>>, Option<GcIdx<Table>>) {
+#[allow(clippy::type_complexity)]
+pub fn gc_roots() -> (
+    Option<GcIdx<Userdata>>,
+    Option<GcIdx<Userdata>>,
+    Option<GcIdx<Table>>,
+) {
     let input = DEFAULT_INPUT.with(|cell| *cell.borrow());
     let output = DEFAULT_OUTPUT.with(|cell| *cell.borrow());
     let mt = FILE_METATABLE.with(|cell| *cell.borrow());
@@ -284,7 +289,7 @@ fn get_file_arg(
     let got = if ctx.args.get(idx).is_none() {
         "got no value".to_string()
     } else {
-        let tname = selune_core::object::obj_type_name(val, &ctx.gc, ctx.strings);
+        let tname = selune_core::object::obj_type_name(val, ctx.gc, ctx.strings);
         format!("FILE* expected, got {}", tname)
     };
     Err(NativeError::String(format!(
@@ -300,15 +305,27 @@ fn io_error_result(strings: &mut StringInterner, err: io::Error) -> Vec<TValue> 
     let msg = err.to_string();
     let sid = strings.intern_or_create(msg.as_bytes());
     let errno = err.raw_os_error().unwrap_or(0) as i64;
-    vec![TValue::nil(), TValue::from_string_id(sid), TValue::from_integer(errno)]
+    vec![
+        TValue::nil(),
+        TValue::from_string_id(sid),
+        TValue::from_integer(errno),
+    ]
 }
 
 /// Return a Lua-style I/O error with filename prefix: nil, "filename: errmsg", errno.
-fn io_error_result_with_name(strings: &mut StringInterner, filename: &str, err: io::Error) -> Vec<TValue> {
+fn io_error_result_with_name(
+    strings: &mut StringInterner,
+    filename: &str,
+    err: io::Error,
+) -> Vec<TValue> {
     let msg = format!("{}: {}", filename, err);
     let sid = strings.intern_or_create(msg.as_bytes());
     let errno = err.raw_os_error().unwrap_or(0) as i64;
-    vec![TValue::nil(), TValue::from_string_id(sid), TValue::from_integer(errno)]
+    vec![
+        TValue::nil(),
+        TValue::from_string_id(sid),
+        TValue::from_integer(errno),
+    ]
 }
 
 /// Get a mutable reference to the LuaFile inside a userdata, using a raw pointer
@@ -445,17 +462,12 @@ fn read_line_bytes(lua_file: &mut LuaFile, buf: &mut Vec<u8>) -> Result<usize, N
     Ok(total)
 }
 
-fn read_all(
-    lua_file: &mut LuaFile,
-    strings: &mut StringInterner,
-) -> Result<TValue, NativeError> {
+fn read_all(lua_file: &mut LuaFile, strings: &mut StringInterner) -> Result<TValue, NativeError> {
     let mut buf = Vec::new();
-    lua_file
-        .read_to_end(&mut buf)
-        .map_err(|e| {
-            let errno = e.raw_os_error().unwrap_or(0);
-            NativeError::IoError(e.to_string(), errno)
-        })?;
+    lua_file.read_to_end(&mut buf).map_err(|e| {
+        let errno = e.raw_os_error().unwrap_or(0);
+        NativeError::IoError(e.to_string(), errno)
+    })?;
     let sid = strings.intern_or_create(&buf);
     Ok(TValue::from_string_id(sid))
 }
@@ -608,9 +620,15 @@ fn parse_lua_number(s: &str, gc: &mut GcHeap) -> Option<TValue> {
         } else {
             (false, trimmed)
         };
-        let hex_digits = hex_str.strip_prefix("0x").or_else(|| hex_str.strip_prefix("0X"))?;
+        let hex_digits = hex_str
+            .strip_prefix("0x")
+            .or_else(|| hex_str.strip_prefix("0X"))?;
         let val = u64::from_str_radix(hex_digits, 16).ok()?;
-        let ival = if neg { (val as i64).wrapping_neg() } else { val as i64 };
+        let ival = if neg {
+            (val as i64).wrapping_neg()
+        } else {
+            val as i64
+        };
         return Some(TValue::from_full_integer(ival, gc));
     }
 
@@ -637,7 +655,9 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     } else {
         (false, s)
     };
-    let rest = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
+    let rest = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))?;
 
     let mut mantissa: f64 = 0.0;
     let mut frac_exp: i32 = 0;
@@ -806,7 +826,7 @@ fn format_lua_float(f: f64) -> String {
     // Parse the exponent from the scientific notation
     if let Some(e_pos) = fixed.find('e') {
         let exp: i32 = fixed[e_pos + 1..].parse().unwrap_or(0);
-        if exp >= -4 && exp < 14 {
+        if (-4..14).contains(&exp) {
             // Use fixed-point notation with enough decimal places
             let decimals = if exp >= 0 {
                 (13 - exp).max(0) as usize
@@ -845,11 +865,7 @@ fn format_lua_float(f: f64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Register the io library into _ENV.
-pub fn register(
-    env_idx: GcIdx<Table>,
-    gc: &mut GcHeap,
-    strings: &mut StringInterner,
-) {
+pub fn register(env_idx: GcIdx<Table>, gc: &mut GcHeap, strings: &mut StringInterner) {
     // 1) Create the file handle metatable with __index methods
     let methods_table = gc.alloc_table(0, 16);
     register_fn(gc, methods_table, strings, "read", native_file_read);
@@ -1102,7 +1118,11 @@ fn native_io_read(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
             Ok(val) => results.push(val),
             Err(NativeError::IoError(msg, errno)) => {
                 let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
-                return Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)]);
+                return Ok(vec![
+                    TValue::nil(),
+                    TValue::from_string_id(msg_sid),
+                    TValue::from_integer(errno as i64),
+                ]);
             }
             Err(e) => return Err(e),
         }
@@ -1140,7 +1160,11 @@ fn native_io_write(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         Ok(r) => Ok(r),
         Err(NativeError::IoError(msg, errno)) => {
             let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
-            Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)])
+            Ok(vec![
+                TValue::nil(),
+                TValue::from_string_id(msg_sid),
+                TValue::from_integer(errno as i64),
+            ])
         }
         Err(e) => Err(e),
     }
@@ -1340,11 +1364,13 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
     let first_arg = ctx.args.first().copied().unwrap_or(TValue::nil());
 
     // Parse format arguments (args after filename)
-    let fmt_args = if ctx.args.len() > 1 { &ctx.args[1..] } else { &[] };
+    let fmt_args = if ctx.args.len() > 1 {
+        &ctx.args[1..]
+    } else {
+        &[]
+    };
     if fmt_args.len() > MAXARGLINE {
-        return Err(NativeError::String(
-            "too many arguments".to_string(),
-        ));
+        return Err(NativeError::String("too many arguments".to_string()));
     }
     let formats: Vec<ReadFormat> = {
         let mut fmts = Vec::with_capacity(fmt_args.len());
@@ -1368,9 +1394,9 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
         let upvalue = TValue::from_userdata(state_ud);
 
-        let iter_fn = ctx
-            .gc
-            .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
+        let iter_fn =
+            ctx.gc
+                .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
         return Ok(vec![TValue::from_native(iter_fn)]);
     }
 
@@ -1392,12 +1418,17 @@ fn native_io_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> 
         let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
         let upvalue = TValue::from_userdata(state_ud);
 
-        let iter_fn = ctx
-            .gc
-            .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
+        let iter_fn =
+            ctx.gc
+                .alloc_native_with_upvalue(native_lines_iterator, "io.lines iterator", upvalue);
         let file_tval = TValue::from_userdata(ud_idx);
         // Return 4 values: (iter, file, nil, file) for the to-be-closed protocol
-        return Ok(vec![TValue::from_native(iter_fn), file_tval, TValue::nil(), file_tval]);
+        return Ok(vec![
+            TValue::from_native(iter_fn),
+            file_tval,
+            TValue::nil(),
+            file_tval,
+        ]);
     }
 
     Err(NativeError::String(
@@ -1413,9 +1444,10 @@ struct LinesIterState {
     formats: Vec<ReadFormat>,
 }
 
-
 fn native_lines_iterator(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
-    let state_ud_idx = ctx.upvalue.as_userdata_idx()
+    let state_ud_idx = ctx
+        .upvalue
+        .as_userdata_idx()
         .ok_or_else(|| NativeError::String("lines iterator: no state".to_string()))?;
 
     let state_ud = ctx.gc.get_userdata(state_ud_idx);
@@ -1437,9 +1469,7 @@ fn native_lines_iterator(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeE
     let lua_file = unsafe { &mut *lua_file_ptr };
 
     if lua_file.is_closed {
-        return Err(NativeError::String(
-            "file is already closed".to_string(),
-        ));
+        return Err(NativeError::String("file is already closed".to_string()));
     }
 
     if formats.is_empty() {
@@ -1523,7 +1553,11 @@ fn native_file_read(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
             Err(NativeError::IoError(msg, errno)) => {
                 // IO errors return (nil, msg, errno) instead of raising
                 let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
-                return Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)]);
+                return Ok(vec![
+                    TValue::nil(),
+                    TValue::from_string_id(msg_sid),
+                    TValue::from_integer(errno as i64),
+                ]);
             }
             Err(e) => return Err(e),
         }
@@ -1554,7 +1588,11 @@ fn native_file_write(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
         Ok(r) => Ok(r),
         Err(NativeError::IoError(msg, errno)) => {
             let msg_sid = ctx.strings.intern_or_create(msg.as_bytes());
-            Ok(vec![TValue::nil(), TValue::from_string_id(msg_sid), TValue::from_integer(errno as i64)])
+            Ok(vec![
+                TValue::nil(),
+                TValue::from_string_id(msg_sid),
+                TValue::from_integer(errno as i64),
+            ])
         }
         Err(e) => Err(e),
     }
@@ -1639,14 +1677,25 @@ fn native_file_seek(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError>
 
 fn native_file_setvbuf(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
     let ud_idx = get_file_arg(ctx, 0, "setvbuf")?;
-    let mode_sid = ctx.args.get(1).and_then(|v| v.as_string_id()).ok_or_else(|| {
-        NativeError::String("bad argument #1 to 'setvbuf' (string expected)".to_string())
-    })?;
+    let mode_sid = ctx
+        .args
+        .get(1)
+        .and_then(|v| v.as_string_id())
+        .ok_or_else(|| {
+            NativeError::String("bad argument #1 to 'setvbuf' (string expected)".to_string())
+        })?;
     let mode_str = std::str::from_utf8(ctx.strings.get_bytes(mode_sid)).unwrap_or("");
-    let size = ctx.args.get(2).and_then(|v| v.as_full_integer(ctx.gc)).unwrap_or(0) as usize;
+    let size = ctx
+        .args
+        .get(2)
+        .and_then(|v| v.as_full_integer(ctx.gc))
+        .unwrap_or(0) as usize;
 
-    let lua_file: &mut LuaFile = ctx.gc.get_userdata_mut(ud_idx)
-        .data.downcast_mut::<LuaFile>()
+    let lua_file: &mut LuaFile = ctx
+        .gc
+        .get_userdata_mut(ud_idx)
+        .data
+        .downcast_mut::<LuaFile>()
         .ok_or_else(|| NativeError::String("not a file".to_string()))?;
 
     // Helper: extract raw File from BufferedFile
@@ -1701,7 +1750,8 @@ fn native_file_setvbuf(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErr
         }
         _ => {
             return Err(NativeError::String(format!(
-                "bad argument #1 to 'setvbuf' (invalid option '{}')", mode_str
+                "bad argument #1 to 'setvbuf' (invalid option '{}')",
+                mode_str
             )));
         }
     }
@@ -1717,7 +1767,11 @@ fn native_file_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
     let ud_idx = get_file_arg(ctx, 0, "lines")?;
 
     // Parse format arguments (args after self)
-    let fmt_args = if ctx.args.len() > 1 { &ctx.args[1..] } else { &[] };
+    let fmt_args = if ctx.args.len() > 1 {
+        &ctx.args[1..]
+    } else {
+        &[]
+    };
     let formats: Vec<ReadFormat> = {
         let mut fmts = Vec::with_capacity(fmt_args.len());
         for &arg in fmt_args {
@@ -1734,9 +1788,9 @@ fn native_file_lines(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError
     let state_ud = ctx.gc.alloc_userdata(Box::new(state), None);
     let upvalue = TValue::from_userdata(state_ud);
 
-    let iter_fn = ctx
-        .gc
-        .alloc_native_with_upvalue(native_lines_iterator, "file:lines iterator", upvalue);
+    let iter_fn =
+        ctx.gc
+            .alloc_native_with_upvalue(native_lines_iterator, "file:lines iterator", upvalue);
     Ok(vec![TValue::from_native(iter_fn)])
 }
 
@@ -1811,7 +1865,11 @@ fn native_file_gc(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeError> {
         let tname = selune_core::object::obj_type_name(arg, ctx.gc, ctx.strings);
         Err(NativeError::String(format!(
             "bad argument #1 to '__gc' (FILE* expected, got {})",
-            if arg.is_nil() { "no value".to_string() } else { tname }
+            if arg.is_nil() {
+                "no value".to_string()
+            } else {
+                tname
+            }
         )))
     }
 }

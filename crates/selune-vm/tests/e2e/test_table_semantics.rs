@@ -36,7 +36,10 @@ fn table_nan_key_error() {
         t[0/0] = 1
         "#,
     );
-    assert!(err.contains("NaN") || err.contains("nan") || err.contains("index"), "got: {err}");
+    assert!(
+        err.contains("NaN") || err.contains("nan") || err.contains("index"),
+        "got: {err}"
+    );
 }
 
 #[test]

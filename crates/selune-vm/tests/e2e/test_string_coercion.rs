@@ -82,10 +82,7 @@ fn coerce_string_to_number_unm() {
 #[test]
 fn coerce_string_add_error() {
     let err = run_lua_err(r#"return "hello" + 1"#);
-    assert!(
-        err.contains("attempt to perform arithmetic"),
-        "got: {err}"
-    );
+    assert!(err.contains("attempt to perform arithmetic"), "got: {err}");
 }
 
 #[test]

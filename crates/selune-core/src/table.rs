@@ -205,6 +205,7 @@ impl Table {
     /// Get the next key-value pair after `key` (for iteration).
     /// Returns Ok(Some(k,v)) for next pair, Ok(None) for end of iteration,
     /// Err(()) for invalid key (key not found in table).
+    #[allow(clippy::result_unit_err)]
     pub fn next(&self, key: TValue) -> Result<Option<(TValue, TValue)>, ()> {
         if key.is_nil() {
             // Start iteration: first non-nil array element
@@ -298,17 +299,18 @@ impl Table {
                 }
             }
             // Trim trailing nils from array
-            while self.array.last().map_or(false, |v| v.is_nil()) {
+            while self.array.last().is_some_and(|v| v.is_nil()) {
                 self.array.pop();
             }
         }
         // Clear dead keys/values in hash part
         let mut to_remove = Vec::new();
         for (k, v) in self.hash.iter() {
-            let key_dead = weak_keys && match k {
-                TableKey::GcPtr(bits) => is_dead(TValue::from_raw_bits(*bits)),
-                _ => false,
-            };
+            let key_dead = weak_keys
+                && match k {
+                    TableKey::GcPtr(bits) => is_dead(TValue::from_raw_bits(*bits)),
+                    _ => false,
+                };
             let val_dead = weak_values && !v.is_nil() && is_dead(*v);
             if key_dead || val_dead {
                 to_remove.push(*k);
@@ -336,7 +338,7 @@ impl Table {
 
     /// Trim trailing nil values from the array part.
     pub fn trim_array(&mut self) {
-        while self.array.last().map_or(false, |v| v.is_nil()) {
+        while self.array.last().is_some_and(|v| v.is_nil()) {
             self.array.pop();
         }
     }
