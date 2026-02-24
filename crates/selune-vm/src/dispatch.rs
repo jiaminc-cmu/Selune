@@ -1582,19 +1582,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (1..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
-                        // Push a native frame for pcall so it appears in tracebacks
-                        let mut pcall_ci = CallInfo::new(base + a, 0);
-                        pcall_ci.is_lua = false;
-                        pcall_ci.func_stack_idx = base + a;
-                        pcall_ci.num_results = num_results;
-                        vm.call_stack.push(pcall_ci);
                         let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, pcall_func, &pcall_args) {
                             Ok(results) => {
-                                // Pop pcall's native frame
-                                vm.call_stack.pop();
-                                ci_idx = vm.call_stack.len() - 1;
-                                base = vm.call_stack[ci_idx].base;
                                 // Place (true, results...)
                                 let mut all = vec![TValue::from_bool(true)];
                                 all.extend(results);
@@ -1616,7 +1606,6 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 // Mark the direct callee frame (not the top frame, which
                                 // may be deeper in nested pcall) so that when it returns
                                 // on resume, return_from_call wraps results as pcall (true, ...).
-                                // Note: don't pop pcall frame — it stays for yield continuation
                                 if callee_frame_idx < vm.call_stack.len() {
                                     vm.call_stack[callee_frame_idx].call_status = CallStatus::PcallYield {
                                         result_base,
@@ -1626,10 +1615,6 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
-                                // Pop pcall's native frame
-                                vm.call_stack.pop();
-                                ci_idx = vm.call_stack.len() - 1;
-                                base = vm.call_stack[ci_idx].base;
                                 // Place (false, error_value)
                                 let err_val = e.to_tvalue(&mut vm.strings);
                                 let all = [TValue::from_bool(false), err_val];
@@ -1663,18 +1648,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             (2..num_args).map(|i| vm.stack[base + a + 1 + i]).collect();
 
                         let result_base = base + a;
-                        // Push a native frame for xpcall so it appears in tracebacks
-                        let mut xpcall_ci = CallInfo::new(base + a, 0);
-                        xpcall_ci.is_lua = false;
-                        xpcall_ci.func_stack_idx = base + a;
-                        xpcall_ci.num_results = num_results;
-                        vm.call_stack.push(xpcall_ci);
                         let callee_frame_idx = vm.call_stack.len();
                         match call_function(vm, xpcall_func, &xpcall_args) {
                             Ok(results) => {
-                                vm.call_stack.pop();
-                                ci_idx = vm.call_stack.len() - 1;
-                                base = vm.call_stack[ci_idx].base;
                                 let mut all = vec![TValue::from_bool(true)];
                                 all.extend(results);
                                 let result_count = if num_results < 0 {
@@ -1693,7 +1669,6 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             Err(LuaError::Yield(vals)) => {
                                 // Yield must propagate through xpcall.
                                 // Mark the direct callee frame so resume wraps results correctly.
-                                // Note: don't pop xpcall frame — it stays for yield continuation
                                 if callee_frame_idx < vm.call_stack.len() {
                                     vm.call_stack[callee_frame_idx].call_status = CallStatus::XpcallYield {
                                         result_base,
@@ -1704,10 +1679,6 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 return Err(LuaError::Yield(vals));
                             }
                             Err(e) => {
-                                // Pop xpcall's native frame
-                                vm.call_stack.pop();
-                                ci_idx = vm.call_stack.len() - 1;
-                                base = vm.call_stack[ci_idx].base;
                                 // Call handler with error value
                                 let err_val = e.to_tvalue(&mut vm.strings);
                                 let handler_result = call_function(vm, handler, &[err_val]);
@@ -3692,8 +3663,14 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
                 let err_val = exec_result.as_ref().err().map(|e| e.to_tvalue(&mut vm.strings));
                 let final_err = unwind_tbc(vm, pcall_ci_idx, err_val);
 
-                // Pop all frames above AND including the pcall frame
-                vm.call_stack.truncate(pcall_ci_idx);
+                // Pop all frames above AND including the pcall frame.
+                // Also pop the pcall/xpcall native frame below it if present
+                // (pushed by call_function when processing pcall).
+                let mut truncate_to = pcall_ci_idx;
+                if truncate_to > 0 && !vm.call_stack[truncate_to - 1].is_lua {
+                    truncate_to -= 1;
+                }
+                vm.call_stack.truncate(truncate_to);
 
                 let err_tval = final_err.unwrap_or_else(|| {
                     exec_result.as_ref().err().unwrap().to_tvalue(&mut vm.strings)
