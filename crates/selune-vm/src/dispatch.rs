@@ -525,34 +525,34 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     // VarArgPrep: just update hook_old_pc
                     vm.hook_old_pc = pc;
                 } else {
-                // For stripped code: line = -1 (fire_hook converts to nil)
-                // For normal code: line = raw_line
-                let line = if is_stripped { -1i32 } else { raw_line as i32 };
-                // PUC's line hook logic (luaG_traceexec):
-                // hook_old_pc is PUC's L->oldpc equivalent (global, not per-frame)
-                let old_pc = vm.hook_old_pc;
-                // Validate old_pc is within this proto (may be stale from another frame)
-                let old_pc = if old_pc < proto.code.len() { old_pc } else { 0 };
-                // PUC: fire when npci <= oldpc (backward jump) OR changedline
-                let fire = pc <= old_pc || changedline(proto, old_pc, pc);
-                vm.hook_old_pc = pc;
-                if fire {
-                    let new_line = line;
-                    vm.hook_last_line = new_line;
-                    // Same stack_top protection for line hooks
-                    let saved_hook_top = vm.stack_top;
-                    let max_stack = proto.max_stack_size as usize;
-                    let frame_top = base + max_stack;
-                    if vm.stack_top < frame_top {
-                        vm.stack_top = frame_top;
+                    // For stripped code: line = -1 (fire_hook converts to nil)
+                    // For normal code: line = raw_line
+                    let line = if is_stripped { -1i32 } else { raw_line as i32 };
+                    // PUC's line hook logic (luaG_traceexec):
+                    // hook_old_pc is PUC's L->oldpc equivalent (global, not per-frame)
+                    let old_pc = vm.hook_old_pc;
+                    // Validate old_pc is within this proto (may be stale from another frame)
+                    let old_pc = if old_pc < proto.code.len() { old_pc } else { 0 };
+                    // PUC: fire when npci <= oldpc (backward jump) OR changedline
+                    let fire = pc <= old_pc || changedline(proto, old_pc, pc);
+                    vm.hook_old_pc = pc;
+                    if fire {
+                        let new_line = line;
+                        vm.hook_last_line = new_line;
+                        // Same stack_top protection for line hooks
+                        let saved_hook_top = vm.stack_top;
+                        let max_stack = proto.max_stack_size as usize;
+                        let frame_top = base + max_stack;
+                        if vm.stack_top < frame_top {
+                            vm.stack_top = frame_top;
+                        }
+                        fire_hook(vm, "line", new_line, entry_depth)?;
+                        vm.stack_top = saved_hook_top;
+                        // Re-read ci_idx/base/pc after hook
+                        ci_idx = vm.call_stack.len() - 1;
+                        base = vm.call_stack[ci_idx].base;
+                        pc = vm.call_stack[ci_idx].pc;
                     }
-                    fire_hook(vm, "line", new_line, entry_depth)?;
-                    vm.stack_top = saved_hook_top;
-                    // Re-read ci_idx/base/pc after hook
-                    ci_idx = vm.call_stack.len() - 1;
-                    base = vm.call_stack[ci_idx].base;
-                    pc = vm.call_stack[ci_idx].pc;
-                }
                 } // end else
             }
         }
@@ -1507,8 +1507,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
                     // Fire return hook before early return (e.g., __close called via call_function)
-                    if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_RETURN != 0
-                        && vm.call_stack.last().map_or(false, |ci| ci.is_lua)
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
                     {
                         let ci = vm.call_stack.len() - 1;
                         vm.call_stack[ci].ntransfer = 0;
@@ -1537,8 +1539,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
                     // Fire return hook before early return
-                    if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_RETURN != 0
-                        && vm.call_stack.last().map_or(false, |ci| ci.is_lua)
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
                     {
                         let ci = vm.call_stack.len() - 1;
                         vm.call_stack[ci].ntransfer = 1;
@@ -1579,8 +1583,10 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                 vm.close_upvalues(base);
                 if vm.call_stack.len() <= entry_depth {
                     // Fire return hook before early return
-                    if vm.hooks_active && !vm.in_hook && vm.hook_mask & HOOK_RETURN != 0
-                        && vm.call_stack.last().map_or(false, |ci| ci.is_lua)
+                    if vm.hooks_active
+                        && !vm.in_hook
+                        && vm.hook_mask & HOOK_RETURN != 0
+                        && vm.call_stack.last().is_some_and(|ci| ci.is_lua)
                     {
                         let ci = vm.call_stack.len() - 1;
                         vm.call_stack[ci].ntransfer = results.len() as u16;
@@ -3068,7 +3074,11 @@ fn return_from_call(vm: &mut Vm, results: &[TValue]) -> Result<(), LuaError> {
     }
 
     // Save the popped frame's saved_hook_line for restoration
-    let saved_hook_line = vm.call_stack.last().map(|ci| ci.saved_hook_line).unwrap_or(-1);
+    let saved_hook_line = vm
+        .call_stack
+        .last()
+        .map(|ci| ci.saved_hook_line)
+        .unwrap_or(-1);
     vm.call_stack.pop();
 
     match call_status {

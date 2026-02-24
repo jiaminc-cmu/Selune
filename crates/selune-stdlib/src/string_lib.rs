@@ -1573,7 +1573,10 @@ fn find_plain(subject: &[u8], pat: &[u8], start: usize) -> Option<usize> {
     let first = pat[0];
     if plen == 1 {
         // Single byte search — use memchr via iterator.
-        return subject[start..].iter().position(|&b| b == first).map(|p| p + start);
+        return subject[start..]
+            .iter()
+            .position(|&b| b == first)
+            .map(|p| p + start);
     }
     let mut i = start;
     let end = slen - plen;
@@ -1747,7 +1750,8 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
     // Phase 1: Match using borrowed string data (no cloning of subject/pattern).
     // We borrow subject and pattern from ctx.strings, do all matching, save the
     // capture indices, then drop the borrows before interning results.
-    let match_result: Result<Option<(usize, Vec<(usize, usize)>)>, String> = {
+    type MatchResult = Result<Option<(usize, Vec<(usize, usize)>)>, String>;
+    let match_result: MatchResult = {
         let subject = ctx.strings.get_bytes(subj_sid);
         let pat = ctx.strings.get_bytes(pat_sid);
 
@@ -1755,7 +1759,7 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
         let match_pat = if anchor { &pat[1..] } else { pat };
 
         let mut matcher = pattern::PatternMatcher::new(subject, match_pat);
-        let mut result: Result<Option<(usize, Vec<(usize, usize)>)>, String> = Ok(None);
+        let mut result: MatchResult = Ok(None);
 
         loop {
             if src > subject.len() {
@@ -1819,8 +1823,7 @@ fn native_gmatch_iter(ctx: &mut NativeContext) -> Result<Vec<TValue>, NativeErro
             } else {
                 // Return explicit captures
                 let mut results = Vec::new();
-                for i in 1..captures.len() {
-                    let (cs, ce) = captures[i];
+                for &(cs, ce) in captures.iter().skip(1) {
                     if ce == CAP_POSITION {
                         results.push(TValue::from_full_integer((cs + 1) as i64, ctx.gc));
                     } else {
