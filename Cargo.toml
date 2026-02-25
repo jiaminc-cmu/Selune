@@ -26,6 +26,12 @@ selune-ffi = { path = "crates/selune-ffi" }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 indexmap = "2"
+cranelift-codegen = "0.129"
+cranelift-frontend = "0.129"
+cranelift-module = "0.129"
+cranelift-jit = "0.129"
+cranelift-native = "0.129"
+target-lexicon = "0.13"
 
 [profile.release]
 lto = true

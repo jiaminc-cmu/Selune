@@ -6,3 +6,11 @@ license.workspace = true
 
 [dependencies]
 selune-core.workspace = true
+selune-vm.workspace = true
+selune-compiler.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-jit.workspace = true
+cranelift-native.workspace = true
+target-lexicon.workspace = true

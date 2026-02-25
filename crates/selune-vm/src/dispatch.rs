@@ -3446,7 +3446,7 @@ const MAXTAGLOOP: usize = 2000;
 /// Table index with __index metamethod support.
 /// Handles: tables (with fallback to __index), and non-table values with __index.
 /// Iterative implementation with MAXTAGLOOP guard to prevent infinite loops.
-fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, LuaError> {
+pub fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, LuaError> {
     let mut current = table_val;
     // Cache mm_name once before the loop to avoid repeated Option unwrap.
     let mm_name = vm.mm_names.as_ref().unwrap().index;
@@ -3510,7 +3510,7 @@ fn table_index(vm: &mut Vm, table_val: TValue, key: TValue) -> Result<TValue, Lu
 
 /// Table newindex with __newindex metamethod support.
 /// Iterative implementation with MAXTAGLOOP guard to prevent infinite loops.
-fn table_newindex(
+pub fn table_newindex(
     vm: &mut Vm,
     table_val: TValue,
     key: TValue,
