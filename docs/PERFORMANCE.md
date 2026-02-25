@@ -75,14 +75,14 @@ The JIT compiler (`selune-jit`) uses Cranelift to generate native code for hot f
 
 | Benchmark | Selune JIT (s) | PUC Lua (s) | Speedup |
 |-----------|---------------|-------------|---------|
-| jit_float_arith | 0.49 | 1.50 | **3.1x faster** |
-| jit_heavy_arith | 0.60 | 1.88 | **3.1x faster** |
-| jit_generic_for | 0.39 | 0.53 | **1.4x faster** |
-| jit_float_forloop | 0.62 | 0.94 | **1.5x faster** |
-| jit_backedge | 0.64 | 0.92 | **1.4x faster** |
-| jit_osr | 0.63 | 0.93 | **1.5x faster** |
-| jit_sum_loop | 3.25 | 4.10 | **1.3x faster** |
-| jit_table_ops | 0.17 | 0.19 | **1.1x faster** |
+| jit_float_arith | 0.83 | 2.72 | **3.3x faster** |
+| jit_heavy_arith | 1.02 | 3.34 | **3.3x faster** |
+| jit_generic_for | 0.56 | 0.95 | **1.7x faster** |
+| jit_float_forloop | 1.06 | 1.64 | **1.5x faster** |
+| jit_backedge | 1.23 | 1.61 | **1.3x faster** |
+| jit_osr | 1.06 | 1.67 | **1.6x faster** |
+| jit_sum_loop | 5.24 | 7.37 | **1.4x faster** |
+| jit_table_ops | 0.28 | 0.33 | **1.2x faster** |
 
 Key JIT features:
 - Integer/float type specialization with NaN-box type guards
