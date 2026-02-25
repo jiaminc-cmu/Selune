@@ -69,21 +69,37 @@
 | GC | gc_pressure, binary_trees | Allocation rate, GC pause time, tree traversal |
 | Math | spectral_norm, mandelbrot | Float-heavy tight loops |
 
-### JIT Compiler (In Progress)
+### JIT Compiler
 
-The JIT compiler (`selune-jit`) uses Cranelift to generate native code for hot functions (called 1000+ times). It currently supports 55+ opcodes with integer and float type specialization:
+The JIT compiler (`selune-jit`) uses Cranelift to generate native code for hot functions (called 1,000+ times) and hot loops (10,000+ back-edge iterations via OSR). All 83 Lua 5.4 opcodes are supported.
 
-- **7-11x speedup** over the interpreter on numeric-heavy loops
-- Integer/float register allocation with slot caching
+| Benchmark | Selune JIT (s) | PUC Lua (s) | Speedup |
+|-----------|---------------|-------------|---------|
+| jit_float_arith | 0.83 | 2.72 | **3.3x faster** |
+| jit_heavy_arith | 1.02 | 3.34 | **3.3x faster** |
+| jit_generic_for | 0.56 | 0.95 | **1.7x faster** |
+| jit_float_forloop | 1.06 | 1.64 | **1.5x faster** |
+| jit_backedge | 1.23 | 1.61 | **1.3x faster** |
+| jit_osr | 1.06 | 1.67 | **1.6x faster** |
+| jit_sum_loop | 5.24 | 7.37 | **1.4x faster** |
+| jit_table_ops | 0.28 | 0.33 | **1.2x faster** |
+
+Key JIT features:
+- Integer/float type specialization with NaN-box type guards
+- Register allocation with slot caching and deferred stores
 - Loop-carried type propagation via Cranelift block parameters
-- Side-exit to interpreter for unsupported patterns (metamethods, coroutines, complex table ops)
+- On-Stack Replacement (OSR) for hot loops
+- Fast-path table access bypassing metamethod dispatch for plain tables
+- Inlined ipairs iterator (no call_function overhead)
+- Safe integer overflow handling via GC-boxing (no side-exit)
+- Side-exit to interpreter for unsupported patterns (metamethods, coroutines)
 
-Note: The benchmarks above measure interpreter performance (each function called once, below JIT threshold). JIT benefits apply to inner loops and frequently-called numeric functions.
+Note: The interpreter benchmarks above measure throughput with each function called once (below JIT threshold). JIT benefits apply to inner loops and frequently-called numeric functions.
 
 ### Remaining Optimization Opportunities
 
 - Inline caching for method calls and table lookups
-- JIT support for string operations and table access patterns
+- OSR support for protos with to-be-closed variables (Tbc opcode)
 - Generational GC (selune-core)
 - SIMD-accelerated string operations
 

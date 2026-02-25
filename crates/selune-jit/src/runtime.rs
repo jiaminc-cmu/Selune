@@ -1,7 +1,9 @@
 use selune_compiler::proto::Constant;
 use selune_core::value::TValue;
 use selune_vm::arith;
-use selune_vm::dispatch::{call_function, constant_to_tvalue, table_index, table_newindex};
+use selune_vm::dispatch::{
+    call_function, close_tbc_variables, constant_to_tvalue, table_index, table_newindex,
+};
 use selune_vm::vm::Vm;
 
 use crate::compiler::SIDE_EXIT;
@@ -315,6 +317,8 @@ pub unsafe extern "C" fn jit_rt_self(
 }
 
 /// Table index: R[A] = R[B][key]
+/// Fast path: if value is a table with no metatable, use raw_get directly.
+/// Falls back to table_index for metamethod support.
 /// Returns the result as raw TValue bits. Returns nil on error.
 ///
 /// # Safety
@@ -328,6 +332,18 @@ pub unsafe extern "C" fn jit_rt_table_index(
     let vm = &mut *vm_ptr;
     let table_val = TValue::from_raw_bits(table_bits);
     let key = TValue::from_raw_bits(key_bits);
+    // Fast path: plain table without metatable
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let table = vm.gc.get_table(table_idx);
+        if table.metatable.is_none() {
+            // Use string fast path if key is a string
+            if let Some(sid) = key.as_string_id() {
+                return table.raw_get_str(sid).raw_bits();
+            }
+            return vm.gc.table_raw_get(table_idx, key).raw_bits();
+        }
+    }
+    // Slow path: full metamethod dispatch
     match table_index(vm, table_val, key) {
         Ok(result) => result.raw_bits(),
         Err(_) => TValue::nil().raw_bits(),
@@ -335,6 +351,8 @@ pub unsafe extern "C" fn jit_rt_table_index(
 }
 
 /// Table newindex: R[A][key] = val
+/// Fast path: if value is a table with no metatable, use raw_set directly.
+/// Falls back to table_newindex for metamethod support.
 /// Returns 0 on success, SIDE_EXIT on error.
 ///
 /// # Safety
@@ -350,6 +368,17 @@ pub unsafe extern "C" fn jit_rt_table_newindex(
     let table_val = TValue::from_raw_bits(table_bits);
     let key = TValue::from_raw_bits(key_bits);
     let val = TValue::from_raw_bits(val_bits);
+    // Fast path: plain table without metatable
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let table = vm.gc.get_table(table_idx);
+        if table.metatable.is_none() {
+            match vm.gc.table_raw_set(table_idx, key, val) {
+                Ok(()) => return 0,
+                Err(_) => return SIDE_EXIT,
+            }
+        }
+    }
+    // Slow path: full metamethod dispatch
     match table_newindex(vm, table_val, key, val) {
         Ok(()) => 0,
         Err(_) => SIDE_EXIT,
@@ -373,6 +402,14 @@ pub unsafe extern "C" fn jit_rt_geti(
 ) -> u64 {
     let vm = &mut *vm_ptr;
     let table_val = TValue::from_raw_bits(table_bits);
+    // Fast path: plain table without metatable
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let table = vm.gc.get_table(table_idx);
+        if table.metatable.is_none() {
+            return table.raw_geti(index).raw_bits();
+        }
+    }
+    // Slow path: full metamethod dispatch
     let key = TValue::from_integer(index);
     match table_index(vm, table_val, key) {
         Ok(result) => result.raw_bits(),
@@ -394,8 +431,17 @@ pub unsafe extern "C" fn jit_rt_seti(
 ) -> i64 {
     let vm = &mut *vm_ptr;
     let table_val = TValue::from_raw_bits(table_bits);
-    let key = TValue::from_integer(index);
     let val = TValue::from_raw_bits(val_bits);
+    // Fast path: plain table without metatable
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let table = vm.gc.get_table(table_idx);
+        if table.metatable.is_none() {
+            vm.gc.get_table_mut(table_idx).raw_seti(index, val);
+            return 0;
+        }
+    }
+    // Slow path: full metamethod dispatch
+    let key = TValue::from_integer(index);
     match table_newindex(vm, table_val, key, val) {
         Ok(()) => 0,
         Err(_) => SIDE_EXIT,
@@ -579,4 +625,378 @@ pub unsafe extern "C" fn jit_rt_setlist(
     }
 
     0
+}
+
+/// Runtime helper for TForCall (generic for-loop iterator call).
+///
+/// Mirrors interpreter TForCall: close upvalues, ensure stack, call iterator,
+/// place results in R[A+4]..R[A+3+c].
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_tforcall(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+    c: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let c = c as usize;
+
+    let iter_func = vm.stack[base + a];
+
+    // Fast path: ipairs iterator on plain table — inline the logic directly.
+    // This avoids close_upvalues, stack size checks, and call_function overhead.
+    // Safe because ipairs doesn't create closures (no upvalues to close) and
+    // doesn't grow the stack (writes only to pre-allocated result slots).
+    if iter_func.raw_bits() == vm.ipairs_iter_val.raw_bits() {
+        let state = vm.stack[base + a + 1];
+        let control = vm.stack[base + a + 2];
+        // ipairs control is always a small integer (0, 1, 2, ...)
+        let i = control.as_integer().unwrap_or(0);
+        let next_i = i + 1;
+        // Fast table access: check for plain table without metatable
+        if let Some(table_idx) = state.as_table_idx() {
+            let table = vm.gc.get_table(table_idx);
+            if table.metatable.is_none() {
+                let val = table.raw_geti(next_i);
+                if val.is_nil() {
+                    // End of iteration
+                    if c >= 1 { vm.stack[base + a + 4] = TValue::nil(); }
+                    if c >= 2 { vm.stack[base + a + 5] = TValue::nil(); }
+                } else {
+                    let key = TValue::from_integer(next_i);
+                    if c >= 1 { vm.stack[base + a + 4] = key; }
+                    if c >= 2 { vm.stack[base + a + 5] = val; }
+                }
+                for j in 2..c {
+                    vm.stack[base + a + 4 + j] = TValue::nil();
+                }
+                return 0;
+            }
+        }
+        // Table has metatable or not a table — fall through to slow path
+        // (need close_upvalues + stack check for metamethod dispatch)
+    }
+
+    // Close upvalues for loop body variables
+    vm.close_upvalues(base + a + 4);
+
+    // Ensure stack has space for results
+    let min_top = base + a + 4 + c;
+    if min_top >= vm.stack.len() {
+        vm.stack.resize(min_top + 1, TValue::nil());
+    }
+
+    let state = vm.stack[base + a + 1];
+    let control = vm.stack[base + a + 2];
+
+    // Handle ipairs with metatable (slow ipairs path)
+    if iter_func.raw_bits() == vm.ipairs_iter_val.raw_bits() {
+        let i = control.as_full_integer(&vm.gc).unwrap_or(0);
+        let next_i = i.wrapping_add(1);
+        let key = TValue::from_full_integer(next_i, &mut vm.gc);
+        let val = match table_index(vm, state, key) {
+            Ok(v) => v,
+            Err(_) => return SIDE_EXIT,
+        };
+        if c >= 1 {
+            vm.stack[base + a + 4] = if val.is_nil() { TValue::nil() } else { key };
+        }
+        if c >= 2 {
+            vm.stack[base + a + 5] = val;
+        }
+        for j in 2..c {
+            vm.stack[base + a + 4 + j] = TValue::nil();
+        }
+        return 0;
+    }
+
+    // Slow path: generic iterator via call_function
+    // Save/restore stack_top (critical — same pattern as jit_rt_call)
+    let saved_stack_top = vm.stack_top;
+    if vm.stack_top < min_top {
+        vm.stack_top = min_top;
+    }
+
+    match call_function(vm, iter_func, &[state, control]) {
+        Ok(results) => {
+            vm.stack_top = saved_stack_top;
+            // Place results in R[A+4]..R[A+3+c]
+            for i in 0..c {
+                vm.stack[base + a + 4 + i] =
+                    results.get(i).copied().unwrap_or(TValue::nil());
+            }
+            0
+        }
+        Err(_) => {
+            vm.stack_top = saved_stack_top;
+            SIDE_EXIT
+        }
+    }
+}
+
+/// Runtime helper for Close opcode.
+///
+/// Closes TBC (to-be-closed) variables and upvalues from `base + a` onwards.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_close(
+    vm_ptr: *mut Vm,
+    _base: u64,
+    level: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let level = level as usize;
+
+    let ci_idx = vm.call_stack.len() - 1;
+    match close_tbc_variables(vm, ci_idx, level, None) {
+        Ok(()) => {
+            vm.close_upvalues(level);
+            0
+        }
+        Err(_) => SIDE_EXIT,
+    }
+}
+
+/// Runtime helper for Tbc opcode.
+///
+/// Marks a variable as to-be-closed. If the value is nil or false, this is a no-op.
+/// If the value is non-nil/non-false, it must have a __close metamethod.
+/// For generic for loops, the 4th slot is typically nil here.
+/// Returns 0 on success, SIDE_EXIT on error (non-closable value).
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_tbc(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let val = vm.stack[base + a];
+
+    // nil and false are allowed (not to be closed)
+    if val.is_falsy() {
+        return 0;
+    }
+
+    // Non-nil/non-false values must have a __close metamethod
+    let mm_name = vm.mm_names.as_ref().unwrap().close;
+    if selune_vm::metamethod::get_metamethod(val, mm_name, &vm.gc).is_some() {
+        // Register the TBC slot in the current CallInfo
+        let ci_idx = vm.call_stack.len() - 1;
+        let tbc_slots = vm.call_stack[ci_idx]
+            .tbc_slots
+            .get_or_insert_with(Vec::new);
+        tbc_slots.push(base + a);
+        return 0;
+    }
+
+    // No __close metamethod — this is an error, side-exit to interpreter
+    SIDE_EXIT
+}
+
+/// Runtime helper for Closure opcode.
+///
+/// Creates a new closure by resolving upvalues from the current frame.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_closure(
+    vm_ptr: *mut Vm,
+    base: u64,
+    proto_idx: u64,
+    bx: u64,
+    dest: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let proto_idx = proto_idx as usize;
+    let bx = bx as usize;
+    let dest = dest as usize;
+
+    let child_flat_idx = vm.protos[proto_idx].child_flat_indices[bx];
+    let upval_count = vm.protos[child_flat_idx].upvalues.len();
+
+    // Read upvalue descriptors into local buffer
+    let mut upval_descs = Vec::with_capacity(upval_count);
+    for i in 0..upval_count {
+        let desc = &vm.protos[child_flat_idx].upvalues[i];
+        upval_descs.push((desc.in_stack, desc.index));
+    }
+
+    let ci_idx = vm.call_stack.len() - 1;
+    let closure_idx_opt = vm.call_stack[ci_idx].closure_idx;
+
+    let mut upvals = Vec::with_capacity(upval_count);
+    for i in 0..upval_count {
+        let (in_stack, index) = upval_descs[i];
+        if in_stack {
+            let stack_idx = base + index as usize;
+            let uv_idx = vm.find_or_create_open_upval(stack_idx);
+            upvals.push(uv_idx);
+        } else if let Some(parent_closure_idx) = closure_idx_opt {
+            let parent_closure = vm.gc.get_closure(parent_closure_idx);
+            let uv_idx = parent_closure.upvalues[index as usize];
+            upvals.push(uv_idx);
+        } else {
+            return SIDE_EXIT;
+        }
+    }
+
+    let new_closure_idx = vm.gc.alloc_closure(child_flat_idx, upvals);
+    vm.stack[base + dest] = TValue::from_closure(new_closure_idx);
+    0
+}
+
+/// Runtime helper for VarArg opcode (fixed count only, c > 0).
+///
+/// Copies `c-1` varargs to R[A]..R[A+c-2].
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_vararg(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+    c: u64,
+    proto_idx: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let c = c as usize;
+    let proto_idx = proto_idx as usize;
+
+    let ci_idx = vm.call_stack.len() - 1;
+    let ci = &vm.call_stack[ci_idx];
+    let wanted = c - 1;
+
+    if let Some(vararg_base) = ci.vararg_base {
+        let num_params = vm.protos[proto_idx].num_params as usize;
+        let vararg_start = vararg_base + num_params;
+        let vararg_count = ci.base.saturating_sub(vararg_start);
+
+        // Ensure stack space
+        if base + a + wanted >= vm.stack.len() {
+            vm.stack.resize(base + a + wanted + 1, TValue::nil());
+        }
+
+        for i in 0..wanted {
+            if i < vararg_count {
+                vm.stack[base + a + i] = vm.stack[vararg_start + i];
+            } else {
+                vm.stack[base + a + i] = TValue::nil();
+            }
+        }
+    } else {
+        // No varargs available, fill with nil
+        if base + a + wanted >= vm.stack.len() {
+            vm.stack.resize(base + a + wanted + 1, TValue::nil());
+        }
+        for i in 0..wanted {
+            vm.stack[base + a + i] = TValue::nil();
+        }
+    }
+    0
+}
+
+/// ForPrep float path: set up float for-loop.
+/// Returns 1 if loop enters (body should execute), 0 if skip (empty loop).
+/// Box an integer that may exceed the 47-bit small int range.
+/// Calls `TValue::from_full_integer()` which GC-boxes if needed.
+/// Returns the raw NaN-boxed u64 bits.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid, non-null pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_box_integer(vm_ptr: *mut Vm, int_val: i64) -> i64 {
+    let vm = &mut *vm_ptr;
+    let tv = TValue::from_full_integer(int_val, &mut vm.gc);
+    tv.raw_bits() as i64
+}
+
+/// Reads init/limit/step from R[A], R[A+1], R[A+2].
+/// Writes float values to R[A], R[A+1], R[A+2], R[A+3].
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_forprep_float(vm_ptr: *mut Vm, base: u64, a: u64) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+
+    // Convert to float (with string coercion per Lua 5.4 semantics)
+    let init = match vm.stack[base + a].as_number(&vm.gc) {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let limit = match vm.stack[base + a + 1].as_number(&vm.gc) {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let step = match vm.stack[base + a + 2].as_number(&vm.gc) {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+
+    if step == 0.0 {
+        return SIDE_EXIT; // 'for' step is zero — side-exit to let interpreter handle the error
+    }
+
+    // Check if loop enters
+    let enters = if step > 0.0 { init <= limit } else { init >= limit };
+    if !enters {
+        return 0; // skip
+    }
+
+    // Write float values to stack
+    vm.stack[base + a] = TValue::from_float(init);
+    vm.stack[base + a + 1] = TValue::from_float(limit);
+    vm.stack[base + a + 2] = TValue::from_float(step);
+    vm.stack[base + a + 3] = TValue::from_float(init);
+    1 // enter body
+}
+
+/// ForLoop float path: advance float for-loop.
+/// Returns 1 if loop continues, 0 if done.
+/// Reads counter/limit/step from R[A], R[A+1], R[A+2].
+/// Updates R[A] and R[A+3] with next counter value.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_forloop_float(vm_ptr: *mut Vm, base: u64, a: u64) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+
+    let counter = match vm.stack[base + a].as_float() {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let limit = match vm.stack[base + a + 1].as_float() {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let step = match vm.stack[base + a + 2].as_float() {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+
+    let next = counter + step;
+    let continues = if step > 0.0 { next <= limit } else { next >= limit };
+    if !continues {
+        return 0; // done
+    }
+
+    vm.stack[base + a] = TValue::from_float(next);
+    vm.stack[base + a + 3] = TValue::from_float(next);
+    1 // continue
 }

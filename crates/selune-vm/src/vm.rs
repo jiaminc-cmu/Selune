@@ -1,6 +1,6 @@
 //! Lua VM state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::callinfo::CallInfo;
 use crate::dispatch;
@@ -232,6 +232,16 @@ pub struct Vm {
     /// Optional JIT compilation callback. Called when a proto reaches the tier-up threshold.
     /// The callback should attempt compilation and store the result in vm.jit_functions.
     pub jit_compile_callback: Option<fn(&mut Vm, usize)>,
+    /// Per-proto back-edge counter for detecting hot loops.
+    pub jit_backedge_counts: Vec<u32>,
+    /// Threshold: trigger JIT compilation after this many back-edge hits.
+    pub jit_backedge_threshold: u32,
+    /// Protos that have been blacklisted from JIT (failed too many times).
+    pub jit_blacklist: HashSet<usize>,
+    /// OSR-compiled functions: (proto_idx, entry_pc) → native function pointer.
+    pub jit_osr_functions: HashMap<(usize, usize), JitFn>,
+    /// Optional OSR compilation callback. Called when a back-edge triggers OSR.
+    pub jit_osr_compile_callback: Option<fn(&mut Vm, usize, usize)>,
 }
 
 /// Format a source name for error messages (matching PUC Lua behavior).
@@ -361,6 +371,11 @@ impl Vm {
             jit_threshold: 1000,
             jit_enabled: false,
             jit_compile_callback: None,
+            jit_backedge_counts: Vec::new(),
+            jit_backedge_threshold: 10_000,
+            jit_blacklist: HashSet::new(),
+            jit_osr_functions: HashMap::new(),
+            jit_osr_compile_callback: None,
         }
     }
 
@@ -626,8 +641,9 @@ impl Vm {
     fn store_proto_tree(&mut self, proto: &Proto) -> usize {
         let idx = self.protos.len();
         self.protos.push(proto.clone());
-        // Keep jit_call_counts in sync with protos
+        // Keep jit_call_counts and jit_backedge_counts in sync with protos
         self.jit_call_counts.push(0);
+        self.jit_backedge_counts.push(0);
         // Recursively flatten child protos into vm.protos and record flat indices
         let num_children = self.protos[idx].protos.len();
         let mut flat_indices = Vec::with_capacity(num_children);

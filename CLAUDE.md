@@ -50,30 +50,29 @@ done
 
 ### Interpreter (complete)
 - **28/28** official Lua 5.4.7 test files passing
-- **1,443** workspace tests, 0 failures, 4 ignored
+- **1,597** workspace tests, 0 failures, 4 ignored
 - **2.61x** geometric mean vs PUC Lua (16 benchmarks)
 - 11 skipped sections across 6 test files (~85-90% true compliance)
 
-### JIT (not started)
-- `selune-jit` crate exists but is empty (1-line docstring)
-- No Cranelift dependencies in workspace yet
-- No profiling counters, no tier-up logic, no executable memory management
+### JIT (Phase 4 — all 13 increments complete)
+- **All 83 Lua 5.4 opcodes** supported (full opcode coverage)
+- **154 JIT tests**, Cranelift 0.129
+- Call-count tier-up (threshold=1,000), back-edge OSR (threshold=10,000)
+- Integer/float type specialization, slot caching, loop-carried type propagation
+- Fast-path table access, inlined ipairs iterator, safe integer overflow (GC-boxing)
+- **1.1x–3.2x faster than PUC Lua** across all 8 JIT benchmarks
 
-## JIT Architecture Plan
+## JIT Architecture
 
 ### Method-based JIT with Cranelift
 - **Compilation unit:** Whole function (matches Cranelift's function-at-a-time model)
 - **Strategy:** 1:1 bytecode → Cranelift IR translation (baseline)
-- **Tier-up:** Per-function call counter in interpreter → compile when hot
+- **Tier-up:** Per-function call counter (1,000 calls) + back-edge counter (10,000 iterations) for OSR
 - **Deopt:** Side exit → reconstruct interpreter frame → resume in interpreter
-- **GC integration:** Poll flag at safe points (function entry, loop back-edges)
+- **GC integration:** Reload stack base after any runtime helper that may allocate
+- **Native signature:** `unsafe extern "C" fn(vm: *mut Vm, base: usize) -> i64`
 
-### Native function signature
-```
-fn(state: *mut VmState, base: *mut TValue, nargs: u32) -> u32
-```
-
-### Key Cranelift crates needed
+### Cranelift crates (v0.129)
 - `cranelift-codegen` — IR and code generation
 - `cranelift-frontend` — SSA construction helper
 - `cranelift-module` — function definition/linking
@@ -85,7 +84,7 @@ fn(state: *mut VmState, base: *mut TValue, nargs: u32) -> u32
 crates/selune-core/src/      — Values (value.rs), GC (gc.rs), tables, strings
 crates/selune-compiler/src/  — Lexer (lexer.rs), compiler (compiler/mod.rs, expr.rs, scope.rs)
 crates/selune-vm/src/        — VM (vm.rs), dispatch (dispatch.rs), arithmetic, metamethods
-crates/selune-jit/src/       — JIT compiler (EMPTY — this is where you work)
+crates/selune-jit/src/       — JIT compiler (compiler.rs, runtime.rs, abi.rs)
 crates/selune-stdlib/src/    — math.rs, string_lib.rs, table_lib.rs, io_lib.rs, os_lib.rs, debug_lib.rs, utf8_lib.rs, package_lib.rs
 crates/selune/src/           — CLI (main.rs)
 ```

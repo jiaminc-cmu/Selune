@@ -95,14 +95,19 @@ This is the same configuration used by the official test suite for portable Lua 
 
 ### Phase 4 — JIT Compiler (In Progress)
 - Method-based JIT compilation via [Cranelift](https://cranelift.dev/) code generator
-- Automatic tier-up: functions compiled to native code after 1000 calls
-- 55+ bytecode opcodes translated to native code
+- Automatic tier-up: functions compiled to native code after 1,000 calls
+- On-Stack Replacement (OSR): hot loops compiled and entered mid-execution via back-edge counting (threshold 10,000)
+- **All 83 Lua 5.4 opcodes** supported (full opcode coverage)
 - Integer and float type specialization with NaN-box type guards
-- Register allocation with slot caching and deferred stores
-- Loop-carried type propagation via Cranelift block parameters
-- Runtime helpers for function calls, upvalues, table access, and string operations
-- Side-exit to interpreter for unsupported patterns (metamethods, coroutines)
-- 7-11x speedup over interpreter on numeric-heavy code
+- Float for-loop support with runtime int/float dispatch
+- Register allocation with slot caching, deferred stores, and loop-carried type propagation
+- Safe integer overflow: GC-boxed integers via runtime helper (no side-exit on overflow)
+- Fast-path table access: bypasses metamethod dispatch for plain tables without metatables
+- Fast-path ipairs iterator: inlined array access without call_function overhead
+- Generic for-loop support (TForPrep/TForCall/TForLoop/Tbc opcodes)
+- Closure creation, VarArg (fixed count), Close, and SetTable via runtime helpers
+- Side-exit to interpreter for unsupported patterns (metamethods, coroutines, variable-count vararg)
+- **1.2x–3.3x faster than PUC Lua** on all 8 JIT benchmarks
 
 ## Project Structure
 
@@ -112,7 +117,7 @@ selune/
 │   ├── selune-core/     # Core types: TValue (NaN-boxed), TString, StringInterner, GC heap
 │   ├── selune-compiler/ # Lexer, parser, bytecode compiler
 │   ├── selune-vm/       # Stack-based virtual machine
-│   ├── selune-jit/      # JIT compiler via Cranelift (55+ opcodes, int+float specialization)
+│   ├── selune-jit/      # JIT compiler via Cranelift (all 83 opcodes, int+float specialization, OSR)
 │   ├── selune-stdlib/   # Standard library (math, string, table, io, os, debug, utf8, coroutine, package)
 │   ├── selune-ffi/      # C API compatibility layer (planned)
 │   └── selune/          # CLI binary
@@ -180,16 +185,22 @@ These benchmarks measure interpreter throughput (each function called once, belo
 
 ### JIT Performance
 
-When the JIT activates (functions called 1000+ times), Selune generates native code via Cranelift that is significantly faster than both the interpreter and PUC Lua:
+When the JIT activates (functions called 1,000+ times, or loops with 10,000+ back-edge iterations via OSR), Selune generates native code via Cranelift that is faster than PUC Lua across all benchmarks:
 
-| Test | Interpreter | JIT | JIT Speedup | vs PUC Lua |
-|------|------------|-----|-------------|------------|
-| Integer sum loop | 1.21s | 0.16s | **7.1x** | **4.7x faster** |
-| Heavy integer arithmetic | 4.66s | 0.40s | **11.6x** | **4.7x faster** |
+| Benchmark | Selune JIT (s) | PUC Lua (s) | Speedup |
+|-----------|---------------|-------------|---------|
+| jit_float_arith | 0.83 | 2.72 | **3.3x faster** |
+| jit_heavy_arith | 1.02 | 3.34 | **3.3x faster** |
+| jit_generic_for | 0.56 | 0.95 | **1.7x faster** |
+| jit_float_forloop | 1.06 | 1.64 | **1.5x faster** |
+| jit_backedge | 1.23 | 1.61 | **1.3x faster** |
+| jit_osr | 1.06 | 1.67 | **1.6x faster** |
+| jit_sum_loop | 5.24 | 7.37 | **1.4x faster** |
+| jit_table_ops | 0.28 | 0.33 | **1.2x faster** |
 
-The JIT currently supports 55+ opcodes including integer/float arithmetic, comparisons, control flow, loops, function calls, upvalues, and table access.
+The JIT supports all 83 Lua 5.4 opcodes with integer/float type specialization, OSR for hot loops, fast-path table access, and inlined ipairs iteration.
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To regenerate: `./benchmarks/run_benchmarks.sh`
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for interpreter benchmark results. To regenerate: `./benchmarks/run_benchmarks.sh`
 
 ## Roadmap
 
@@ -204,11 +215,11 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To
 
 ## Testing
 
-1,570+ tests across the workspace:
+1,597 tests across the workspace:
 
 - **1,122** VM end-to-end tests (4 ignored for known gaps)
+- **154** JIT compiler tests
 - **140** compiler unit tests
-- **127** JIT compiler tests
 - **95** compiler end-to-end integration tests
 - **48** core type tests (TValue roundtrips, string interning, property tests)
 - **36** standard library tests

@@ -184,7 +184,24 @@ fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
                 Ok(jit_fn) => {
                     vm.jit_functions.insert(proto_idx, jit_fn);
                 }
-                Err(_e) => {}
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+fn jit_compile_osr_hook(vm: &mut Vm, proto_idx: usize, entry_pc: usize) {
+    JIT_COMPILER.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            *opt = JitCompiler::new().ok();
+        }
+        if let Some(jit) = opt.as_mut() {
+            match jit.compile_proto_osr(&vm.protos[proto_idx], &mut vm.gc, proto_idx, entry_pc) {
+                Ok(jit_fn) => {
+                    vm.jit_osr_functions.insert((proto_idx, entry_pc), jit_fn);
+                }
+                Err(_) => {}
             }
         }
     });
@@ -202,7 +219,9 @@ fn create_vm(warn_on: bool, script_file: &Option<String>, script_args: &[String]
     // Enable JIT compilation
     vm.jit_enabled = true;
     vm.jit_threshold = 1000;
+    vm.jit_backedge_threshold = 10_000;
     vm.jit_compile_callback = Some(jit_compile_hook);
+    vm.jit_osr_compile_callback = Some(jit_compile_osr_hook);
 
     if warn_on {
         vm.warn_enabled = true;
