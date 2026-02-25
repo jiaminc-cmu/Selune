@@ -184,7 +184,7 @@ fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
                 Ok(jit_fn) => {
                     vm.jit_functions.insert(proto_idx, jit_fn);
                 }
-                Err(_e) => {}
+                Err(_) => {}
             }
         }
     });
@@ -201,7 +201,7 @@ fn jit_compile_osr_hook(vm: &mut Vm, proto_idx: usize, entry_pc: usize) {
                 Ok(jit_fn) => {
                     vm.jit_osr_functions.insert((proto_idx, entry_pc), jit_fn);
                 }
-                Err(_e) => {}
+                Err(_) => {}
             }
         }
     });

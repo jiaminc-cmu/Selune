@@ -128,6 +128,7 @@ impl JitCompiler {
             runtime::jit_rt_tforcall as *const u8,
         );
         builder.symbol("jit_rt_close", runtime::jit_rt_close as *const u8);
+        builder.symbol("jit_rt_tbc", runtime::jit_rt_tbc as *const u8);
         builder.symbol(
             "jit_rt_closure",
             runtime::jit_rt_closure as *const u8,
@@ -140,6 +141,10 @@ impl JitCompiler {
         builder.symbol(
             "jit_rt_forloop_float",
             runtime::jit_rt_forloop_float as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_box_integer",
+            runtime::jit_rt_box_integer as *const u8,
         );
 
         let module = JITModule::new(builder);
@@ -374,6 +379,7 @@ impl JitCompiler {
                 | OpCode::TForLoop
                 | OpCode::SetTable
                 | OpCode::Close
+                | OpCode::Tbc
                 | OpCode::Closure => {}
                 OpCode::VarArg => {
                     // Only support fixed-count vararg (c > 0)
@@ -385,6 +391,17 @@ impl JitCompiler {
                 | OpCode::Return
                 | OpCode::TailCall => {}
                 _ => return Err(JitError::UnsupportedOpcode(op, pc)),
+            }
+        }
+
+        // OSR compilation of protos containing Tbc (generic for loops) is not yet
+        // supported — the OSR entry mishandles TBC slot registration, corrupting
+        // locals. Reject these protos for OSR only; normal call-count JIT is fine.
+        if entry_pc.is_some() {
+            for inst in &proto.code {
+                if inst.opcode() == OpCode::Tbc {
+                    return Err(JitError::UnsupportedOpcode(OpCode::Tbc, 0));
+                }
             }
         }
 
@@ -554,6 +571,16 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_close", Linkage::Import, &close_sig)?;
 
+        // jit_rt_tbc(vm_ptr, base, a) -> i64
+        let mut tbc_sig = Signature::new(call_conv);
+        for _ in 0..3 {
+            tbc_sig.params.push(AbiParam::new(types::I64));
+        }
+        tbc_sig.returns.push(AbiParam::new(types::I64));
+        let tbc_id = self
+            .module
+            .declare_function("jit_rt_tbc", Linkage::Import, &tbc_sig)?;
+
         // jit_rt_closure(vm_ptr, base, proto_idx, bx, dest) -> i64
         let mut closure_sig = Signature::new(call_conv);
         for _ in 0..5 {
@@ -596,6 +623,17 @@ impl JitCompiler {
             "jit_rt_forloop_float",
             Linkage::Import,
             &forloop_float_sig,
+        )?;
+
+        // jit_rt_box_integer(vm_ptr, int_val) -> i64 (NaN-boxed bits, possibly GC-boxed)
+        let mut box_integer_sig = Signature::new(call_conv);
+        box_integer_sig.params.push(AbiParam::new(types::I64));
+        box_integer_sig.params.push(AbiParam::new(types::I64));
+        box_integer_sig.returns.push(AbiParam::new(types::I64));
+        let box_integer_id = self.module.declare_function(
+            "jit_rt_box_integer",
+            Linkage::Import,
+            &box_integer_sig,
         )?;
 
         // jit_rt_get_stack_base(vm_ptr) -> *const u8 (as i64)
@@ -648,10 +686,12 @@ impl JitCompiler {
             let setlist_ref = self.module.declare_func_in_func(setlist_id, builder.func);
             let tforcall_ref = self.module.declare_func_in_func(tforcall_id, builder.func);
             let close_ref = self.module.declare_func_in_func(close_id, builder.func);
+            let tbc_ref = self.module.declare_func_in_func(tbc_id, builder.func);
             let closure_ref = self.module.declare_func_in_func(closure_id, builder.func);
             let vararg_ref = self.module.declare_func_in_func(vararg_id, builder.func);
             let forprep_float_ref = self.module.declare_func_in_func(forprep_float_id, builder.func);
             let forloop_float_ref = self.module.declare_func_in_func(forloop_float_id, builder.func);
+            let box_integer_ref = self.module.declare_func_in_func(box_integer_id, builder.func);
             let get_stack_base_ref =
                 self.module
                     .declare_func_in_func(get_stack_base_id, builder.func);
@@ -732,10 +772,12 @@ impl JitCompiler {
                 setlist_ref,
                 tforcall_ref,
                 close_ref,
+                tbc_ref,
                 closure_ref,
                 vararg_ref,
                 forprep_float_ref,
                 forloop_float_ref,
+                box_integer_ref,
                 get_stack_base_ref,
                 stack_base_var,
                 slot_cache: SlotCache::new(),
@@ -1023,10 +1065,12 @@ struct BytecodeEmitter<'a, 'b> {
     setlist_ref: FuncRef,
     tforcall_ref: FuncRef,
     close_ref: FuncRef,
+    tbc_ref: FuncRef,
     closure_ref: FuncRef,
     vararg_ref: FuncRef,
     forprep_float_ref: FuncRef,
     forloop_float_ref: FuncRef,
+    box_integer_ref: FuncRef,
     /// Helper to get raw pointer to vm.stack data buffer.
     get_stack_base_ref: FuncRef,
     /// Cranelift Variable for stack_base pointer. Using a Variable instead
@@ -1348,11 +1392,13 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
     /// Emit an integer overflow check + side-exit (with cache flush).
     /// If `result` is outside [SMALL_INT_MIN, SMALL_INT_MAX], branches to side_exit.
-    fn emit_overflow_guard(&mut self, result: Value) {
+    /// Check if an integer result fits in the 47-bit small int range.
+    /// If yes, return the inline-boxed value. If no, call jit_rt_box_integer
+    /// to GC-box it (does NOT side-exit). Returns the NaN-boxed i64 bits.
+    fn emit_box_integer_safe(&mut self, int_val: Value) -> Value {
         // Check: result >= SMALL_INT_MIN && result <= SMALL_INT_MAX
-        // Equivalent: (result - SMALL_INT_MIN) as u64 <= (SMALL_INT_MAX - SMALL_INT_MIN) as u64
         let min_val = self.builder.ins().iconst(types::I64, SMALL_INT_MIN);
-        let shifted = self.builder.ins().isub(result, min_val);
+        let shifted = self.builder.ins().isub(int_val, min_val);
         let range = self
             .builder
             .ins()
@@ -1364,7 +1410,42 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
             range,
         );
 
-        self.emit_guard_with_flush(in_range);
+        let inline_block = self.builder.create_block();
+        let overflow_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+        self.builder.append_block_param(merge_block, types::I64);
+
+        self.builder.ins().brif(in_range, inline_block, &[], overflow_block, &[]);
+
+        // Inline path: box using bit manipulation (fast, no call)
+        self.builder.switch_to_block(inline_block);
+        self.builder.seal_block(inline_block);
+        let boxed_inline = self.emit_box_integer(int_val);
+        self.builder.ins().jump(merge_block, &[BlockArg::Value(boxed_inline)]);
+
+        // Overflow path: call runtime helper to GC-box
+        self.builder.switch_to_block(overflow_block);
+        self.builder.seal_block(overflow_block);
+        // Emit stores for dirty cache entries WITHOUT modifying cache state.
+        // We can't call flush_cache() because that marks entries clean,
+        // which would corrupt the inline path's dirty tracking.
+        let dirty = self.slot_cache.dirty_slots();
+        for (off, raw) in dirty {
+            self.emit_set_slot(off as i64, raw);
+        }
+        let call = self.builder.ins().call(
+            self.box_integer_ref,
+            &[self.vm_ptr, int_val],
+        );
+        let boxed_runtime = self.builder.inst_results(call)[0];
+        // Reload stack base since GC may have moved the stack
+        self.reload_stack_base();
+        self.builder.ins().jump(merge_block, &[BlockArg::Value(boxed_runtime)]);
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+
+        self.builder.block_params(merge_block)[0]
     }
 
     /// Emit a NON-FATAL integer type check. Returns an i8 boolean (1 = integer, 0 = not).
@@ -1687,8 +1768,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                             OpCode::Mul => self.builder.ins().imul(ib, ic),
                             _ => unreachable!(),
                         };
-                        self.emit_overflow_guard(result);
-                        let boxed = self.emit_box_integer(result);
+                        let boxed = self.emit_box_integer_safe(result);
                         self.cached_set_integer(a, result, boxed);
                     }
 
@@ -1748,8 +1828,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                             OpCode::MulK => self.builder.ins().imul(ib, kc),
                             _ => unreachable!(),
                         };
-                        self.emit_overflow_guard(result);
-                        let boxed = self.emit_box_integer(result);
+                        let boxed = self.emit_box_integer_safe(result);
                         self.cached_set_integer(a, result, boxed);
                     }
 
@@ -1771,8 +1850,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         let ib = self.cached_get_integer(b);
                         let imm = self.builder.ins().iconst(types::I64, sc);
                         let result = self.builder.ins().iadd(ib, imm);
-                        self.emit_overflow_guard(result);
-                        let boxed = self.emit_box_integer(result);
+                        let boxed = self.emit_box_integer_safe(result);
                         self.cached_set_integer(a, result, boxed);
                     }
 
@@ -3096,6 +3174,22 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.builder.seal_block(cont);
                 }
 
+                OpCode::Tbc => {
+                    // For generic for loops, the 4th slot is typically nil.
+                    // Side-exit if the value is non-nil (TBC with __close not
+                    // supported in JIT — let interpreter handle it).
+                    let val = self.cached_get_slot(a);
+                    let nil_bits = self.builder.ins().iconst(types::I64, TValue::nil().raw_bits() as i64);
+                    let false_bits = self.builder.ins().iconst(types::I64, TValue::from_bool(false).raw_bits() as i64);
+                    let is_nil = self.builder.ins().icmp(IntCC::Equal, val, nil_bits);
+                    let is_false = self.builder.ins().icmp(IntCC::Equal, val, false_bits);
+                    let is_falsy = self.builder.ins().bor(is_nil, is_false);
+                    let cont = self.builder.create_block();
+                    self.builder.ins().brif(is_falsy, cont, &[], self.side_exit_block, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                }
+
                 OpCode::Closure => {
                     let bx = inst.bx() as i64;
                     self.flush_and_invalidate_cache();
@@ -3628,16 +3722,21 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_unsupported_opcode() {
-        // Generic for loop uses TForCall which we don't support yet
-        let (proto, _strings) =
-            compile(b"for k,v in pairs({}) do end", "test").unwrap();
+    fn test_proto_unsupported_vararg_variable_count() {
+        // VarArg with c==0 (variable count) is not supported in JIT
+        // This creates a function that returns all varargs: function(...) return ... end
+        let (proto, strings) =
+            compile(b"local function f(...) return ... end\nreturn f(1,2,3)", "test").unwrap();
+        let mut vm = Vm::new();
+        let _ = vm.execute(&proto, strings);
+        // The child proto (f) has VarArg with c==0
+        // Find it: proto.children[0] should be the inner function
+        let child_proto = &vm.protos[1]; // child proto at index 1
         let mut compiler = JitCompiler::new().unwrap();
-        let mut gc = GcHeap::new();
-        let result = compiler.compile_proto(&proto, &mut gc, 0);
+        let result = compiler.compile_proto(child_proto, &mut vm.gc, 1);
         assert!(
-            matches!(result, Err(JitError::UnsupportedOpcode(_, _))),
-            "should fail on unsupported opcode, got: {result:?}"
+            matches!(result, Err(JitError::UnsupportedOpcode(OpCode::VarArg, _))),
+            "should fail on VarArg with c==0, got: {result:?}"
         );
     }
 
