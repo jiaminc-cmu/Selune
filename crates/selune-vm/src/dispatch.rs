@@ -2158,14 +2158,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 continue;
                             } else {
                                 // SIDE_EXIT — pop the JIT CallInfo, fall through to interpreter
-                                eprintln!("[JIT] Side-exit proto {} (inline Call)", child_proto_idx);
                                 vm.call_stack.pop();
                                 let count = vm.jit_side_exit_counts
                                     .entry(child_proto_idx)
                                     .or_insert(0);
                                 *count += 1;
                                 if *count >= 3 {
-                                    eprintln!("[JIT] Blacklisted proto {}", child_proto_idx);
                                     vm.jit_functions.remove(&child_proto_idx);
                                 }
                             }

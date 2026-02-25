@@ -1,5 +1,6 @@
 use selune_compiler::proto::Constant;
 use selune_core::value::TValue;
+use selune_vm::arith;
 use selune_vm::dispatch::{call_function, constant_to_tvalue, table_index, table_newindex};
 use selune_vm::vm::Vm;
 
@@ -353,4 +354,229 @@ pub unsafe extern "C" fn jit_rt_table_newindex(
         Ok(()) => 0,
         Err(_) => SIDE_EXIT,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Increment 8: GetI, SetI, Len, Concat, NewTable, SetList
+// ---------------------------------------------------------------------------
+
+/// GetI: R[A] = R[B][C] where C is an integer key.
+/// Returns the result as raw TValue bits.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_geti(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    index: i64,
+) -> u64 {
+    let vm = &mut *vm_ptr;
+    let table_val = TValue::from_raw_bits(table_bits);
+    let key = TValue::from_integer(index);
+    match table_index(vm, table_val, key) {
+        Ok(result) => result.raw_bits(),
+        Err(_) => TValue::nil().raw_bits(),
+    }
+}
+
+/// SetI: R[A][B] = val where B is an integer key.
+/// Returns 0 on success, SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_seti(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    index: i64,
+    val_bits: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let table_val = TValue::from_raw_bits(table_bits);
+    let key = TValue::from_integer(index);
+    let val = TValue::from_raw_bits(val_bits);
+    match table_newindex(vm, table_val, key, val) {
+        Ok(()) => 0,
+        Err(_) => SIDE_EXIT,
+    }
+}
+
+/// Len: computes #val, writes result to stack[base+dest].
+/// Returns 0 on success, SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_len(
+    vm_ptr: *mut Vm,
+    base: u64,
+    dest: u64,
+    src_bits: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let src = TValue::from_raw_bits(src_bits);
+    let base = base as usize;
+    let dest = dest as usize;
+
+    // String fast path
+    if let Some(len) = arith::str_len(src, &vm.strings) {
+        let result = TValue::from_full_integer(len, &mut vm.gc);
+        let idx = base + dest;
+        if idx >= vm.stack.len() {
+            vm.stack.resize(idx + 1, TValue::nil());
+        }
+        vm.stack[idx] = result;
+        return 0;
+    }
+
+    // Table path
+    if let Some(table_idx) = src.as_table_idx() {
+        // Check for __len metamethod first
+        if let Some(mm_names) = vm.mm_names.as_ref() {
+            let mm_name = mm_names.len;
+            if let Some(mm) = selune_vm::metamethod::get_metamethod(src, mm_name, &vm.gc) {
+                match call_function(vm, mm, &[src, src]) {
+                    Ok(results) => {
+                        let idx = base + dest;
+                        if idx >= vm.stack.len() {
+                            vm.stack.resize(idx + 1, TValue::nil());
+                        }
+                        vm.stack[idx] = results.first().copied().unwrap_or(TValue::nil());
+                        return 0;
+                    }
+                    Err(_) => return SIDE_EXIT,
+                }
+            }
+        }
+        // No metamethod — use raw length
+        let len = vm.gc.get_table(table_idx).length();
+        let result = TValue::from_full_integer(len, &mut vm.gc);
+        let idx = base + dest;
+        if idx >= vm.stack.len() {
+            vm.stack.resize(idx + 1, TValue::nil());
+        }
+        vm.stack[idx] = result;
+        return 0;
+    }
+
+    // Non-table, non-string: check __len metamethod
+    if let Some(mm_names) = vm.mm_names.as_ref() {
+        let mm_name = mm_names.len;
+        if let Some(mm) = selune_vm::metamethod::get_metamethod(src, mm_name, &vm.gc) {
+            match call_function(vm, mm, &[src, src]) {
+                Ok(results) => {
+                    let idx = base + dest;
+                    if idx >= vm.stack.len() {
+                        vm.stack.resize(idx + 1, TValue::nil());
+                    }
+                    vm.stack[idx] = results.first().copied().unwrap_or(TValue::nil());
+                    return 0;
+                }
+                Err(_) => return SIDE_EXIT,
+            }
+        }
+    }
+
+    SIDE_EXIT
+}
+
+/// Concat: concatenates `count` values from stack[base+dest..base+dest+count],
+/// writes result to stack[base+dest].
+/// Returns 0 on success, SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_concat(
+    vm_ptr: *mut Vm,
+    base: u64,
+    dest: u64,
+    count: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let dest = dest as usize;
+    let count = count as usize;
+
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = base + dest + i;
+        if idx < vm.stack.len() {
+            values.push(vm.stack[idx]);
+        } else {
+            values.push(TValue::nil());
+        }
+    }
+
+    match arith::lua_concat(&values, &vm.gc, &mut vm.strings) {
+        arith::ArithResult::Ok(result) => {
+            let idx = base + dest;
+            if idx >= vm.stack.len() {
+                vm.stack.resize(idx + 1, TValue::nil());
+            }
+            vm.stack[idx] = result;
+            0
+        }
+        _ => {
+            // Metamethod or error — side-exit to interpreter
+            SIDE_EXIT
+        }
+    }
+}
+
+/// NewTable: allocates a new table with the given capacity hints.
+/// Returns raw TValue bits of the new table.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_newtable(
+    vm_ptr: *mut Vm,
+    array_hint: u64,
+    hash_hint: u64,
+) -> u64 {
+    let vm = &mut *vm_ptr;
+    let table_idx = vm.gc.alloc_table(array_hint as usize, hash_hint as usize);
+    TValue::from_table(table_idx).raw_bits()
+}
+
+/// SetList: bulk-writes stack values to table array part.
+/// table_reg is the register containing the table.
+/// Writes stack[base+table_reg+1..base+table_reg+count] to table[offset+1..offset+count].
+/// Returns 0 on success, SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_setlist(
+    vm_ptr: *mut Vm,
+    base: u64,
+    table_reg: u64,
+    count: u64,
+    offset: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let table_reg = table_reg as usize;
+    let count = count as usize;
+    let offset = offset as usize;
+
+    let table_val = vm.stack[base + table_reg];
+    let table_idx = match table_val.as_table_idx() {
+        Some(idx) => idx,
+        None => return SIDE_EXIT,
+    };
+
+    for i in 1..=count {
+        let val_idx = base + table_reg + i;
+        let val = if val_idx < vm.stack.len() {
+            vm.stack[val_idx]
+        } else {
+            TValue::nil()
+        };
+        vm.gc.get_table_mut(table_idx).raw_seti((offset + i) as i64, val);
+    }
+
+    0
 }

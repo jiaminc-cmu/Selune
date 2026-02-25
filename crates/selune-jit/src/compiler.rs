@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use cranelift_codegen::ir::{types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, Value};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -105,6 +105,18 @@ impl JitCompiler {
         builder.symbol(
             "jit_rt_table_newindex",
             runtime::jit_rt_table_newindex as *const u8,
+        );
+        builder.symbol("jit_rt_geti", runtime::jit_rt_geti as *const u8);
+        builder.symbol("jit_rt_seti", runtime::jit_rt_seti as *const u8);
+        builder.symbol("jit_rt_len", runtime::jit_rt_len as *const u8);
+        builder.symbol("jit_rt_concat", runtime::jit_rt_concat as *const u8);
+        builder.symbol(
+            "jit_rt_newtable",
+            runtime::jit_rt_newtable as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_setlist",
+            runtime::jit_rt_setlist as *const u8,
         );
 
         let module = JITModule::new(builder);
@@ -218,6 +230,8 @@ impl JitCompiler {
     /// - Comparisons: EqI, LtI, LeI, GtI, GeI, EqK, Eq, Lt, Le
     /// - Loops: ForPrep, ForLoop (integer fast-path only)
     /// - Table/Upvalue: GetTabUp, SetTabUp, GetUpval, SetUpval, GetTable, GetField, SetField
+    /// - Table ops: GetI, SetI, NewTable, SetList (via runtime helpers)
+    /// - String/Len: Len, Concat (via runtime helpers, side-exit on metamethod for concat)
     /// - Calls: Call (via runtime helper), Self_
     /// - Side-exit: Return, TailCall, Closure
     /// - Skips: MMBin, MMBinI, MMBinK (skipped as part of arithmetic translation)
@@ -301,6 +315,13 @@ impl JitCompiler {
                 | OpCode::GetTable
                 | OpCode::GetField
                 | OpCode::SetField => {}
+                // Increment 8: table ops, len, concat, newtable, setlist
+                | OpCode::GetI
+                | OpCode::SetI
+                | OpCode::Len
+                | OpCode::Concat
+                | OpCode::NewTable
+                | OpCode::SetList => {}
                 // Side-exit only: too complex for JIT fast-path
                 | OpCode::Return
                 | OpCode::TailCall
@@ -395,6 +416,66 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_table_newindex", Linkage::Import, &tbl_ni_sig)?;
 
+        // jit_rt_geti(vm_ptr, table_bits, index) -> u64
+        let mut geti_sig = Signature::new(call_conv);
+        geti_sig.params.push(AbiParam::new(types::I64));
+        geti_sig.params.push(AbiParam::new(types::I64));
+        geti_sig.params.push(AbiParam::new(types::I64));
+        geti_sig.returns.push(AbiParam::new(types::I64));
+        let geti_id = self
+            .module
+            .declare_function("jit_rt_geti", Linkage::Import, &geti_sig)?;
+
+        // jit_rt_seti(vm_ptr, table_bits, index, val_bits) -> i64
+        let mut seti_sig = Signature::new(call_conv);
+        for _ in 0..4 {
+            seti_sig.params.push(AbiParam::new(types::I64));
+        }
+        seti_sig.returns.push(AbiParam::new(types::I64));
+        let seti_id = self
+            .module
+            .declare_function("jit_rt_seti", Linkage::Import, &seti_sig)?;
+
+        // jit_rt_len(vm_ptr, base, dest, src_bits) -> i64
+        let mut len_sig = Signature::new(call_conv);
+        for _ in 0..4 {
+            len_sig.params.push(AbiParam::new(types::I64));
+        }
+        len_sig.returns.push(AbiParam::new(types::I64));
+        let len_id = self
+            .module
+            .declare_function("jit_rt_len", Linkage::Import, &len_sig)?;
+
+        // jit_rt_concat(vm_ptr, base, dest, count) -> i64
+        let mut concat_sig = Signature::new(call_conv);
+        for _ in 0..4 {
+            concat_sig.params.push(AbiParam::new(types::I64));
+        }
+        concat_sig.returns.push(AbiParam::new(types::I64));
+        let concat_id = self
+            .module
+            .declare_function("jit_rt_concat", Linkage::Import, &concat_sig)?;
+
+        // jit_rt_newtable(vm_ptr, array_hint, hash_hint) -> u64
+        let mut newtable_sig = Signature::new(call_conv);
+        newtable_sig.params.push(AbiParam::new(types::I64));
+        newtable_sig.params.push(AbiParam::new(types::I64));
+        newtable_sig.params.push(AbiParam::new(types::I64));
+        newtable_sig.returns.push(AbiParam::new(types::I64));
+        let newtable_id = self
+            .module
+            .declare_function("jit_rt_newtable", Linkage::Import, &newtable_sig)?;
+
+        // jit_rt_setlist(vm_ptr, base, table_reg, count, offset) -> i64
+        let mut setlist_sig = Signature::new(call_conv);
+        for _ in 0..5 {
+            setlist_sig.params.push(AbiParam::new(types::I64));
+        }
+        setlist_sig.returns.push(AbiParam::new(types::I64));
+        let setlist_id = self
+            .module
+            .declare_function("jit_rt_setlist", Linkage::Import, &setlist_sig)?;
+
         // jit_rt_get_stack_base(vm_ptr) -> *const u8 (as i64)
         let mut get_stack_base_sig = Signature::new(call_conv);
         get_stack_base_sig.params.push(AbiParam::new(types::I64));
@@ -437,6 +518,12 @@ impl JitCompiler {
             let self_ref = self.module.declare_func_in_func(self_id, builder.func);
             let tbl_idx_ref = self.module.declare_func_in_func(tbl_idx_id, builder.func);
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
+            let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
+            let seti_ref = self.module.declare_func_in_func(seti_id, builder.func);
+            let len_ref = self.module.declare_func_in_func(len_id, builder.func);
+            let concat_ref = self.module.declare_func_in_func(concat_id, builder.func);
+            let newtable_ref = self.module.declare_func_in_func(newtable_id, builder.func);
+            let setlist_ref = self.module.declare_func_in_func(setlist_id, builder.func);
             let get_stack_base_ref =
                 self.module
                     .declare_func_in_func(get_stack_base_id, builder.func);
@@ -484,6 +571,12 @@ impl JitCompiler {
                 self_ref,
                 tbl_idx_ref,
                 tbl_ni_ref,
+                geti_ref,
+                seti_ref,
+                len_ref,
+                concat_ref,
+                newtable_ref,
+                setlist_ref,
                 get_stack_base_ref,
                 stack_base,
                 slot_cache: SlotCache::new(),
@@ -619,6 +712,8 @@ enum SlotType {
     Unknown,
     /// Known to be an inline integer (NaN-boxed with QNAN|TAG_INT).
     Integer,
+    /// Known to be a float (raw bits are a valid f64, not NaN-boxed tagged).
+    Float,
 }
 
 /// A cached stack slot: keeps the raw NaN-boxed value and optionally
@@ -723,6 +818,12 @@ struct BytecodeEmitter<'a, 'b> {
     self_ref: FuncRef,
     tbl_idx_ref: FuncRef,
     tbl_ni_ref: FuncRef,
+    geti_ref: FuncRef,
+    seti_ref: FuncRef,
+    len_ref: FuncRef,
+    concat_ref: FuncRef,
+    newtable_ref: FuncRef,
+    setlist_ref: FuncRef,
     /// Helper to get raw pointer to vm.stack data buffer.
     get_stack_base_ref: FuncRef,
     /// Cached raw pointer to vm.stack data (invalidated by stack reallocation).
@@ -840,6 +941,56 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         );
     }
 
+    /// Get the unboxed float value for a slot. If the slot is already
+    /// known to be a Float, returns the cached typed value directly.
+    /// Otherwise loads the raw value and emits a float type guard.
+    fn cached_get_float(&mut self, offset: i64) -> Value {
+        let off = offset as usize;
+        if let Some(typed) = self.slot_cache.get_typed(off, SlotType::Float) {
+            return typed;
+        }
+        let raw = self.cached_get_slot(offset);
+        let float_val = self.emit_float_guard(raw);
+        let dirty = self.slot_cache.slots.get(&off).map_or(false, |s| s.dirty);
+        self.slot_cache.set(off, raw, SlotType::Float, Some(float_val), dirty);
+        float_val
+    }
+
+    /// Set a slot to a known-float value in the cache (deferred store).
+    fn cached_set_float(&mut self, offset: i64, float_val: Value, boxed_val: Value) {
+        self.slot_cache.set(
+            offset as usize,
+            boxed_val,
+            SlotType::Float,
+            Some(float_val),
+            true,
+        );
+    }
+
+    /// Get the cached slot type for an offset.
+    fn get_slot_type(&self, offset: i64) -> SlotType {
+        self.slot_cache.slots.get(&(offset as usize))
+            .map(|s| s.slot_type).unwrap_or(SlotType::Unknown)
+    }
+
+    /// Coerce a slot to f64. If known-Integer, extract + fcvt. If known-Float,
+    /// return cached f64. If Unknown, guard as integer then convert (side-exits
+    /// on non-integer non-float).
+    fn get_as_float(&mut self, offset: i64, slot_type: SlotType) -> Value {
+        match slot_type {
+            SlotType::Float => self.cached_get_float(offset),
+            SlotType::Integer => {
+                let int_val = self.cached_get_integer(offset);
+                self.builder.ins().fcvt_from_sint(types::F64, int_val)
+            }
+            SlotType::Unknown => {
+                // Try integer guard first (side-exits on non-integer)
+                let int_val = self.cached_get_integer(offset);
+                self.builder.ins().fcvt_from_sint(types::F64, int_val)
+            }
+        }
+    }
+
     /// Emit a conditional branch to side_exit_block, flushing dirty cache
     /// entries before exit. Creates a trampoline block if needed.
     ///
@@ -947,6 +1098,27 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         );
 
         self.emit_guard_with_flush(in_range);
+    }
+
+    /// Emit a type guard: check if `val` is a float (not a NaN-boxed tagged value).
+    /// Uses the same check as the interpreter's `!is_tagged()`: `(val & QNAN) != QNAN`.
+    /// Canonical NaN (which IS QNAN) will side-exit, which is acceptable for baseline JIT.
+    /// Returns the f64 value via bitcast.
+    fn emit_float_guard(&mut self, val: Value) -> Value {
+        let qnan = self.builder.ins().iconst(types::I64, value::QNAN as i64);
+        let masked = self.builder.ins().band(val, qnan);
+        let is_float = self.builder.ins().icmp(IntCC::NotEqual, masked, qnan);
+        self.emit_guard_with_flush(is_float);
+        self.builder.ins().bitcast(types::F64, MemFlags::new(), val)
+    }
+
+    /// NaN-box a float value. Canonicalizes NaN results (NaN != NaN in IEEE 754).
+    /// Uses `fcmp(Unordered, v, v)` to detect NaN, replaces with canonical QNAN.
+    fn emit_box_float(&mut self, float_val: Value) -> Value {
+        let is_nan = self.builder.ins().fcmp(FloatCC::Unordered, float_val, float_val);
+        let qnan = self.builder.ins().iconst(types::I64, value::QNAN as i64);
+        let raw = self.builder.ins().bitcast(types::I64, MemFlags::new(), float_val);
+        self.builder.ins().select(is_nan, qnan, raw)
     }
 
     /// Transition to a new block at the given PC if it's a jump target.
@@ -1063,8 +1235,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LoadF => {
                     let sbx = inst.sbx() as f64;
                     let raw_bits = TValue::from_float(sbx).raw_bits();
-                    let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.cached_set_slot(a, val);
+                    let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
+                    let float_val = self.builder.ins().f64const(sbx);
+                    self.cached_set_float(a, float_val, boxed);
                 }
 
                 OpCode::LoadK => {
@@ -1072,11 +1245,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let k = &self.proto.constants[bx];
                     let raw_bits = self.constant_to_raw_bits(k);
                     let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    if let Constant::Integer(i) = k {
-                        let int_val = self.builder.ins().iconst(types::I64, *i);
-                        self.cached_set_integer(a, int_val, boxed);
-                    } else {
-                        self.cached_set_slot(a, boxed);
+                    match k {
+                        Constant::Integer(i) => {
+                            let int_val = self.builder.ins().iconst(types::I64, *i);
+                            self.cached_set_integer(a, int_val, boxed);
+                        }
+                        Constant::Float(f) => {
+                            let float_val = self.builder.ins().f64const(*f);
+                            self.cached_set_float(a, float_val, boxed);
+                        }
+                        _ => {
+                            self.cached_set_slot(a, boxed);
+                        }
                     }
                 }
 
@@ -1086,11 +1266,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let k = &self.proto.constants[ax];
                     let raw_bits = self.constant_to_raw_bits(k);
                     let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    if let Constant::Integer(i) = k {
-                        let int_val = self.builder.ins().iconst(types::I64, *i);
-                        self.cached_set_integer(a, int_val, boxed);
-                    } else {
-                        self.cached_set_slot(a, boxed);
+                    match k {
+                        Constant::Integer(i) => {
+                            let int_val = self.builder.ins().iconst(types::I64, *i);
+                            self.cached_set_integer(a, int_val, boxed);
+                        }
+                        Constant::Float(f) => {
+                            let float_val = self.builder.ins().f64const(*f);
+                            self.cached_set_float(a, float_val, boxed);
+                        }
+                        _ => {
+                            self.cached_set_slot(a, boxed);
+                        }
                     }
                 }
 
@@ -1152,21 +1339,35 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Add | OpCode::Sub | OpCode::Mul => {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
+                    let type_b = self.get_slot_type(b);
+                    let type_c = self.get_slot_type(c);
 
-                    let ib = self.cached_get_integer(b);
-                    let ic = self.cached_get_integer(c);
-
-                    let result = match op {
-                        OpCode::Add => self.builder.ins().iadd(ib, ic),
-                        OpCode::Sub => self.builder.ins().isub(ib, ic),
-                        OpCode::Mul => self.builder.ins().imul(ib, ic),
-                        _ => unreachable!(),
-                    };
-
-                    self.emit_overflow_guard(result);
-
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float || type_c == SlotType::Float {
+                        // Float path
+                        let fb = self.get_as_float(b, type_b);
+                        let fc = self.get_as_float(c, type_c);
+                        let fresult = match op {
+                            OpCode::Add => self.builder.ins().fadd(fb, fc),
+                            OpCode::Sub => self.builder.ins().fsub(fb, fc),
+                            OpCode::Mul => self.builder.ins().fmul(fb, fc),
+                            _ => unreachable!(),
+                        };
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        // Integer path (existing behavior)
+                        let ib = self.cached_get_integer(b);
+                        let ic = self.cached_get_integer(c);
+                        let result = match op {
+                            OpCode::Add => self.builder.ins().iadd(ib, ic),
+                            OpCode::Sub => self.builder.ins().isub(ib, ic),
+                            OpCode::Mul => self.builder.ins().imul(ib, ic),
+                            _ => unreachable!(),
+                        };
+                        self.emit_overflow_guard(result);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
 
                     // Skip the following MMBin instruction
                     pc += 1;
@@ -1175,34 +1376,59 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::AddK | OpCode::SubK | OpCode::MulK => {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
-
-                    let ib = self.cached_get_integer(b);
+                    let type_b = self.get_slot_type(b);
 
                     let k = &self.proto.constants[c];
-                    let kval = match k {
-                        Constant::Integer(i) => *i,
-                        _ => {
-                            self.flush_and_invalidate_cache();
-                            self.builder.ins().jump(self.side_exit_block, &[]);
-                            block_terminated = true;
-                            pc += 1; // skip MMBinK
-                            pc += 1;
-                            continue;
-                        }
-                    };
+                    let is_float_k = matches!(k, Constant::Float(_));
 
-                    let kc = self.builder.ins().iconst(types::I64, kval);
-                    let result = match op {
-                        OpCode::AddK => self.builder.ins().iadd(ib, kc),
-                        OpCode::SubK => self.builder.ins().isub(ib, kc),
-                        OpCode::MulK => self.builder.ins().imul(ib, kc),
-                        _ => unreachable!(),
-                    };
-
-                    self.emit_overflow_guard(result);
-
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float || is_float_k {
+                        // Float path
+                        let fb = self.get_as_float(b, type_b);
+                        let fc = match k {
+                            Constant::Integer(i) => self.builder.ins().f64const(*i as f64),
+                            Constant::Float(f) => self.builder.ins().f64const(*f),
+                            _ => {
+                                self.flush_and_invalidate_cache();
+                                self.builder.ins().jump(self.side_exit_block, &[]);
+                                block_terminated = true;
+                                pc += 1; // skip MMBinK
+                                pc += 1;
+                                continue;
+                            }
+                        };
+                        let fresult = match op {
+                            OpCode::AddK => self.builder.ins().fadd(fb, fc),
+                            OpCode::SubK => self.builder.ins().fsub(fb, fc),
+                            OpCode::MulK => self.builder.ins().fmul(fb, fc),
+                            _ => unreachable!(),
+                        };
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        // Integer path
+                        let ib = self.cached_get_integer(b);
+                        let kval = match k {
+                            Constant::Integer(i) => *i,
+                            _ => {
+                                self.flush_and_invalidate_cache();
+                                self.builder.ins().jump(self.side_exit_block, &[]);
+                                block_terminated = true;
+                                pc += 1; // skip MMBinK
+                                pc += 1;
+                                continue;
+                            }
+                        };
+                        let kc = self.builder.ins().iconst(types::I64, kval);
+                        let result = match op {
+                            OpCode::AddK => self.builder.ins().iadd(ib, kc),
+                            OpCode::SubK => self.builder.ins().isub(ib, kc),
+                            OpCode::MulK => self.builder.ins().imul(ib, kc),
+                            _ => unreachable!(),
+                        };
+                        self.emit_overflow_guard(result);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
 
                     pc += 1;
                 }
@@ -1210,38 +1436,51 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::AddI => {
                     let b = inst.b() as i64;
                     let sc = inst.c() as i8 as i64;
+                    let type_b = self.get_slot_type(b);
 
-                    let ib = self.cached_get_integer(b);
-
-                    let imm = self.builder.ins().iconst(types::I64, sc);
-                    let result = self.builder.ins().iadd(ib, imm);
-
-                    self.emit_overflow_guard(result);
-
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float {
+                        let fb = self.cached_get_float(b);
+                        let fc = self.builder.ins().f64const(sc as f64);
+                        let fresult = self.builder.ins().fadd(fb, fc);
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        let ib = self.cached_get_integer(b);
+                        let imm = self.builder.ins().iconst(types::I64, sc);
+                        let result = self.builder.ins().iadd(ib, imm);
+                        self.emit_overflow_guard(result);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
 
                     pc += 1;
                 }
 
-                // ---- Integer division (R[A] = R[B] // R[C]) ----
+                // ---- Integer/Float division (R[A] = R[B] // R[C]) ----
                 OpCode::IDiv => {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
+                    let type_b = self.get_slot_type(b);
+                    let type_c = self.get_slot_type(c);
 
-                    let ib = self.cached_get_integer(b);
-                    let ic = self.cached_get_integer(c);
-
-                    // Guard: divisor != 0
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
-                    self.emit_guard_with_flush(nz);
-
-                    // Lua idiv: floor division
-                    let result = self.emit_lua_idiv(ib, ic);
-                    // Result magnitude ≤ |dividend|, no overflow guard needed
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float || type_c == SlotType::Float {
+                        // Float path: floor(a / b)
+                        let fb = self.get_as_float(b, type_b);
+                        let fc = self.get_as_float(c, type_c);
+                        let fresult = self.emit_lua_fidiv(fb, fc);
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        let ib = self.cached_get_integer(b);
+                        let ic = self.cached_get_integer(c);
+                        // Guard: divisor != 0
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
+                        self.emit_guard_with_flush(nz);
+                        let result = self.emit_lua_idiv(ib, ic);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
 
                     pc += 1; // skip MMBin
                 }
@@ -1250,19 +1489,27 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Mod => {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
+                    let type_b = self.get_slot_type(b);
+                    let type_c = self.get_slot_type(c);
 
-                    let ib = self.cached_get_integer(b);
-                    let ic = self.cached_get_integer(c);
-
-                    // Guard: divisor != 0
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
-                    self.emit_guard_with_flush(nz);
-
-                    // Lua imod: result sign matches divisor
-                    let result = self.emit_lua_imod(ib, ic);
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float || type_c == SlotType::Float {
+                        // Float path: a - floor(a/b)*b
+                        let fb = self.get_as_float(b, type_b);
+                        let fc = self.get_as_float(c, type_c);
+                        let fresult = self.emit_lua_fmod(fb, fc);
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        let ib = self.cached_get_integer(b);
+                        let ic = self.cached_get_integer(c);
+                        // Guard: divisor != 0
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
+                        self.emit_guard_with_flush(nz);
+                        let result = self.emit_lua_imod(ib, ic);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
 
                     pc += 1; // skip MMBin
                 }
@@ -1272,18 +1519,14 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let ib = self.cached_get_integer(b);
-                    let ic = self.cached_get_integer(c);
-
-                    // Convert to f64 and divide
-                    let fb = self.builder.ins().fcvt_from_sint(types::F64, ib);
-                    let fc = self.builder.ins().fcvt_from_sint(types::F64, ic);
+                    let type_b = self.get_slot_type(b);
+                    let type_c = self.get_slot_type(c);
+                    let fb = self.get_as_float(b, type_b);
+                    let fc = self.get_as_float(c, type_c);
                     let fresult = self.builder.ins().fdiv(fb, fc);
 
-                    // Box as float TValue (floats are stored as-is, no tagging needed
-                    // since their bit pattern doesn't collide with QNAN prefix)
-                    let raw = self.builder.ins().bitcast(types::I64, MemFlags::new(), fresult);
-                    self.cached_set_slot(a, raw);
+                    let boxed = self.emit_box_float(fresult);
+                    self.cached_set_float(a, fresult, boxed);
 
                     pc += 1; // skip MMBin
                 }
@@ -1328,20 +1571,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
 
-                    let ib = self.cached_get_integer(b);
-
                     let k = &self.proto.constants[c];
-                    let kval = match k {
-                        Constant::Integer(i) => *i,
-                        _ => {
-                            self.flush_and_invalidate_cache();
-                            self.builder.ins().jump(self.side_exit_block, &[]);
-                            block_terminated = true;
-                            pc += 1; // skip MMBinK
-                            pc += 1;
-                            continue;
-                        }
-                    };
 
                     if matches!(op, OpCode::PowK) {
                         // Pow requires powf — side exit
@@ -1353,31 +1583,84 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         continue;
                     }
 
-                    let kc = self.builder.ins().iconst(types::I64, kval);
-
                     if matches!(op, OpCode::DivK) {
-                        // Float division
-                        let fb = self.builder.ins().fcvt_from_sint(types::F64, ib);
-                        let fc = self.builder.ins().fcvt_from_sint(types::F64, kc);
-                        let fresult = self.builder.ins().fdiv(fb, fc);
-                        let raw = self.builder.ins().bitcast(types::I64, MemFlags::new(), fresult);
-                        self.cached_set_slot(a, raw);
-                    } else {
-                        // Guard: divisor != 0
-                        let zero = self.builder.ins().iconst(types::I64, 0);
-                        let nz = self.builder.ins().icmp(IntCC::NotEqual, kc, zero);
-                        self.emit_guard_with_flush(nz);
-
-                        let result = match op {
-                            OpCode::IDivK => self.emit_lua_idiv(ib, kc),
-                            OpCode::ModK => self.emit_lua_imod(ib, kc),
-                            _ => unreachable!(),
+                        // Float division — accept int or float operands
+                        let type_b = self.get_slot_type(b);
+                        let fb = self.get_as_float(b, type_b);
+                        let fc = match k {
+                            Constant::Integer(i) => self.builder.ins().f64const(*i as f64),
+                            Constant::Float(f) => self.builder.ins().f64const(*f),
+                            _ => {
+                                self.flush_and_invalidate_cache();
+                                self.builder.ins().jump(self.side_exit_block, &[]);
+                                block_terminated = true;
+                                pc += 1;
+                                pc += 1;
+                                continue;
+                            }
                         };
-                        let boxed = self.emit_box_integer(result);
-                        self.cached_set_integer(a, result, boxed);
-                    }
+                        let fresult = self.builder.ins().fdiv(fb, fc);
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                        pc += 1; // skip MMBinK
+                    } else {
+                        // IDivK / ModK
+                        let type_b = self.get_slot_type(b);
+                        let is_float_k = matches!(k, Constant::Float(_));
 
-                    pc += 1; // skip MMBinK
+                        if type_b == SlotType::Float || is_float_k {
+                            // Float path
+                            let fb = self.get_as_float(b, type_b);
+                            let fc = match k {
+                                Constant::Integer(i) => self.builder.ins().f64const(*i as f64),
+                                Constant::Float(f) => self.builder.ins().f64const(*f),
+                                _ => {
+                                    self.flush_and_invalidate_cache();
+                                    self.builder.ins().jump(self.side_exit_block, &[]);
+                                    block_terminated = true;
+                                    pc += 1;
+                                    pc += 1;
+                                    continue;
+                                }
+                            };
+                            let fresult = match op {
+                                OpCode::IDivK => self.emit_lua_fidiv(fb, fc),
+                                OpCode::ModK => self.emit_lua_fmod(fb, fc),
+                                _ => unreachable!(),
+                            };
+                            let boxed = self.emit_box_float(fresult);
+                            self.cached_set_float(a, fresult, boxed);
+                        } else {
+                            // Integer path
+                            let ib = self.cached_get_integer(b);
+                            let kval = match k {
+                                Constant::Integer(i) => *i,
+                                _ => {
+                                    self.flush_and_invalidate_cache();
+                                    self.builder.ins().jump(self.side_exit_block, &[]);
+                                    block_terminated = true;
+                                    pc += 1; // skip MMBinK
+                                    pc += 1;
+                                    continue;
+                                }
+                            };
+                            let kc = self.builder.ins().iconst(types::I64, kval);
+
+                            // Guard: divisor != 0
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let nz = self.builder.ins().icmp(IntCC::NotEqual, kc, zero);
+                            self.emit_guard_with_flush(nz);
+
+                            let result = match op {
+                                OpCode::IDivK => self.emit_lua_idiv(ib, kc),
+                                OpCode::ModK => self.emit_lua_imod(ib, kc),
+                                _ => unreachable!(),
+                            };
+                            let boxed = self.emit_box_integer(result);
+                            self.cached_set_integer(a, result, boxed);
+                        }
+                        pc += 1; // skip MMBinK
+                    }
                 }
 
                 // ---- Bitwise with constant ----
@@ -1436,12 +1719,20 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 // ---- Unary minus ----
                 OpCode::Unm => {
                     let b = inst.b() as i64;
-                    let ib = self.cached_get_integer(b);
+                    let type_b = self.get_slot_type(b);
 
-                    // wrapping_neg: result fits in 47-bit (magnitude ≤ |operand|)
-                    let result = self.builder.ins().ineg(ib);
-                    let boxed = self.emit_box_integer(result);
-                    self.cached_set_integer(a, result, boxed);
+                    if type_b == SlotType::Float {
+                        let fb = self.cached_get_float(b);
+                        let fresult = self.builder.ins().fneg(fb);
+                        let boxed = self.emit_box_float(fresult);
+                        self.cached_set_float(a, fresult, boxed);
+                    } else {
+                        let ib = self.cached_get_integer(b);
+                        // wrapping_neg: result fits in 47-bit (magnitude ≤ |operand|)
+                        let result = self.builder.ins().ineg(ib);
+                        let boxed = self.emit_box_integer(result);
+                        self.cached_set_integer(a, result, boxed);
+                    }
                     // No following MM instruction
                 }
 
@@ -1527,11 +1818,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::EqI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let imm = self.builder.ins().iconst(types::I64, sb);
-                    let eq = self.builder.ins().icmp(IntCC::Equal, ia, imm);
-                    // Skip if result == k (i.e., condition matches expectation)
-                    let cond = if k { self.emit_bool_not(eq) } else { eq };
+                    let type_a = self.get_slot_type(a);
+                    let cmp = if type_a == SlotType::Float {
+                        let fa = self.cached_get_float(a);
+                        let fimm = self.builder.ins().f64const(sb as f64);
+                        self.builder.ins().fcmp(FloatCC::Equal, fa, fimm)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let imm = self.builder.ins().iconst(types::I64, sb);
+                        self.builder.ins().icmp(IntCC::Equal, ia, imm)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1539,10 +1836,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LtI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let imm = self.builder.ins().iconst(types::I64, sb);
-                    let lt = self.builder.ins().icmp(IntCC::SignedLessThan, ia, imm);
-                    let cond = if k { self.emit_bool_not(lt) } else { lt };
+                    let type_a = self.get_slot_type(a);
+                    let cmp = if type_a == SlotType::Float {
+                        let fa = self.cached_get_float(a);
+                        let fimm = self.builder.ins().f64const(sb as f64);
+                        self.builder.ins().fcmp(FloatCC::LessThan, fa, fimm)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let imm = self.builder.ins().iconst(types::I64, sb);
+                        self.builder.ins().icmp(IntCC::SignedLessThan, ia, imm)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1550,10 +1854,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LeI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let imm = self.builder.ins().iconst(types::I64, sb);
-                    let le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, imm);
-                    let cond = if k { self.emit_bool_not(le) } else { le };
+                    let type_a = self.get_slot_type(a);
+                    let cmp = if type_a == SlotType::Float {
+                        let fa = self.cached_get_float(a);
+                        let fimm = self.builder.ins().f64const(sb as f64);
+                        self.builder.ins().fcmp(FloatCC::LessThanOrEqual, fa, fimm)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let imm = self.builder.ins().iconst(types::I64, sb);
+                        self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, imm)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1561,10 +1872,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GtI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let imm = self.builder.ins().iconst(types::I64, sb);
-                    let gt = self.builder.ins().icmp(IntCC::SignedGreaterThan, ia, imm);
-                    let cond = if k { self.emit_bool_not(gt) } else { gt };
+                    let type_a = self.get_slot_type(a);
+                    let cmp = if type_a == SlotType::Float {
+                        let fa = self.cached_get_float(a);
+                        let fimm = self.builder.ins().f64const(sb as f64);
+                        self.builder.ins().fcmp(FloatCC::GreaterThan, fa, fimm)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let imm = self.builder.ins().iconst(types::I64, sb);
+                        self.builder.ins().icmp(IntCC::SignedGreaterThan, ia, imm)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1572,10 +1890,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GeI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let imm = self.builder.ins().iconst(types::I64, sb);
-                    let ge = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, ia, imm);
-                    let cond = if k { self.emit_bool_not(ge) } else { ge };
+                    let type_a = self.get_slot_type(a);
+                    let cmp = if type_a == SlotType::Float {
+                        let fa = self.cached_get_float(a);
+                        let fimm = self.builder.ins().f64const(sb as f64);
+                        self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, fa, fimm)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let imm = self.builder.ins().iconst(types::I64, sb);
+                        self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, ia, imm)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1598,11 +1923,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Eq => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    // Fast path: both must be inline integers
-                    let ia = self.cached_get_integer(a);
-                    let ib = self.cached_get_integer(b);
-                    let eq = self.builder.ins().icmp(IntCC::Equal, ia, ib);
-                    let cond = if k { self.emit_bool_not(eq) } else { eq };
+                    let type_a = self.get_slot_type(a);
+                    let type_b = self.get_slot_type(b);
+                    let cmp = if type_a == SlotType::Float || type_b == SlotType::Float {
+                        let fa = self.get_as_float(a, type_a);
+                        let fb = self.get_as_float(b, type_b);
+                        self.builder.ins().fcmp(FloatCC::Equal, fa, fb)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let ib = self.cached_get_integer(b);
+                        self.builder.ins().icmp(IntCC::Equal, ia, ib)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1610,10 +1942,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Lt => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let ib = self.cached_get_integer(b);
-                    let lt = self.builder.ins().icmp(IntCC::SignedLessThan, ia, ib);
-                    let cond = if k { self.emit_bool_not(lt) } else { lt };
+                    let type_a = self.get_slot_type(a);
+                    let type_b = self.get_slot_type(b);
+                    let cmp = if type_a == SlotType::Float || type_b == SlotType::Float {
+                        let fa = self.get_as_float(a, type_a);
+                        let fb = self.get_as_float(b, type_b);
+                        self.builder.ins().fcmp(FloatCC::LessThan, fa, fb)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let ib = self.cached_get_integer(b);
+                        self.builder.ins().icmp(IntCC::SignedLessThan, ia, ib)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -1621,10 +1961,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Le => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let ia = self.cached_get_integer(a);
-                    let ib = self.cached_get_integer(b);
-                    let le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, ib);
-                    let cond = if k { self.emit_bool_not(le) } else { le };
+                    let type_a = self.get_slot_type(a);
+                    let type_b = self.get_slot_type(b);
+                    let cmp = if type_a == SlotType::Float || type_b == SlotType::Float {
+                        let fa = self.get_as_float(a, type_a);
+                        let fb = self.get_as_float(b, type_b);
+                        self.builder.ins().fcmp(FloatCC::LessThanOrEqual, fa, fb)
+                    } else {
+                        let ia = self.cached_get_integer(a);
+                        let ib = self.cached_get_integer(b);
+                        self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, ib)
+                    };
+                    let cond = if k { self.emit_bool_not(cmp) } else { cmp };
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
                 }
@@ -2027,6 +2375,180 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.builder.seal_block(cont);
                 }
 
+                OpCode::GetI => {
+                    // R[A] = R[B][C] where C is an integer index
+                    let b = inst.b() as i64;
+                    let c = inst.c() as i64;
+                    let table_val = self.cached_get_slot(b);
+                    self.flush_and_invalidate_cache();
+                    let index_val = self.builder.ins().iconst(types::I64, c);
+                    let call = self.builder.ins().call(
+                        self.geti_ref,
+                        &[self.vm_ptr, table_val, index_val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    self.cached_set_slot(a, result);
+                }
+
+                OpCode::SetI => {
+                    // R[A][B] = RK(C) where B is an integer index
+                    let b = inst.b() as i64;
+                    let c = inst.c() as usize;
+                    let k = inst.k();
+                    let table_val = self.cached_get_slot(a);
+                    let val = if k {
+                        let raw = self
+                            .constant_to_raw_bits(&self.proto.constants[c]);
+                        self.builder.ins().iconst(types::I64, raw as i64)
+                    } else {
+                        self.cached_get_slot(c as i64)
+                    };
+                    self.flush_and_invalidate_cache();
+                    let index_val = self.builder.ins().iconst(types::I64, b);
+                    let call = self.builder.ins().call(
+                        self.seti_ref,
+                        &[self.vm_ptr, table_val, index_val, val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT
+                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                    let is_exit =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, result, exit_val);
+                    let cont = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                }
+
+                OpCode::Len => {
+                    // R[A] = #R[B]
+                    let b = inst.b() as i64;
+                    let src_val = self.cached_get_slot(b);
+                    self.flush_and_invalidate_cache();
+                    let dest_val = self.builder.ins().iconst(types::I64, a);
+                    let call = self.builder.ins().call(
+                        self.len_ref,
+                        &[self.vm_ptr, self.base, dest_val, src_val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT
+                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                    let is_exit =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, result, exit_val);
+                    let cont = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                    // Reload slot A from memory (runtime helper wrote it directly)
+                    let reloaded = self.emit_get_slot(a);
+                    self.slot_cache.set(a as usize, reloaded, SlotType::Unknown, None, false);
+                }
+
+                OpCode::Concat => {
+                    // R[A] = R[A].. ... ..R[A+B-1] (B values starting at A)
+                    let b = inst.b() as i64;
+                    self.flush_and_invalidate_cache();
+                    let dest_val = self.builder.ins().iconst(types::I64, a);
+                    let count_val = self.builder.ins().iconst(types::I64, b);
+                    let call = self.builder.ins().call(
+                        self.concat_ref,
+                        &[self.vm_ptr, self.base, dest_val, count_val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT
+                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                    let is_exit =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, result, exit_val);
+                    let cont = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                    // Reload slot A from memory (runtime helper wrote it directly)
+                    let reloaded = self.emit_get_slot(a);
+                    self.slot_cache.set(a as usize, reloaded, SlotType::Unknown, None, false);
+                }
+
+                OpCode::NewTable => {
+                    // R[A] = {} with capacity hints B (array) and C (hash)
+                    let b = inst.b() as i64;
+                    let c = inst.c() as i64;
+                    if inst.k() {
+                        // Skip next ExtraArg instruction
+                        pc += 1;
+                    }
+                    self.flush_and_invalidate_cache();
+                    let array_hint = self.builder.ins().iconst(types::I64, b);
+                    let hash_hint = self.builder.ins().iconst(types::I64, c);
+                    let call = self.builder.ins().call(
+                        self.newtable_ref,
+                        &[self.vm_ptr, array_hint, hash_hint],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    self.cached_set_slot(a, result);
+                }
+
+                OpCode::SetList => {
+                    // R[A][C+i] = R[A+i], 1 <= i <= B
+                    let b = inst.b() as usize;
+                    let mut c = inst.c() as usize;
+                    if inst.k() {
+                        // Extended C via ExtraArg
+                        pc += 1;
+                        let next_inst = self.proto.code[pc];
+                        c += next_inst.ax_field() as usize * 256;
+                    }
+                    if b == 0 {
+                        // Variable count from stack_top — side-exit
+                        self.flush_and_invalidate_cache();
+                        self.builder.ins().jump(self.side_exit_block, &[]);
+                        block_terminated = true;
+                        pc += 1;
+                        continue;
+                    }
+                    self.flush_and_invalidate_cache();
+                    let table_reg_val = self.builder.ins().iconst(types::I64, a);
+                    let count_val = self.builder.ins().iconst(types::I64, b as i64);
+                    let offset_val =
+                        self.builder
+                            .ins()
+                            .iconst(types::I64, ((c - 1) * 50) as i64);
+                    let call = self.builder.ins().call(
+                        self.setlist_ref,
+                        &[self.vm_ptr, self.base, table_reg_val, count_val, offset_val],
+                    );
+                    let result = self.builder.inst_results(call)[0];
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT
+                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                    let is_exit =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, result, exit_val);
+                    let cont = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                    self.builder.seal_block(cont);
+                }
+
                 // Side-exit: complex operations handled by interpreter
                 OpCode::Return | OpCode::TailCall | OpCode::Closure => {
                     self.flush_and_invalidate_cache();
@@ -2144,6 +2666,20 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         let shift_result = self.builder.ins().select(b_neg, shl_result, shr_result);
         // If out of range, result is 0
         self.builder.ins().select(out_of_range, zero, shift_result)
+    }
+
+    /// Emit Lua float floor division: floor(a / b)
+    fn emit_lua_fidiv(&mut self, a: Value, b: Value) -> Value {
+        let div = self.builder.ins().fdiv(a, b);
+        self.builder.ins().floor(div)
+    }
+
+    /// Emit Lua float modulo: a - floor(a/b) * b
+    fn emit_lua_fmod(&mut self, a: Value, b: Value) -> Value {
+        let div = self.builder.ins().fdiv(a, b);
+        let floored = self.builder.ins().floor(div);
+        let product = self.builder.ins().fmul(floored, b);
+        self.builder.ins().fsub(a, product)
     }
 
     /// Emit a check for truthiness: returns a Cranelift i8 value that is 1
@@ -2492,24 +3028,17 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_side_exit_on_float_add() {
-        // `return 1.5 + 2.5` — floats will fail the integer type guard → side exit
-        let (proto, _strings) = compile(b"local a = 1.5; local b = 2.5; return a + b", "test").unwrap();
-        let mut compiler = JitCompiler::new().unwrap();
-        let mut gc = GcHeap::new();
-        let func = compiler.compile_proto(&proto, &mut gc, 0).unwrap();
-
-        let mut vm = Vm::new();
-        vm.stack.resize(256, TValue::nil());
-        let nresults = unsafe { func(&mut vm as *mut Vm, 0) };
-        assert_eq!(nresults, SIDE_EXIT, "float arithmetic should trigger side exit");
+    fn test_proto_float_add() {
+        // `local a = 1.5; local b = 2.5; return a + b` — floats now handled via float path
+        let result = jit_eval_one("local a = 1.5; local b = 2.5; return a + b");
+        assert_eq!(result.as_float(), Some(4.0));
     }
 
     #[test]
     fn test_proto_unsupported_opcode() {
-        // `return "a" .. "b"` uses Concat which we don't support yet
+        // Generic for loop uses TForCall which we don't support yet
         let (proto, _strings) =
-            compile(b"local a = \"x\"; local b = \"y\"; return a .. b", "test").unwrap();
+            compile(b"for k,v in pairs({}) do end", "test").unwrap();
         let mut compiler = JitCompiler::new().unwrap();
         let mut gc = GcHeap::new();
         let result = compiler.compile_proto(&proto, &mut gc, 0);
@@ -2682,20 +3211,10 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_comparison_side_exit() {
-        // Float comparison should trigger side exit
-        let (proto, _strings) = compile(
-            b"local x = 1.5; if x > 1 then return 1 end; return 0",
-            "test",
-        ).unwrap();
-        let mut compiler = JitCompiler::new().unwrap();
-        let mut gc = GcHeap::new();
-        let func = compiler.compile_proto(&proto, &mut gc, 0).unwrap();
-
-        let mut vm = Vm::new();
-        vm.stack.resize(256, TValue::nil());
-        let nresults = unsafe { func(&mut vm as *mut Vm, 0) };
-        assert_eq!(nresults, SIDE_EXIT, "float comparison should trigger side exit");
+    fn test_proto_float_comparison_gt() {
+        // Float comparison: 1.5 > 1 should return 1
+        let result = jit_eval_one("local x = 1.5; if x > 1 then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
     }
 
     // --- Increment 4 tests: more arithmetic opcodes ---
@@ -3804,6 +4323,208 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_integer(), Some(42));
+    }
+
+    // --- Increment 8 tests: float support + new opcodes ---
+
+    #[test]
+    fn test_proto_float_sub() {
+        let result = jit_eval_one("local a = 5.5; local b = 2.0; return a - b");
+        assert_eq!(result.as_float(), Some(3.5));
+    }
+
+    #[test]
+    fn test_proto_float_mul() {
+        let result = jit_eval_one("local a = 2.5; local b = 4.0; return a * b");
+        assert_eq!(result.as_float(), Some(10.0));
+    }
+
+    #[test]
+    fn test_proto_float_div() {
+        let result = jit_eval_one("local a = 7.0; local b = 2.0; return a / b");
+        assert_eq!(result.as_float(), Some(3.5));
+    }
+
+    #[test]
+    fn test_proto_mixed_int_float_add() {
+        // Integer + float constant
+        let result = jit_eval_one("local a = 1; local b = 2.5; return a + b");
+        assert_eq!(result.as_float(), Some(3.5));
+    }
+
+    #[test]
+    fn test_proto_float_chain() {
+        // Div produces float, then Add should use float path
+        let result = jit_eval_one("local a = 10; local b = 3; local c = a / b; return c + 1");
+        let f = result.as_float().unwrap();
+        let expected = 10.0 / 3.0 + 1.0;
+        assert!((f - expected).abs() < 1e-10, "expected {expected}, got {f}");
+    }
+
+    #[test]
+    fn test_proto_float_unm() {
+        let result = jit_eval_one("local a = 3.14; return -a");
+        assert_eq!(result.as_float(), Some(-3.14));
+    }
+
+    #[test]
+    fn test_proto_float_idiv() {
+        // Float floor division: 7.5 // 2.0 = 3.0
+        let result = jit_eval_one("local a = 7.5; local b = 2.0; return a // b");
+        assert_eq!(result.as_float(), Some(3.0));
+    }
+
+    #[test]
+    fn test_proto_float_mod() {
+        // Float modulo: 7.5 % 2.0 = 1.5
+        let result = jit_eval_one("local a = 7.5; local b = 2.0; return a % b");
+        assert_eq!(result.as_float(), Some(1.5));
+    }
+
+    #[test]
+    fn test_proto_float_addi() {
+        // AddI with float register: 1.5 + 1 (where 1 is immediate)
+        let result = jit_eval_one("local a = 10; local b = a / 4; return b + 1");
+        // 10/4 = 2.5, 2.5+1 = 3.5
+        assert_eq!(result.as_float(), Some(3.5));
+    }
+
+    #[test]
+    fn test_proto_float_constant_addk() {
+        // AddK with float constant: x + 0.5
+        let result = jit_eval_one("local x = 1.0; return x + 0.5");
+        assert_eq!(result.as_float(), Some(1.5));
+    }
+
+    #[test]
+    fn test_proto_div_result_feeds_add() {
+        // Result of div (float) propagates Float type to subsequent add
+        let result = jit_eval_one("local a = 10; local b = 3; return a / b + a / b");
+        let f = result.as_float().unwrap();
+        let expected = 10.0 / 3.0 + 10.0 / 3.0;
+        assert!((f - expected).abs() < 1e-10, "expected {expected}, got {f}");
+    }
+
+    #[test]
+    fn test_proto_float_lt_immediate() {
+        let result = jit_eval_one("local x = 1.5; if x < 2 then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn test_proto_float_eq_immediate() {
+        let result = jit_eval_one("local x = 5.0; if x == 5 then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn test_proto_float_comparison_reg() {
+        let result = jit_eval_one("local a = 1.5; local b = 2.5; if a < b then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn test_proto_float_loop() {
+        // for loop with integer arithmetic producing float via div
+        // s is integer (avoids cross-block float type loss)
+        let result = jit_eval_one(
+            "local s = 0; for i = 1, 10 do s = s + i end; return s / 3"
+        );
+        let f = result.as_float().unwrap();
+        let expected = 55.0 / 3.0;
+        assert!((f - expected).abs() < 1e-10, "expected {expected}, got {f}");
+    }
+
+    #[test]
+    fn test_proto_float_ge_immediate() {
+        let result = jit_eval_one("local x = 3.0; if x >= 3 then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
+    }
+
+    /// Helper: compile, JIT, and run with a full VM (env, strings, protos).
+    /// Returns the first result TValue.
+    fn jit_eval_full(source: &str) -> TValue {
+        let (proto, strings) = compile(source.as_bytes(), "test").unwrap();
+        let mut vm = Vm::new();
+        vm.strings = strings;
+        vm.mm_names = Some(MetamethodNames::init(&mut vm.strings));
+
+        vm.protos.clear();
+        let main_proto_idx = vm.protos.len();
+        vm.protos.push(proto.clone());
+
+        let env_idx = vm.gc.alloc_table(0, 16);
+        let env_val = TValue::from_table(env_idx);
+        vm.env_idx = Some(env_idx);
+
+        let env_upval_idx = vm.gc.alloc_upval(UpValLocation::Closed(env_val));
+        let closure_idx = vm.gc.alloc_closure(main_proto_idx, vec![env_upval_idx]);
+
+        let base = 0usize;
+        vm.stack.resize(256, TValue::nil());
+        let mut ci = CallInfo::new(base, main_proto_idx);
+        ci.closure_idx = Some(closure_idx);
+        vm.call_stack.push(ci);
+
+        let mut compiler = JitCompiler::new().unwrap();
+        let func = compiler
+            .compile_proto(&proto, &mut vm.gc, main_proto_idx)
+            .unwrap();
+        let nresults = unsafe { func(&mut vm as *mut Vm, base) };
+        assert!(nresults >= 1, "expected at least 1 result, got {nresults}");
+        vm.stack[base]
+    }
+
+    // --- Increment 8D tests: new opcodes ---
+
+    #[test]
+    fn test_proto_newtable() {
+        // NewTable allocates a table, return confirms it's not nil
+        let result = jit_eval_full("local t = {}; if t then return 1 end; return 0");
+        assert_eq!(result.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn test_proto_geti_seti() {
+        // SetI + GetI: t[1] = 42; return t[1]
+        let result = jit_eval_full("local t = {}; t[1] = 42; return t[1]");
+        assert_eq!(result.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn test_proto_setlist() {
+        // Table constructor with values → NewTable + SetList, then GetI
+        let result = jit_eval_full("local t = {10, 20, 30}; return t[2]");
+        assert_eq!(result.as_integer(), Some(20));
+    }
+
+    #[test]
+    fn test_proto_len_string() {
+        // Len on a string literal
+        let result = jit_eval_full("return #'hello'");
+        assert_eq!(result.as_integer(), Some(5));
+    }
+
+    #[test]
+    fn test_proto_len_table() {
+        // Len on a table
+        let result = jit_eval_full("local t = {1,2,3,4,5}; return #t");
+        assert_eq!(result.as_integer(), Some(5));
+    }
+
+    #[test]
+    fn test_proto_concat() {
+        // String concatenation
+        let result = jit_eval_full("local a = 'hello'; local b = ' world'; return a..b");
+        let s = result.as_string_id();
+        assert!(s.is_some(), "expected a string result");
+    }
+
+    #[test]
+    fn test_proto_setlist_large() {
+        // Larger table constructor
+        let result = jit_eval_full("local t = {1,2,3,4,5,6,7,8,9,10}; return t[10]");
+        assert_eq!(result.as_integer(), Some(10));
     }
 }
 

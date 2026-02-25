@@ -182,12 +182,9 @@ fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
         if let Some(jit) = opt.as_mut() {
             match jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx) {
                 Ok(jit_fn) => {
-                    eprintln!("[JIT] Compiled proto {} successfully", proto_idx);
                     vm.jit_functions.insert(proto_idx, jit_fn);
                 }
-                Err(e) => {
-                    eprintln!("[JIT] Failed to compile proto {}: {}", proto_idx, e);
-                }
+                Err(_e) => {}
             }
         }
     });

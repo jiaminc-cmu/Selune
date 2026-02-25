@@ -93,6 +93,17 @@ This is the same configuration used by the official test suite for portable Lua 
 - Resource limits: 200 local variables, 255 upvalues, 200 nesting levels, 249 registers
 - `_VERSION`, `_G`, `warn()`, `select()`, `rawget`, `rawset`, `rawequal`, `rawlen`
 
+### Phase 4 — JIT Compiler (In Progress)
+- Method-based JIT compilation via [Cranelift](https://cranelift.dev/) code generator
+- Automatic tier-up: functions compiled to native code after 1000 calls
+- 55+ bytecode opcodes translated to native code
+- Integer and float type specialization with NaN-box type guards
+- Register allocation with slot caching and deferred stores
+- Loop-carried type propagation via Cranelift block parameters
+- Runtime helpers for function calls, upvalues, table access, and string operations
+- Side-exit to interpreter for unsupported patterns (metamethods, coroutines)
+- 7-11x speedup over interpreter on numeric-heavy code
+
 ## Project Structure
 
 ```
@@ -101,7 +112,7 @@ selune/
 │   ├── selune-core/     # Core types: TValue (NaN-boxed), TString, StringInterner, GC heap
 │   ├── selune-compiler/ # Lexer, parser, bytecode compiler
 │   ├── selune-vm/       # Stack-based virtual machine
-│   ├── selune-jit/      # JIT compilation via Cranelift (in progress)
+│   ├── selune-jit/      # JIT compiler via Cranelift (55+ opcodes, int+float specialization)
 │   ├── selune-stdlib/   # Standard library (math, string, table, io, os, debug, utf8, coroutine, package)
 │   ├── selune-ffi/      # C API compatibility layer (planned)
 │   └── selune/          # CLI binary
@@ -146,23 +157,37 @@ Key design details are documented in [docs/architecture.md](docs/architecture.md
 
 Benchmarked on arm64 Apple M3, comparing against PUC Lua 5.4.8 and LuaJIT 2.1:
 
-| Benchmark | Selune/PUC | Selune/LuaJIT | Category |
-|-----------|-----------|---------------|----------|
-| binary_trees | 1.15x | 4.60x | GC/allocation |
-| table_hash | 1.32x | 5.78x | Hash table ops |
-| gc_pressure | 1.37x | 9.72x | GC stress |
-| string_concat | 1.64x | 3.68x | String ops |
-| closures | 1.93x | 3.46x | Function/upvalue |
-| mandelbrot | 2.17x | 25.91x | Float math |
-| ackermann | 2.29x | 19.66x | Deep recursion |
-| table_array | 2.49x | 24.53x | Array ops |
-| spectral_norm | 2.79x | 149.17x | Float math |
-| arithmetic | 3.18x | 41.74x | Integer math |
-| coroutines | 3.54x | — | Yield/resume |
-| fibonacci | 3.92x | 42.30x | Recursion |
-| method_calls | 6.42x | 59.92x | OOP dispatch |
+### Interpreter Benchmarks
 
-**Geometric mean: 2.61x PUC Lua** (across 16 benchmarks). Lower is better; <1.0x means Selune is faster.
+These benchmarks measure interpreter throughput (each function called once, below JIT threshold):
+
+| Benchmark | Selune/PUC | Category |
+|-----------|-----------|----------|
+| binary_trees | 1.19x | GC/allocation |
+| table_hash | 1.27x | Hash table ops |
+| gc_pressure | 1.37x | GC stress |
+| spectral_norm | 1.38x | Float math |
+| string_concat | 1.61x | String ops |
+| closures | 1.68x | Function/upvalue |
+| ackermann | 2.31x | Deep recursion |
+| mandelbrot | 2.37x | Float math |
+| table_array | 2.50x | Array ops |
+| arithmetic | 3.51x | Integer math |
+| fibonacci | 3.74x | Recursion |
+| method_calls | 6.23x | OOP dispatch |
+
+**Interpreter geometric mean: 2.51x PUC Lua** (across 16 benchmarks). Lower is better; <1.0x means Selune is faster.
+
+### JIT Performance
+
+When the JIT activates (functions called 1000+ times), Selune generates native code via Cranelift that is significantly faster than both the interpreter and PUC Lua:
+
+| Test | Interpreter | JIT | JIT Speedup | vs PUC Lua |
+|------|------------|-----|-------------|------------|
+| Integer sum loop | 1.21s | 0.16s | **7.1x** | **4.7x faster** |
+| Heavy integer arithmetic | 4.66s | 0.40s | **11.6x** | **4.7x faster** |
+
+The JIT currently supports 55+ opcodes including integer/float arithmetic, comparisons, control flow, loops, function calls, upvalues, and table access.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To regenerate: `./benchmarks/run_benchmarks.sh`
 
@@ -179,10 +204,11 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To
 
 ## Testing
 
-1,443+ tests across the workspace:
+1,570+ tests across the workspace:
 
 - **1,122** VM end-to-end tests (4 ignored for known gaps)
 - **140** compiler unit tests
+- **127** JIT compiler tests
 - **95** compiler end-to-end integration tests
 - **48** core type tests (TValue roundtrips, string interning, property tests)
 - **36** standard library tests
