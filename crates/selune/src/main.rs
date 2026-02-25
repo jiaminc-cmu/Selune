@@ -1,6 +1,9 @@
-use selune_compiler::compiler;
-use selune_vm::vm::Vm;
+use std::cell::RefCell;
 use std::io::Read;
+
+use selune_compiler::compiler;
+use selune_jit::JitCompiler;
+use selune_vm::vm::Vm;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -166,6 +169,30 @@ fn main() {
     }
 }
 
+thread_local! {
+    static JIT_COMPILER: RefCell<Option<JitCompiler>> = RefCell::new(None);
+}
+
+fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
+    JIT_COMPILER.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            *opt = JitCompiler::new().ok();
+        }
+        if let Some(jit) = opt.as_mut() {
+            match jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx) {
+                Ok(jit_fn) => {
+                    eprintln!("[JIT] Compiled proto {} successfully", proto_idx);
+                    vm.jit_functions.insert(proto_idx, jit_fn);
+                }
+                Err(e) => {
+                    eprintln!("[JIT] Failed to compile proto {}: {}", proto_idx, e);
+                }
+            }
+        }
+    });
+}
+
 fn create_vm(warn_on: bool, script_file: &Option<String>, script_args: &[String]) -> Vm {
     // We need to use the VM's execute method which initializes everything.
     // Create a dummy proto to initialize the VM, then we can use load_chunk for subsequent code.
@@ -174,6 +201,11 @@ fn create_vm(warn_on: bool, script_file: &Option<String>, script_args: &[String]
     let mut vm = Vm::new();
     // Execute the empty proto to initialize stdlib
     let _ = vm.execute(&proto, strings);
+
+    // Enable JIT compilation
+    vm.jit_enabled = true;
+    vm.jit_threshold = 1000;
+    vm.jit_compile_callback = Some(jit_compile_hook);
 
     if warn_on {
         vm.warn_enabled = true;

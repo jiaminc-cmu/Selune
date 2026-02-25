@@ -8,5 +8,6 @@ license.workspace = true
 selune-core.workspace = true
 selune-compiler.workspace = true
 selune-vm.workspace = true
+selune-jit.workspace = true
 selune-stdlib.workspace = true
 rustyline = "14"

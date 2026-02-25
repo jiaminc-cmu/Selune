@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use cranelift_codegen::ir::{types, AbiParam, Block, FuncRef, InstBuilder, MemFlags, Signature, Value};
+use cranelift_codegen::ir::{types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -71,6 +71,14 @@ impl JitCompiler {
         builder.symbol(
             "jit_rt_get_stack_slot",
             runtime::jit_rt_get_stack_slot as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_get_stack_base",
+            runtime::jit_rt_get_stack_base as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_ensure_stack",
+            runtime::jit_rt_ensure_stack as *const u8,
         );
         builder.symbol(
             "jit_rt_get_upval",
@@ -308,24 +316,6 @@ impl JitCompiler {
         // Declare runtime helpers
         let call_conv = self.module.isa().default_call_conv();
 
-        let mut set_sig = Signature::new(call_conv);
-        set_sig.params.push(AbiParam::new(types::I64)); // vm_ptr
-        set_sig.params.push(AbiParam::new(types::I64)); // base
-        set_sig.params.push(AbiParam::new(types::I64)); // offset
-        set_sig.params.push(AbiParam::new(types::I64)); // raw_bits
-        let set_id = self
-            .module
-            .declare_function("jit_rt_set_stack_slot", Linkage::Import, &set_sig)?;
-
-        let mut get_sig = Signature::new(call_conv);
-        get_sig.params.push(AbiParam::new(types::I64)); // vm_ptr
-        get_sig.params.push(AbiParam::new(types::I64)); // base
-        get_sig.params.push(AbiParam::new(types::I64)); // offset
-        get_sig.returns.push(AbiParam::new(types::I64)); // raw_bits
-        let get_id = self
-            .module
-            .declare_function("jit_rt_get_stack_slot", Linkage::Import, &get_sig)?;
-
         // jit_rt_get_upval(vm_ptr, upval_idx) -> u64
         let mut get_upval_sig = Signature::new(call_conv);
         get_upval_sig.params.push(AbiParam::new(types::I64));
@@ -405,6 +395,26 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_table_newindex", Linkage::Import, &tbl_ni_sig)?;
 
+        // jit_rt_get_stack_base(vm_ptr) -> *const u8 (as i64)
+        let mut get_stack_base_sig = Signature::new(call_conv);
+        get_stack_base_sig.params.push(AbiParam::new(types::I64));
+        get_stack_base_sig.returns.push(AbiParam::new(types::I64));
+        let get_stack_base_id = self.module.declare_function(
+            "jit_rt_get_stack_base",
+            Linkage::Import,
+            &get_stack_base_sig,
+        )?;
+
+        // jit_rt_ensure_stack(vm_ptr, min_len)
+        let mut ensure_stack_sig = Signature::new(call_conv);
+        ensure_stack_sig.params.push(AbiParam::new(types::I64));
+        ensure_stack_sig.params.push(AbiParam::new(types::I64));
+        let ensure_stack_id = self.module.declare_function(
+            "jit_rt_ensure_stack",
+            Linkage::Import,
+            &ensure_stack_sig,
+        )?;
+
         self.ctx.func.signature = sig;
 
         {
@@ -417,8 +427,6 @@ impl JitCompiler {
             let vm_ptr = builder.block_params(entry)[0];
             let base = builder.block_params(entry)[1];
 
-            let set_ref = self.module.declare_func_in_func(set_id, builder.func);
-            let get_ref = self.module.declare_func_in_func(get_id, builder.func);
             let get_upval_ref = self.module.declare_func_in_func(get_upval_id, builder.func);
             let set_upval_ref = self.module.declare_func_in_func(set_upval_id, builder.func);
             let get_tab_up_ref =
@@ -429,12 +437,34 @@ impl JitCompiler {
             let self_ref = self.module.declare_func_in_func(self_id, builder.func);
             let tbl_idx_ref = self.module.declare_func_in_func(tbl_idx_id, builder.func);
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
+            let get_stack_base_ref =
+                self.module
+                    .declare_func_in_func(get_stack_base_id, builder.func);
+            let ensure_stack_ref =
+                self.module
+                    .declare_func_in_func(ensure_stack_id, builder.func);
 
             // Side-exit block: return SIDE_EXIT
             let side_exit_block = builder.create_block();
 
             // Pre-scan: find all jump targets and create blocks for them
-            let pc_blocks = Self::create_pc_blocks(proto, &mut builder);
+            let (pc_blocks, for_loop_bodies) = Self::create_pc_blocks(proto, &mut builder);
+
+            // Compute max register used so we can ensure_stack at entry.
+            // This avoids bounds checking on every inline load/store.
+            let max_reg = proto.max_stack_size as usize;
+            // Ensure stack has enough space: base + max_reg + margin
+            let min_stack_val = builder.ins().iconst(types::I64, (max_reg + 16) as i64);
+            let base_plus_min = builder.ins().iadd(base, min_stack_val);
+            builder
+                .ins()
+                .call(ensure_stack_ref, &[vm_ptr, base_plus_min]);
+
+            // Get stack base pointer for inline access
+            let call_gsb = builder
+                .ins()
+                .call(get_stack_base_ref, &[vm_ptr]);
+            let stack_base = builder.inst_results(call_gsb)[0];
 
             // If PC 0 is a jump target, jump from entry to its block
             if let Some(&block) = pc_blocks.get(&0) {
@@ -446,8 +476,6 @@ impl JitCompiler {
                 builder: &mut builder,
                 vm_ptr,
                 base,
-                set_ref,
-                get_ref,
                 get_upval_ref,
                 set_upval_ref,
                 get_tab_up_ref,
@@ -456,10 +484,14 @@ impl JitCompiler {
                 self_ref,
                 tbl_idx_ref,
                 tbl_ni_ref,
+                get_stack_base_ref,
+                stack_base,
+                slot_cache: SlotCache::new(),
                 side_exit_block,
                 proto,
                 gc,
                 pc_blocks: &pc_blocks,
+                for_loop_bodies: &for_loop_bodies,
                 proto_idx,
             };
 
@@ -489,9 +521,16 @@ impl JitCompiler {
     }
 
     /// Pre-scan bytecodes to find jump targets and create Cranelift blocks.
-    fn create_pc_blocks(proto: &Proto, builder: &mut FunctionBuilder) -> HashMap<usize, Block> {
+    /// Create Cranelift blocks for all jump targets. Returns the PC→Block map
+    /// and a map of for-loop body PCs → base slot (for block parameter setup).
+    fn create_pc_blocks(
+        proto: &Proto,
+        builder: &mut FunctionBuilder,
+    ) -> (HashMap<usize, Block>, HashMap<usize, usize>) {
         let mut targets = std::collections::HashSet::new();
         let code = &proto.code;
+        // Track ForPrep body PCs and their base slot (A register)
+        let mut for_loop_bodies: Vec<(usize, usize)> = Vec::new();
 
         for (pc, inst) in code.iter().enumerate() {
             let op = inst.opcode();
@@ -524,7 +563,11 @@ impl JitCompiler {
                     let target = (pc as i64 + 2 + sbx as i64) as usize;
                     targets.insert(target);
                     // The loop body starts at pc+1
-                    targets.insert(pc + 1);
+                    let body_pc = pc + 1;
+                    targets.insert(body_pc);
+                    // Record for block parameter setup
+                    let base_slot = inst.a() as usize;
+                    for_loop_bodies.push((body_pc, base_slot));
                 }
                 OpCode::ForLoop => {
                     let sbx = inst.sbx();
@@ -539,13 +582,27 @@ impl JitCompiler {
         }
 
         let mut pc_blocks = HashMap::new();
+        let mut for_body_map = HashMap::new();
         for target in targets {
             if target < code.len() {
                 let block = builder.create_block();
                 pc_blocks.insert(target, block);
             }
         }
-        pc_blocks
+
+        // Add block parameters for for-loop body blocks:
+        // 4 params: counter(i64), count(i64), step(i64), loop_var(i64)
+        for (body_pc, base_slot) in for_loop_bodies {
+            if let Some(&block) = pc_blocks.get(&body_pc) {
+                builder.append_block_param(block, types::I64); // counter
+                builder.append_block_param(block, types::I64); // count
+                builder.append_block_param(block, types::I64); // step
+                builder.append_block_param(block, types::I64); // loop_var
+                for_body_map.insert(body_pc, base_slot);
+            }
+        }
+
+        (pc_blocks, for_body_map)
     }
 }
 
@@ -555,13 +612,109 @@ const PAYLOAD_MASK: i64 = value::PAYLOAD_MASK as i64;
 const SMALL_INT_MIN: i64 = value::SMALL_INT_MIN;
 const SMALL_INT_MAX: i64 = value::SMALL_INT_MAX;
 
+/// Known type of a cached stack slot value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotType {
+    /// Type unknown — must guard before using typed_val.
+    Unknown,
+    /// Known to be an inline integer (NaN-boxed with QNAN|TAG_INT).
+    Integer,
+}
+
+/// A cached stack slot: keeps the raw NaN-boxed value and optionally
+/// an unboxed typed value (e.g., the extracted i64 integer).
+#[derive(Clone, Copy)]
+struct CachedSlot {
+    /// The NaN-boxed i64 value (always available).
+    raw_val: Value,
+    /// Unboxed value if type is known (e.g., extracted integer payload).
+    typed_val: Option<Value>,
+    /// What type we've proven for this slot.
+    slot_type: SlotType,
+    /// True if this slot has been modified but not yet written to memory.
+    dirty: bool,
+}
+
+/// Per-block cache mapping Lua register offsets to Cranelift SSA variables.
+struct SlotCache {
+    slots: HashMap<usize, CachedSlot>,
+}
+
+impl SlotCache {
+    fn new() -> Self {
+        SlotCache {
+            slots: HashMap::new(),
+        }
+    }
+
+    /// Get cached raw value for an offset.
+    fn get_raw(&self, offset: usize) -> Option<Value> {
+        self.slots.get(&offset).map(|s| s.raw_val)
+    }
+
+    /// Get cached typed value if the type matches.
+    fn get_typed(&self, offset: usize, ty: SlotType) -> Option<Value> {
+        self.slots.get(&offset).and_then(|s| {
+            if s.slot_type == ty {
+                s.typed_val
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Insert or update a cache entry.
+    fn set(
+        &mut self,
+        offset: usize,
+        raw_val: Value,
+        slot_type: SlotType,
+        typed_val: Option<Value>,
+        dirty: bool,
+    ) {
+        self.slots.insert(
+            offset,
+            CachedSlot {
+                raw_val,
+                typed_val,
+                slot_type,
+                dirty,
+            },
+        );
+    }
+
+    /// Remove one slot from the cache.
+    fn invalidate(&mut self, offset: usize) {
+        self.slots.remove(&offset);
+    }
+
+    /// Clear entire cache.
+    fn invalidate_all(&mut self) {
+        self.slots.clear();
+    }
+
+    /// List all dirty entries: (offset, raw_val).
+    fn dirty_slots(&self) -> Vec<(usize, Value)> {
+        self.slots
+            .iter()
+            .filter(|(_, s)| s.dirty)
+            .map(|(&off, s)| (off, s.raw_val))
+            .collect()
+    }
+
+    /// Mark all dirty slots as clean (after flushing to memory).
+    fn mark_all_clean(&mut self) {
+        for s in self.slots.values_mut() {
+            s.dirty = false;
+        }
+    }
+}
+
 /// Helper struct that holds state during bytecode → IR translation.
 struct BytecodeEmitter<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     vm_ptr: Value,
     base: Value,
-    set_ref: FuncRef,
-    get_ref: FuncRef,
     get_upval_ref: FuncRef,
     set_upval_ref: FuncRef,
     get_tab_up_ref: FuncRef,
@@ -570,32 +723,155 @@ struct BytecodeEmitter<'a, 'b> {
     self_ref: FuncRef,
     tbl_idx_ref: FuncRef,
     tbl_ni_ref: FuncRef,
+    /// Helper to get raw pointer to vm.stack data buffer.
+    get_stack_base_ref: FuncRef,
+    /// Cached raw pointer to vm.stack data (invalidated by stack reallocation).
+    stack_base: Value,
+    /// Register value cache — avoids redundant loads and defers stores.
+    slot_cache: SlotCache,
     side_exit_block: Block,
     proto: &'a Proto,
     gc: &'a mut GcHeap,
     /// Maps bytecode PC → Cranelift block (for jump targets).
     pc_blocks: &'a HashMap<usize, Block>,
+    /// Maps for-loop body PC → base slot (A register of ForPrep).
+    /// Used to initialize slot cache from block parameters at loop entry.
+    for_loop_bodies: &'a HashMap<usize, usize>,
     /// Index of this proto in vm.protos[], used by runtime helpers.
     proto_idx: usize,
 }
 
 impl<'a, 'b> BytecodeEmitter<'a, 'b> {
-    /// Emit a call to jit_rt_set_stack_slot(vm, base, offset, raw_bits).
-    fn emit_set_slot(&mut self, offset: i64, raw_bits: Value) {
+    /// Compute the memory address for stack[base + offset].
+    /// Returns the address as an i64 pointer value.
+    fn emit_slot_addr(&mut self, offset: i64) -> Value {
+        // addr = stack_base + (base + offset) * 8
         let offset_val = self.builder.ins().iconst(types::I64, offset);
-        self.builder
-            .ins()
-            .call(self.set_ref, &[self.vm_ptr, self.base, offset_val, raw_bits]);
+        let idx = self.builder.ins().iadd(self.base, offset_val);
+        let byte_offset = self.builder.ins().ishl_imm(idx, 3); // * 8
+        self.builder.ins().iadd(self.stack_base, byte_offset)
     }
 
-    /// Emit a call to jit_rt_get_stack_slot(vm, base, offset) -> raw_bits.
+    /// Inline store: write raw_bits to stack[base + offset].
+    fn emit_set_slot(&mut self, offset: i64, raw_bits: Value) {
+        let addr = self.emit_slot_addr(offset);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), raw_bits, addr, 0);
+    }
+
+    /// Inline load: read raw_bits from stack[base + offset].
     fn emit_get_slot(&mut self, offset: i64) -> Value {
-        let offset_val = self.builder.ins().iconst(types::I64, offset);
+        let addr = self.emit_slot_addr(offset);
+        self.builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), addr, 0)
+    }
+
+    /// Reload stack_base after a runtime helper call that may have
+    /// triggered stack reallocation (e.g., Call, table ops).
+    fn reload_stack_base(&mut self) {
         let call = self
             .builder
             .ins()
-            .call(self.get_ref, &[self.vm_ptr, self.base, offset_val]);
-        self.builder.inst_results(call)[0]
+            .call(self.get_stack_base_ref, &[self.vm_ptr]);
+        self.stack_base = self.builder.inst_results(call)[0];
+    }
+
+    /// Get a slot value, checking cache first; emits inline load on miss.
+    fn cached_get_slot(&mut self, offset: i64) -> Value {
+        let off = offset as usize;
+        if let Some(raw) = self.slot_cache.get_raw(off) {
+            return raw;
+        }
+        let val = self.emit_get_slot(offset);
+        self.slot_cache.set(off, val, SlotType::Unknown, None, false);
+        val
+    }
+
+    /// Set a slot value in the cache (deferred store — NOT written to memory).
+    fn cached_set_slot(&mut self, offset: i64, raw_val: Value) {
+        self.slot_cache.set(offset as usize, raw_val, SlotType::Unknown, None, true);
+    }
+
+    /// Flush all dirty cache entries to memory (emit stores), mark clean.
+    fn flush_cache(&mut self) {
+        let dirty = self.slot_cache.dirty_slots();
+        for (off, raw) in dirty {
+            self.emit_set_slot(off as i64, raw);
+        }
+        self.slot_cache.mark_all_clean();
+    }
+
+    /// Flush dirty entries to memory, then clear the entire cache.
+    fn flush_and_invalidate_cache(&mut self) {
+        self.flush_cache();
+        self.slot_cache.invalidate_all();
+    }
+
+    /// Get the unboxed integer value for a slot. If the slot is already
+    /// known to be an integer (from a previous guard), returns the cached
+    /// typed value directly — no load, no guard. Otherwise loads the raw
+    /// value and emits a type guard, then caches the result.
+    fn cached_get_integer(&mut self, offset: i64) -> Value {
+        let off = offset as usize;
+        // Check if we already know this slot is an integer
+        if let Some(typed) = self.slot_cache.get_typed(off, SlotType::Integer) {
+            return typed;
+        }
+        // Load raw value (possibly from cache)
+        let raw = self.cached_get_slot(offset);
+        // Emit integer type guard (side-exits on non-integer)
+        let int_val = self.emit_integer_guard(raw);
+        // Update cache with type info (not dirty — we didn't modify the slot)
+        let dirty = self.slot_cache.slots.get(&off).map_or(false, |s| s.dirty);
+        self.slot_cache.set(off, raw, SlotType::Integer, Some(int_val), dirty);
+        int_val
+    }
+
+    /// Set a slot to a known-integer value in the cache (deferred store).
+    fn cached_set_integer(&mut self, offset: i64, int_val: Value, boxed_val: Value) {
+        self.slot_cache.set(
+            offset as usize,
+            boxed_val,
+            SlotType::Integer,
+            Some(int_val),
+            true,
+        );
+    }
+
+    /// Emit a conditional branch to side_exit_block, flushing dirty cache
+    /// entries before exit. Creates a trampoline block if needed.
+    ///
+    /// `condition` is true when we should continue (not exit).
+    fn emit_guard_with_flush(&mut self, condition: Value) {
+        let dirty = self.slot_cache.dirty_slots();
+        let cont_block = self.builder.create_block();
+
+        if dirty.is_empty() {
+            // No dirty slots — branch directly to side_exit_block
+            self.builder
+                .ins()
+                .brif(condition, cont_block, &[], self.side_exit_block, &[]);
+        } else {
+            // Create trampoline that flushes dirty slots before side-exit.
+            // We must emit the branch first (to terminate current block),
+            // then switch to the trampoline to fill it.
+            let trampoline = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(condition, cont_block, &[], trampoline, &[]);
+            // Fill the trampoline block
+            self.builder.switch_to_block(trampoline);
+            self.builder.seal_block(trampoline);
+            for (off, raw) in &dirty {
+                self.emit_set_slot(*off as i64, *raw);
+            }
+            self.builder.ins().jump(self.side_exit_block, &[]);
+        }
+
+        self.builder.switch_to_block(cont_block);
+        self.builder.seal_block(cont_block);
     }
 
     /// Logical NOT for boolean (i8) values from icmp.
@@ -618,7 +894,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
     }
 
     /// Emit a type guard: check if `val` is an inline integer (QNAN | TAG_INT prefix).
-    /// Branches to side_exit_block if NOT an integer.
+    /// Branches to side_exit_block if NOT an integer (flushing dirty cache first).
     /// Returns the extracted i64 integer value (sign-extended from 47-bit payload).
     fn emit_integer_guard(&mut self, val: Value) -> Value {
         // Check: (val & ~PAYLOAD_MASK) == QNAN_TAG_INT
@@ -632,13 +908,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
             expected,
         );
 
-        let cont_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_int, cont_block, &[], self.side_exit_block, &[]);
-
-        self.builder.switch_to_block(cont_block);
-        self.builder.seal_block(cont_block);
+        // Guard: continue if integer, side-exit (with cache flush) if not
+        self.emit_guard_with_flush(is_int);
 
         // Extract the integer payload: sign-extend from 47 bits
         let payload_mask = self.builder.ins().iconst(types::I64, PAYLOAD_MASK);
@@ -657,7 +928,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         self.builder.ins().bor(payload, tag)
     }
 
-    /// Emit an integer overflow check + side-exit.
+    /// Emit an integer overflow check + side-exit (with cache flush).
     /// If `result` is outside [SMALL_INT_MIN, SMALL_INT_MAX], branches to side_exit.
     fn emit_overflow_guard(&mut self, result: Value) {
         // Check: result >= SMALL_INT_MIN && result <= SMALL_INT_MAX
@@ -675,25 +946,62 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
             range,
         );
 
-        let cont_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(in_range, cont_block, &[], self.side_exit_block, &[]);
-
-        self.builder.switch_to_block(cont_block);
-        self.builder.seal_block(cont_block);
+        self.emit_guard_with_flush(in_range);
     }
 
     /// Transition to a new block at the given PC if it's a jump target.
     /// Emits a fallthrough jump from the current block if needed.
+    /// Flushes and invalidates the slot cache at block boundaries.
+    /// For for-loop body blocks, initializes cache from block parameters.
     fn maybe_switch_to_pc_block(&mut self, pc: usize, block_terminated: &mut bool) {
         if let Some(&target_block) = self.pc_blocks.get(&pc) {
             if !*block_terminated {
-                // Fallthrough: jump from current block to the target block
+                // Flush dirty cache before jumping to a different block
+                self.flush_and_invalidate_cache();
+                // Fallthrough: jump from current block to the target block.
+                // For-loop body blocks have block params, but ForPrep always
+                // terminates its block, so we never fall through to one.
+                debug_assert!(
+                    !self.for_loop_bodies.contains_key(&pc),
+                    "unexpected fallthrough into for-loop body at pc={pc}"
+                );
                 self.builder.ins().jump(target_block, &[]);
+            } else {
+                // Block already terminated — just clear cache for new block
+                self.slot_cache.invalidate_all();
             }
             self.builder.switch_to_block(target_block);
             *block_terminated = false;
+
+            // If this is a for-loop body block, initialize cache from block params
+            if let Some(&base_slot) = self.for_loop_bodies.get(&pc) {
+                let params = self.builder.block_params(target_block);
+                let i_counter = params[0];
+                let i_count = params[1];
+                let i_step = params[2];
+                let i_loop_var = params[3];
+
+                // Box the typed values for the raw cache entries
+                let boxed_counter = self.emit_box_integer(i_counter);
+                let boxed_count = self.emit_box_integer(i_count);
+                let boxed_step = self.emit_box_integer(i_step);
+                let boxed_var = self.emit_box_integer(i_loop_var);
+
+                // Initialize cache with known-integer type (not dirty — memory
+                // was written by ForPrep, and ForLoop back-edge writes before jump)
+                let a = base_slot as i64;
+                self.cached_set_integer(a, i_counter, boxed_counter);
+                self.cached_set_integer(a + 1, i_count, boxed_count);
+                self.cached_set_integer(a + 2, i_step, boxed_step);
+                self.cached_set_integer(a + 3, i_loop_var, boxed_var);
+                // Mark these as NOT dirty (memory is already up-to-date from
+                // ForPrep or ForLoop which write before jumping here)
+                for off in 0..4 {
+                    if let Some(s) = self.slot_cache.slots.get_mut(&(base_slot + off)) {
+                        s.dirty = false;
+                    }
+                }
+            }
         }
     }
 
@@ -701,6 +1009,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
     /// otherwise fall through to pc+1. This matches how comparisons and
     /// Test/TestSet interact with the following Jmp instruction.
     fn emit_cond_skip(&mut self, condition: Value, pc: usize) {
+        // Flush cache before branching to different blocks
+        self.flush_and_invalidate_cache();
         let skip_block = self.pc_blocks.get(&(pc + 2)).copied()
             .expect("comparison skip target pc+2 should have a block");
         let fall_block = self.pc_blocks.get(&(pc + 1)).copied()
@@ -732,51 +1042,71 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
             match op {
                 OpCode::Move => {
                     let b = inst.b() as i64;
-                    let val = self.emit_get_slot(b);
-                    self.emit_set_slot(a, val);
+                    let val = self.cached_get_slot(b);
+                    // Copy cache entry: preserve type info from source
+                    let off_b = b as usize;
+                    let slot_type = self.slot_cache.slots.get(&off_b)
+                        .map(|s| s.slot_type).unwrap_or(SlotType::Unknown);
+                    let typed_val = self.slot_cache.slots.get(&off_b)
+                        .and_then(|s| s.typed_val);
+                    self.slot_cache.set(a as usize, val, slot_type, typed_val, true);
                 }
 
                 OpCode::LoadI => {
                     let sbx = inst.sbx() as i64;
                     let raw_bits = TValue::from_integer(sbx).raw_bits();
-                    let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
+                    let int_val = self.builder.ins().iconst(types::I64, sbx);
+                    self.cached_set_integer(a, int_val, boxed);
                 }
 
                 OpCode::LoadF => {
                     let sbx = inst.sbx() as f64;
                     let raw_bits = TValue::from_float(sbx).raw_bits();
                     let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    self.cached_set_slot(a, val);
                 }
 
                 OpCode::LoadK => {
                     let bx = inst.bx() as usize;
-                    let raw_bits = self.constant_to_raw_bits(&self.proto.constants[bx]);
-                    let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    let k = &self.proto.constants[bx];
+                    let raw_bits = self.constant_to_raw_bits(k);
+                    let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
+                    if let Constant::Integer(i) = k {
+                        let int_val = self.builder.ins().iconst(types::I64, *i);
+                        self.cached_set_integer(a, int_val, boxed);
+                    } else {
+                        self.cached_set_slot(a, boxed);
+                    }
                 }
 
                 OpCode::LoadKX => {
                     pc += 1;
                     let ax = code[pc].ax_field() as usize;
-                    let raw_bits = self.constant_to_raw_bits(&self.proto.constants[ax]);
-                    let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    let k = &self.proto.constants[ax];
+                    let raw_bits = self.constant_to_raw_bits(k);
+                    let boxed = self.builder.ins().iconst(types::I64, raw_bits as i64);
+                    if let Constant::Integer(i) = k {
+                        let int_val = self.builder.ins().iconst(types::I64, *i);
+                        self.cached_set_integer(a, int_val, boxed);
+                    } else {
+                        self.cached_set_slot(a, boxed);
+                    }
                 }
 
                 OpCode::LoadFalse => {
                     let raw_bits = TValue::from_bool(false).raw_bits();
                     let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    self.cached_set_slot(a, val);
                 }
 
                 OpCode::LFalseSkip => {
                     let raw_bits = TValue::from_bool(false).raw_bits();
                     let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    self.cached_set_slot(a, val);
                     // Skip next instruction — jump to pc+2
                     if let Some(&target) = self.pc_blocks.get(&(pc + 2)) {
+                        self.flush_and_invalidate_cache();
                         self.builder.ins().jump(target, &[]);
                         block_terminated = true;
                     }
@@ -786,7 +1116,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LoadTrue => {
                     let raw_bits = TValue::from_bool(true).raw_bits();
                     let val = self.builder.ins().iconst(types::I64, raw_bits as i64);
-                    self.emit_set_slot(a, val);
+                    self.cached_set_slot(a, val);
                 }
 
                 OpCode::LoadNil => {
@@ -794,11 +1124,12 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let nil_bits = TValue::nil().raw_bits();
                     let nil_val = self.builder.ins().iconst(types::I64, nil_bits as i64);
                     for i in 0..=b {
-                        self.emit_set_slot(a + i, nil_val);
+                        self.cached_set_slot(a + i, nil_val);
                     }
                 }
 
                 OpCode::Return0 => {
+                    self.flush_cache();
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.builder.ins().return_(&[zero]);
                     block_terminated = true;
@@ -806,8 +1137,12 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                 OpCode::Return1 => {
                     if a != 0 {
-                        let val = self.emit_get_slot(a);
+                        let val = self.cached_get_slot(a);
+                        // Flush cache FIRST so dirty slot 0 doesn't overwrite return value
+                        self.flush_and_invalidate_cache();
                         self.emit_set_slot(0, val);
+                    } else {
+                        self.flush_cache();
                     }
                     let one = self.builder.ins().iconst(types::I64, 1);
                     self.builder.ins().return_(&[one]);
@@ -818,11 +1153,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let vc = self.emit_get_slot(c);
-
-                    let ib = self.emit_integer_guard(vb);
-                    let ic = self.emit_integer_guard(vc);
+                    let ib = self.cached_get_integer(b);
+                    let ic = self.cached_get_integer(c);
 
                     let result = match op {
                         OpCode::Add => self.builder.ins().iadd(ib, ic),
@@ -834,7 +1166,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.emit_overflow_guard(result);
 
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     // Skip the following MMBin instruction
                     pc += 1;
@@ -844,13 +1176,13 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
 
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     let k = &self.proto.constants[c];
                     let kval = match k {
                         Constant::Integer(i) => *i,
                         _ => {
+                            self.flush_and_invalidate_cache();
                             self.builder.ins().jump(self.side_exit_block, &[]);
                             block_terminated = true;
                             pc += 1; // skip MMBinK
@@ -870,7 +1202,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.emit_overflow_guard(result);
 
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1;
                 }
@@ -879,8 +1211,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let sc = inst.c() as i8 as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     let imm = self.builder.ins().iconst(types::I64, sc);
                     let result = self.builder.ins().iadd(ib, imm);
@@ -888,7 +1219,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.emit_overflow_guard(result);
 
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1;
                 }
@@ -898,25 +1229,19 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let vc = self.emit_get_slot(c);
-
-                    let ib = self.emit_integer_guard(vb);
-                    let ic = self.emit_integer_guard(vc);
+                    let ib = self.cached_get_integer(b);
+                    let ic = self.cached_get_integer(c);
 
                     // Guard: divisor != 0
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
-                    let cont = self.builder.create_block();
-                    self.builder.ins().brif(nz, cont, &[], self.side_exit_block, &[]);
-                    self.builder.switch_to_block(cont);
-                    self.builder.seal_block(cont);
+                    self.emit_guard_with_flush(nz);
 
                     // Lua idiv: floor division
                     let result = self.emit_lua_idiv(ib, ic);
                     // Result magnitude ≤ |dividend|, no overflow guard needed
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1; // skip MMBin
                 }
@@ -926,24 +1251,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let vc = self.emit_get_slot(c);
-
-                    let ib = self.emit_integer_guard(vb);
-                    let ic = self.emit_integer_guard(vc);
+                    let ib = self.cached_get_integer(b);
+                    let ic = self.cached_get_integer(c);
 
                     // Guard: divisor != 0
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let nz = self.builder.ins().icmp(IntCC::NotEqual, ic, zero);
-                    let cont = self.builder.create_block();
-                    self.builder.ins().brif(nz, cont, &[], self.side_exit_block, &[]);
-                    self.builder.switch_to_block(cont);
-                    self.builder.seal_block(cont);
+                    self.emit_guard_with_flush(nz);
 
                     // Lua imod: result sign matches divisor
                     let result = self.emit_lua_imod(ib, ic);
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1; // skip MMBin
                 }
@@ -953,12 +1272,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let vc = self.emit_get_slot(c);
-
-                    // Both must be inline integers for our fast path
-                    let ib = self.emit_integer_guard(vb);
-                    let ic = self.emit_integer_guard(vc);
+                    let ib = self.cached_get_integer(b);
+                    let ic = self.cached_get_integer(c);
 
                     // Convert to f64 and divide
                     let fb = self.builder.ins().fcvt_from_sint(types::F64, ib);
@@ -968,7 +1283,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // Box as float TValue (floats are stored as-is, no tagging needed
                     // since their bit pattern doesn't collide with QNAN prefix)
                     let raw = self.builder.ins().bitcast(types::I64, MemFlags::new(), fresult);
-                    self.emit_set_slot(a, raw);
+                    self.cached_set_slot(a, raw);
 
                     pc += 1; // skip MMBin
                 }
@@ -977,6 +1292,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 // Pow requires calling powf, which we can't easily do in Cranelift IR.
                 // Side-exit to interpreter for now.
                 OpCode::Pow => {
+                    self.flush_and_invalidate_cache();
                     self.builder.ins().jump(self.side_exit_block, &[]);
                     block_terminated = true;
                     pc += 1; // skip MMBin
@@ -987,11 +1303,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let vc = self.emit_get_slot(c);
-
-                    let ib = self.emit_integer_guard(vb);
-                    let ic = self.emit_integer_guard(vc);
+                    let ib = self.cached_get_integer(b);
+                    let ic = self.cached_get_integer(c);
 
                     let result = match op {
                         OpCode::BAnd => self.builder.ins().band(ib, ic),
@@ -1005,7 +1318,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // Bitwise results always fit in 47-bit (band/bor/bxor preserve range,
                     // shifts may produce full 64-bit values but we box them)
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1; // skip MMBin
                 }
@@ -1015,13 +1328,13 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
 
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     let k = &self.proto.constants[c];
                     let kval = match k {
                         Constant::Integer(i) => *i,
                         _ => {
+                            self.flush_and_invalidate_cache();
                             self.builder.ins().jump(self.side_exit_block, &[]);
                             block_terminated = true;
                             pc += 1; // skip MMBinK
@@ -1032,6 +1345,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                     if matches!(op, OpCode::PowK) {
                         // Pow requires powf — side exit
+                        self.flush_and_invalidate_cache();
                         self.builder.ins().jump(self.side_exit_block, &[]);
                         block_terminated = true;
                         pc += 1;
@@ -1047,15 +1361,12 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         let fc = self.builder.ins().fcvt_from_sint(types::F64, kc);
                         let fresult = self.builder.ins().fdiv(fb, fc);
                         let raw = self.builder.ins().bitcast(types::I64, MemFlags::new(), fresult);
-                        self.emit_set_slot(a, raw);
+                        self.cached_set_slot(a, raw);
                     } else {
                         // Guard: divisor != 0
                         let zero = self.builder.ins().iconst(types::I64, 0);
                         let nz = self.builder.ins().icmp(IntCC::NotEqual, kc, zero);
-                        let cont = self.builder.create_block();
-                        self.builder.ins().brif(nz, cont, &[], self.side_exit_block, &[]);
-                        self.builder.switch_to_block(cont);
-                        self.builder.seal_block(cont);
+                        self.emit_guard_with_flush(nz);
 
                         let result = match op {
                             OpCode::IDivK => self.emit_lua_idiv(ib, kc),
@@ -1063,7 +1374,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                             _ => unreachable!(),
                         };
                         let boxed = self.emit_box_integer(result);
-                        self.emit_set_slot(a, boxed);
+                        self.cached_set_integer(a, result, boxed);
                     }
 
                     pc += 1; // skip MMBinK
@@ -1074,13 +1385,13 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
 
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     let k = &self.proto.constants[c];
                     let kval = match k {
                         Constant::Integer(i) => *i,
                         _ => {
+                            self.flush_and_invalidate_cache();
                             self.builder.ins().jump(self.side_exit_block, &[]);
                             block_terminated = true;
                             pc += 1; // skip MMBinK
@@ -1098,7 +1409,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     };
 
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
 
                     pc += 1; // skip MMBinK
                 }
@@ -1108,8 +1419,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let sc = inst.c() as i8 as i64;
 
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     let imm = self.builder.ins().iconst(types::I64, sc);
                     let result = match op {
@@ -1119,33 +1429,31 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     };
 
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
                     // No following MMBinI to skip
                 }
 
                 // ---- Unary minus ----
                 OpCode::Unm => {
                     let b = inst.b() as i64;
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     // wrapping_neg: result fits in 47-bit (magnitude ≤ |operand|)
                     let result = self.builder.ins().ineg(ib);
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
                     // No following MM instruction
                 }
 
                 // ---- Bitwise NOT ----
                 OpCode::BNot => {
                     let b = inst.b() as i64;
-                    let vb = self.emit_get_slot(b);
-                    let ib = self.emit_integer_guard(vb);
+                    let ib = self.cached_get_integer(b);
 
                     // Bitwise NOT on 64-bit integer
                     let result = self.builder.ins().bnot(ib);
                     let boxed = self.emit_box_integer(result);
-                    self.emit_set_slot(a, boxed);
+                    self.cached_set_integer(a, result, boxed);
                     // No following MM instruction
                 }
 
@@ -1155,10 +1463,10 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let sj = inst.get_sj();
                     let target_pc = (pc as i64 + 1 + sj as i64) as usize;
                     if let Some(&target_block) = self.pc_blocks.get(&target_pc) {
+                        self.flush_and_invalidate_cache();
                         self.builder.ins().jump(target_block, &[]);
                     } else {
-                        // Jump to a PC without a block — shouldn't happen with
-                        // proper pre-scan, but fall through safely
+                        self.flush_and_invalidate_cache();
                         self.builder.ins().jump(self.side_exit_block, &[]);
                     }
                     block_terminated = true;
@@ -1167,7 +1475,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Test => {
                     // if R(A).is_truthy() == k then skip next (pc += 1)
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
+                    let va = self.cached_get_slot(a);
                     let cond = self.emit_is_truthy(va, k);
                     self.emit_cond_skip(cond, pc);
                     block_terminated = true;
@@ -1178,21 +1486,23 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // else R(A) = R(B)
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let vb = self.emit_get_slot(b);
+                    let vb = self.cached_get_slot(b);
                     let should_skip = self.emit_is_truthy(vb, k);
 
                     let skip_block = self.pc_blocks.get(&(pc + 2)).copied()
                         .expect("TestSet skip target pc+2 should have a block");
                     let set_block = self.builder.create_block();
 
+                    self.flush_and_invalidate_cache();
                     self.builder.ins().brif(should_skip, skip_block, &[], set_block, &[]);
 
                     // set_block: R(A) = R(B), then fall to pc+1
                     self.builder.switch_to_block(set_block);
                     self.builder.seal_block(set_block);
-                    // Re-read vb since we're in a new block
-                    let vb2 = self.emit_get_slot(b);
-                    self.emit_set_slot(a, vb2);
+                    // Re-read vb since we're in a new block (cache was invalidated)
+                    let vb2 = self.cached_get_slot(b);
+                    self.cached_set_slot(a, vb2);
+                    self.flush_and_invalidate_cache();
                     let fall_block = self.pc_blocks.get(&(pc + 1)).copied()
                         .expect("TestSet fallthrough pc+1 should have a block");
                     self.builder.ins().jump(fall_block, &[]);
@@ -1202,14 +1512,14 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                 OpCode::Not => {
                     let b = inst.b() as i64;
-                    let vb = self.emit_get_slot(b);
+                    let vb = self.cached_get_slot(b);
                     // is_falsy: nil or false
                     let is_falsy = self.emit_is_falsy(vb);
                     // Convert bool to TValue: true if falsy, false if truthy
                     let true_bits = self.builder.ins().iconst(types::I64, TValue::from_bool(true).raw_bits() as i64);
                     let false_bits = self.builder.ins().iconst(types::I64, TValue::from_bool(false).raw_bits() as i64);
                     let result = self.builder.ins().select(is_falsy, true_bits, false_bits);
-                    self.emit_set_slot(a, result);
+                    self.cached_set_slot(a, result);
                 }
 
                 // ---- Comparisons with immediate ----
@@ -1217,8 +1527,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::EqI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let ia = self.emit_integer_guard(va);
+                    let ia = self.cached_get_integer(a);
                     let imm = self.builder.ins().iconst(types::I64, sb);
                     let eq = self.builder.ins().icmp(IntCC::Equal, ia, imm);
                     // Skip if result == k (i.e., condition matches expectation)
@@ -1230,8 +1539,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LtI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let ia = self.emit_integer_guard(va);
+                    let ia = self.cached_get_integer(a);
                     let imm = self.builder.ins().iconst(types::I64, sb);
                     let lt = self.builder.ins().icmp(IntCC::SignedLessThan, ia, imm);
                     let cond = if k { self.emit_bool_not(lt) } else { lt };
@@ -1242,8 +1550,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::LeI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let ia = self.emit_integer_guard(va);
+                    let ia = self.cached_get_integer(a);
                     let imm = self.builder.ins().iconst(types::I64, sb);
                     let le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, imm);
                     let cond = if k { self.emit_bool_not(le) } else { le };
@@ -1254,8 +1561,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GtI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let ia = self.emit_integer_guard(va);
+                    let ia = self.cached_get_integer(a);
                     let imm = self.builder.ins().iconst(types::I64, sb);
                     let gt = self.builder.ins().icmp(IntCC::SignedGreaterThan, ia, imm);
                     let cond = if k { self.emit_bool_not(gt) } else { gt };
@@ -1266,8 +1572,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GeI => {
                     let sb = inst.b() as i8 as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let ia = self.emit_integer_guard(va);
+                    let ia = self.cached_get_integer(a);
                     let imm = self.builder.ins().iconst(types::I64, sb);
                     let ge = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, ia, imm);
                     let cond = if k { self.emit_bool_not(ge) } else { ge };
@@ -1280,7 +1585,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let k = inst.k();
                     // Load constant as raw bits and compare directly
                     let raw_k = self.constant_to_raw_bits(&self.proto.constants[b]);
-                    let va = self.emit_get_slot(a);
+                    let va = self.cached_get_slot(a);
                     let kval = self.builder.ins().iconst(types::I64, raw_k as i64);
                     let eq = self.builder.ins().icmp(IntCC::Equal, va, kval);
                     let cond = if k { self.emit_bool_not(eq) } else { eq };
@@ -1293,11 +1598,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Eq => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let vb = self.emit_get_slot(b);
                     // Fast path: both must be inline integers
-                    let ia = self.emit_integer_guard(va);
-                    let ib = self.emit_integer_guard(vb);
+                    let ia = self.cached_get_integer(a);
+                    let ib = self.cached_get_integer(b);
                     let eq = self.builder.ins().icmp(IntCC::Equal, ia, ib);
                     let cond = if k { self.emit_bool_not(eq) } else { eq };
                     self.emit_cond_skip(cond, pc);
@@ -1307,10 +1610,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Lt => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let vb = self.emit_get_slot(b);
-                    let ia = self.emit_integer_guard(va);
-                    let ib = self.emit_integer_guard(vb);
+                    let ia = self.cached_get_integer(a);
+                    let ib = self.cached_get_integer(b);
                     let lt = self.builder.ins().icmp(IntCC::SignedLessThan, ia, ib);
                     let cond = if k { self.emit_bool_not(lt) } else { lt };
                     self.emit_cond_skip(cond, pc);
@@ -1320,10 +1621,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::Le => {
                     let b = inst.b() as i64;
                     let k = inst.k();
-                    let va = self.emit_get_slot(a);
-                    let vb = self.emit_get_slot(b);
-                    let ia = self.emit_integer_guard(va);
-                    let ib = self.emit_integer_guard(vb);
+                    let ia = self.cached_get_integer(a);
+                    let ib = self.cached_get_integer(b);
                     let le = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, ia, ib);
                     let cond = if k { self.emit_bool_not(le) } else { le };
                     self.emit_cond_skip(cond, pc);
@@ -1336,22 +1635,17 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // R(A) = init, R(A+1) = limit, R(A+2) = step
                     // Integer fast-path: compute iteration count, store in R(A+1)
                     // Then jump to loop body or skip entirely
-                    let v_init = self.emit_get_slot(a);
-                    let v_limit = self.emit_get_slot(a + 1);
-                    let v_step = self.emit_get_slot(a + 2);
+                    let i_init = self.cached_get_integer(a);
+                    let i_limit = self.cached_get_integer(a + 1);
+                    let i_step = self.cached_get_integer(a + 2);
 
-                    // Guard: all three must be inline integers
-                    let i_init = self.emit_integer_guard(v_init);
-                    let i_limit = self.emit_integer_guard(v_limit);
-                    let i_step = self.emit_integer_guard(v_step);
-
-                    // Guard: step != 0 (side-exit)
+                    // Guard: step != 0 (side-exit with flush)
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let step_nz = self.builder.ins().icmp(IntCC::NotEqual, i_step, zero);
-                    let step_ok_block = self.builder.create_block();
-                    self.builder.ins().brif(step_nz, step_ok_block, &[], self.side_exit_block, &[]);
-                    self.builder.switch_to_block(step_ok_block);
-                    self.builder.seal_block(step_ok_block);
+                    self.emit_guard_with_flush(step_nz);
+
+                    // Flush cache before branching into multiple paths
+                    self.flush_and_invalidate_cache();
 
                     // Check direction and compute count
                     let step_pos = self.builder.ins().icmp(IntCC::SignedGreaterThan, i_step, zero);
@@ -1389,7 +1683,14 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.emit_set_slot(a + 1, boxed_count);
                     self.emit_set_slot(a + 2, boxed_step);
                     self.emit_set_slot(a + 3, boxed_init);
-                    self.builder.ins().jump(body_block, &[]);
+                    // Jump to body with typed block params: [counter, count, step, loop_var]
+                    let args_pos = [
+                        BlockArg::Value(i_init),
+                        BlockArg::Value(count_pos),
+                        BlockArg::Value(i_step),
+                        BlockArg::Value(i_init),
+                    ];
+                    self.builder.ins().jump(body_block, &args_pos);
 
                     // Negative step block
                     self.builder.switch_to_block(neg_block);
@@ -1410,7 +1711,14 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.emit_set_slot(a + 1, boxed_count2);
                     self.emit_set_slot(a + 2, boxed_step2);
                     self.emit_set_slot(a + 3, boxed_init2);
-                    self.builder.ins().jump(body_block, &[]);
+                    // Jump to body with typed block params: [counter, count, step, loop_var]
+                    let args_neg = [
+                        BlockArg::Value(i_init),
+                        BlockArg::Value(count_neg),
+                        BlockArg::Value(i_step),
+                        BlockArg::Value(i_init),
+                    ];
+                    self.builder.ins().jump(body_block, &args_neg);
 
                     block_terminated = true;
                 }
@@ -1422,13 +1730,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     //   next = counter + step
                     //   R(A) = next, R(A+1) = count_u, R(A+3) = next
                     //   jump back to loop body
-                    let v_counter = self.emit_get_slot(a);
-                    let v_count = self.emit_get_slot(a + 1);
-                    let v_step = self.emit_get_slot(a + 2);
-
-                    let i_counter = self.emit_integer_guard(v_counter);
-                    let i_count = self.emit_integer_guard(v_count);
-                    let i_step = self.emit_integer_guard(v_step);
+                    let i_counter = self.cached_get_integer(a);
+                    let i_count = self.cached_get_integer(a + 1);
+                    let i_step = self.cached_get_integer(a + 2);
 
                     // Decrement count (unsigned)
                     let one = self.builder.ins().iconst(types::I64, 1);
@@ -1447,6 +1751,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let exit_block = self.pc_blocks.get(&exit_pc).copied()
                         .expect("ForLoop exit should have a block");
 
+                    // Flush cache before branching
+                    self.flush_and_invalidate_cache();
+
                     let continue_block = self.builder.create_block();
                     self.builder.ins().brif(done, exit_block, &[], continue_block, &[]);
 
@@ -1457,10 +1764,19 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let next = self.builder.ins().iadd(i_counter, i_step);
                     let boxed_next = self.emit_box_integer(next);
                     let boxed_count_dec = self.emit_box_integer(count_dec);
+                    // Write updated values to memory (for side-exit consistency)
                     self.emit_set_slot(a, boxed_next);
                     self.emit_set_slot(a + 1, boxed_count_dec);
                     self.emit_set_slot(a + 3, boxed_next);
-                    self.builder.ins().jump(loop_block, &[]);
+                    // Jump back to loop body with typed block params:
+                    // [counter, count, step, loop_var]
+                    let loop_args = [
+                        BlockArg::Value(next),
+                        BlockArg::Value(count_dec),
+                        BlockArg::Value(i_step),
+                        BlockArg::Value(next),
+                    ];
+                    self.builder.ins().jump(loop_block, &loop_args);
 
                     block_terminated = true;
                 }
@@ -1469,18 +1785,27 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                 OpCode::GetUpval => {
                     let b = inst.b() as i64;
+                    // GetUpval reads an upvalue (no Lua code triggered), but
+                    // the runtime helper reads from vm state, so flush dirty
+                    // slots in case the upvalue points to a stack slot we've modified.
+                    self.flush_cache();
                     let upval_idx_val = self.builder.ins().iconst(types::I64, b);
                     let call = self
                         .builder
                         .ins()
                         .call(self.get_upval_ref, &[self.vm_ptr, upval_idx_val]);
                     let result = self.builder.inst_results(call)[0];
-                    self.emit_set_slot(a, result);
+                    // Invalidate cache since the upvalue may alias any slot
+                    self.slot_cache.invalidate_all();
+                    self.cached_set_slot(a, result);
                 }
 
                 OpCode::SetUpval => {
                     let b = inst.b() as i64;
-                    let va = self.emit_get_slot(a);
+                    let va = self.cached_get_slot(a);
+                    // SetUpval writes to an upvalue which may alias stack slots.
+                    // Flush dirty slots before the call so the helper sees correct state.
+                    self.flush_and_invalidate_cache();
                     let upval_idx_val = self.builder.ins().iconst(types::I64, b);
                     self.builder
                         .ins()
@@ -1490,6 +1815,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GetTabUp => {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let proto_idx_val =
                         self.builder.ins().iconst(types::I64, self.proto_idx as i64);
                     let upval_b = self.builder.ins().iconst(types::I64, b);
@@ -1499,7 +1826,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         &[self.vm_ptr, proto_idx_val, upval_b, const_c],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    self.emit_set_slot(a, result);
+                    // table_index may trigger metamethods → stack reallocation
+                    self.reload_stack_base();
+                    self.cached_set_slot(a, result);
                 }
 
                 OpCode::SetTabUp => {
@@ -1507,6 +1836,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
                     let k = inst.k();
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let proto_idx_val =
                         self.builder.ins().iconst(types::I64, self.proto_idx as i64);
                     let upval_a_val = self.builder.ins().iconst(types::I64, a);
@@ -1526,7 +1857,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         ],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    // Check for SIDE_EXIT
+                    // table_newindex may trigger metamethods → stack reallocation
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
                     let is_exit =
                         self.builder
@@ -1550,12 +1883,15 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                     if b == 0 {
                         // Variable args (use stack top) — side-exit for now
+                        self.flush_and_invalidate_cache();
                         self.builder.ins().jump(self.side_exit_block, &[]);
                         block_terminated = true;
                         pc += 1;
                         continue;
                     }
 
+                    // Flush and invalidate before call that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let func_off = self.builder.ins().iconst(types::I64, a);
                     let nargs_val = self.builder.ins().iconst(types::I64, nargs);
                     let nresults_val = self.builder.ins().iconst(types::I64, nresults);
@@ -1564,7 +1900,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    // Check for SIDE_EXIT
+                    // call_function may resize stack → reload pointer
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
                     let is_exit =
                         self.builder
@@ -1588,8 +1926,11 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                             .constant_to_raw_bits(&self.proto.constants[c as usize]);
                         self.builder.ins().iconst(types::I64, raw as i64)
                     } else {
-                        self.emit_get_slot(c)
+                        self.cached_get_slot(c)
                     };
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    // (Self_ helper writes R[A+1] and R[A] directly to stack)
+                    self.flush_and_invalidate_cache();
                     let a_val = self.builder.ins().iconst(types::I64, a);
                     let b_val = self.builder.ins().iconst(types::I64, b);
                     let call = self.builder.ins().call(
@@ -1597,6 +1938,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         &[self.vm_ptr, self.base, a_val, b_val, key],
                     );
                     let result = self.builder.inst_results(call)[0];
+                    // Self_ calls table_index → may trigger metamethods
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
                     let is_exit =
                         self.builder
@@ -1613,29 +1957,35 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 OpCode::GetTable => {
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
-                    let table_val = self.emit_get_slot(b);
-                    let key_val = self.emit_get_slot(c);
+                    let table_val = self.cached_get_slot(b);
+                    let key_val = self.cached_get_slot(c);
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let call = self.builder.ins().call(
                         self.tbl_idx_ref,
                         &[self.vm_ptr, table_val, key_val],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    self.emit_set_slot(a, result);
+                    self.reload_stack_base();
+                    self.cached_set_slot(a, result);
                 }
 
                 OpCode::GetField => {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
-                    let table_val = self.emit_get_slot(b);
+                    let table_val = self.cached_get_slot(b);
                     let key_raw = self
                         .constant_to_raw_bits(&self.proto.constants[c]);
                     let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let call = self.builder.ins().call(
                         self.tbl_idx_ref,
                         &[self.vm_ptr, table_val, key_val],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    self.emit_set_slot(a, result);
+                    self.reload_stack_base();
+                    self.cached_set_slot(a, result);
                 }
 
                 OpCode::SetField => {
@@ -1643,7 +1993,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as usize;
                     let c = inst.c() as usize;
                     let k = inst.k();
-                    let table_val = self.emit_get_slot(a);
+                    let table_val = self.cached_get_slot(a);
                     let key_raw = self
                         .constant_to_raw_bits(&self.proto.constants[b]);
                     let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
@@ -1652,13 +2002,18 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                             .constant_to_raw_bits(&self.proto.constants[c]);
                         self.builder.ins().iconst(types::I64, raw as i64)
                     } else {
-                        self.emit_get_slot(c as i64)
+                        self.cached_get_slot(c as i64)
                     };
+                    // Flush and invalidate before runtime helper that may trigger Lua code
+                    self.flush_and_invalidate_cache();
                     let call = self.builder.ins().call(
                         self.tbl_ni_ref,
                         &[self.vm_ptr, table_val, key_val, val],
                     );
                     let result = self.builder.inst_results(call)[0];
+                    // table_newindex may trigger metamethods → stack reallocation
+                    self.reload_stack_base();
+                    // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
                     let is_exit =
                         self.builder
@@ -1674,6 +2029,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                 // Side-exit: complex operations handled by interpreter
                 OpCode::Return | OpCode::TailCall | OpCode::Closure => {
+                    self.flush_and_invalidate_cache();
                     self.builder.ins().jump(self.side_exit_block, &[]);
                     block_terminated = true;
                 }
@@ -3228,6 +3584,226 @@ mod tests {
         let nresults = unsafe { func(&mut vm as *mut Vm, base) };
 
         assert_eq!(nresults, SIDE_EXIT, "TailCall should trigger side exit");
+    }
+
+    // --- Increment 6: Integration tests (JIT wired into interpreter) ---
+
+    /// Helper: create a fully initialized VM and run Lua source through it,
+    /// returning the results. Optionally enables JIT with a given threshold.
+    fn run_lua_with_jit(source: &str, jit_threshold: u32) -> Vec<TValue> {
+        use std::cell::RefCell;
+
+        let init_source = b"";
+        let (proto, strings) = compile(init_source, "=(init)").unwrap();
+        let mut vm = Vm::new();
+        let _ = vm.execute(&proto, strings);
+
+        // Enable JIT
+        thread_local! {
+            static TEST_JIT: RefCell<Option<JitCompiler>> = RefCell::new(None);
+        }
+        fn test_jit_hook(vm: &mut Vm, proto_idx: usize) {
+            // Can't use thread_local from outer scope in fn, so recreate inline
+            use std::cell::RefCell;
+            thread_local! {
+                static HOOK_JIT: RefCell<Option<JitCompiler>> = RefCell::new(None);
+            }
+            HOOK_JIT.with(|cell| {
+                let mut opt = cell.borrow_mut();
+                if opt.is_none() {
+                    *opt = JitCompiler::new().ok();
+                }
+                if let Some(jit) = opt.as_mut() {
+                    if let Ok(jit_fn) =
+                        jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx)
+                    {
+                        vm.jit_functions.insert(proto_idx, jit_fn);
+                    }
+                }
+            });
+        }
+        vm.jit_enabled = true;
+        vm.jit_threshold = jit_threshold;
+        vm.jit_compile_callback = Some(test_jit_hook);
+
+        let closure_val = vm.load_chunk(source.as_bytes(), "=test", None).unwrap();
+        selune_vm::dispatch::call_function(&mut vm, closure_val, &[]).unwrap()
+    }
+
+    #[test]
+    fn test_jit_integration_simple_return() {
+        // A simple function called enough times to trigger JIT
+        let results = run_lua_with_jit(
+            r#"
+            local function f()
+                return 42
+            end
+            local r
+            for i = 1, 100 do
+                r = f()
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(42));
+    }
+
+    #[test]
+    fn test_jit_integration_arithmetic() {
+        let results = run_lua_with_jit(
+            r#"
+            local function add(a, b)
+                return a + b
+            end
+            local r
+            for i = 1, 100 do
+                r = add(10, 32)
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(42));
+    }
+
+    #[test]
+    fn test_jit_integration_loop() {
+        // Test that a for-loop inside a JIT-compiled function works
+        let results = run_lua_with_jit(
+            r#"
+            local function sum(n)
+                local s = 0
+                for i = 1, n do
+                    s = s + i
+                end
+                return s
+            end
+            local r
+            for i = 1, 100 do
+                r = sum(10)
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(55));
+    }
+
+    #[test]
+    fn test_jit_integration_side_exit_fallback() {
+        // Vararg functions should side-exit and fall back to interpreter
+        let results = run_lua_with_jit(
+            r#"
+            local function f(...)
+                return ...
+            end
+            local r
+            for i = 1, 100 do
+                r = f(99)
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(99));
+    }
+
+    #[test]
+    fn test_jit_tier_up() {
+        // Verify that call counts work: function is interpreted at first,
+        // then JIT-compiled after threshold
+        let results = run_lua_with_jit(
+            r#"
+            local function f(x)
+                return x + 1
+            end
+            -- Call below threshold (should be interpreted)
+            local r1 = f(10)
+            -- Call many times to trigger JIT
+            local r2
+            for i = 1, 200 do
+                r2 = f(i)
+            end
+            return r1, r2
+            "#,
+            50,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_integer(), Some(11));
+        assert_eq!(results[1].as_integer(), Some(201));
+    }
+
+    #[test]
+    fn test_jit_integration_global_access() {
+        // Test JIT function that reads/writes globals via GetTabUp/SetTabUp
+        let results = run_lua_with_jit(
+            r#"
+            local function f()
+                return type(42)
+            end
+            local r
+            for i = 1, 100 do
+                r = f()
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        // type(42) returns "number" as a string
+        assert!(results[0].as_string_id().is_some());
+    }
+
+    #[test]
+    fn test_jit_integration_nested_call() {
+        // Test a JIT function that calls another function
+        let results = run_lua_with_jit(
+            r#"
+            local function double(x)
+                return x * 2
+            end
+            local function quad(x)
+                local d = double(x)
+                return double(d)
+            end
+            local r
+            for i = 1, 100 do
+                r = quad(5)
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(20));
+    }
+
+    #[test]
+    fn test_jit_integration_comparison() {
+        let results = run_lua_with_jit(
+            r#"
+            local function max(a, b)
+                if a > b then
+                    return a
+                else
+                    return b
+                end
+            end
+            local r
+            for i = 1, 100 do
+                r = max(17, 42)
+            end
+            return r
+            "#,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_integer(), Some(42));
     }
 }
 

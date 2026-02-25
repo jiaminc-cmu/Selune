@@ -5,6 +5,42 @@ use selune_vm::vm::Vm;
 
 use crate::compiler::SIDE_EXIT;
 
+/// Get the raw pointer to the start of vm.stack's data buffer.
+/// JIT code uses this pointer + offset to do inline loads/stores,
+/// avoiding the overhead of calling get/set helpers for every access.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid, non-null pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_get_stack_base(vm_ptr: *mut Vm) -> *const u8 {
+    let vm = &*vm_ptr;
+    vm.stack.as_ptr() as *const u8
+}
+
+/// Get the current length of vm.stack (number of TValue slots).
+///
+/// # Safety
+/// - `vm_ptr` must be a valid, non-null pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_get_stack_len(vm_ptr: *mut Vm) -> u64 {
+    let vm = &*vm_ptr;
+    vm.stack.len() as u64
+}
+
+/// Ensure vm.stack has at least `min_len` slots. Called before JIT
+/// function entry or when inline access detects potential out-of-bounds.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid, non-null pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_ensure_stack(vm_ptr: *mut Vm, min_len: u64) {
+    let vm = &mut *vm_ptr;
+    let needed = min_len as usize;
+    if vm.stack.len() < needed {
+        vm.stack.resize(needed, TValue::nil());
+    }
+}
+
 /// Write a TValue (as raw u64 bits) to vm.stack[base + offset].
 ///
 /// # Safety

@@ -2094,6 +2094,84 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     let func_stack_pos = base + a;
                     let new_base = func_stack_pos + 1;
 
+                    // --- JIT fast path ---
+                    if vm.jit_enabled && !is_vararg {
+                        // Increment call count and trigger compilation if needed
+                        if child_proto_idx < vm.jit_call_counts.len() {
+                            vm.jit_call_counts[child_proto_idx] += 1;
+                            if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
+                                && !vm.jit_functions.contains_key(&child_proto_idx)
+                            {
+                                if let Some(cb) = vm.jit_compile_callback {
+                                    vm.call_stack[ci_idx].pc = pc;
+                                    cb(vm, child_proto_idx);
+                                }
+                            }
+                        }
+
+                        // Execute JIT code if available
+                        if let Some(&jit_fn) = vm.jit_functions.get(&child_proto_idx) {
+                            vm.ensure_stack(new_base, max_stack + 1);
+
+                            // Nil-fill extra params
+                            for i in num_args..num_params {
+                                vm.stack[new_base + i] = TValue::nil();
+                            }
+
+                            // Push a CallInfo so runtime helpers can find the closure
+                            let mut ci = CallInfo::new(new_base, child_proto_idx);
+                            ci.num_results = num_results;
+                            ci.closure_idx = Some(closure_idx);
+                            ci.func_stack_idx = func_stack_pos;
+                            ci.ftransfer = 1;
+                            ci.ntransfer = num_params as u16;
+                            ci.saved_hook_line = vm.hook_last_line;
+                            vm.call_stack.push(ci);
+                            vm.call_stack[ci_idx].pc = pc;
+
+                            let result = unsafe { jit_fn(vm as *mut Vm, new_base) };
+
+                            if result >= 0 {
+                                // JIT succeeded — place results directly at func_stack_pos
+                                let nresults_actual = result as usize;
+                                // Close upvalues for JIT frame
+                                vm.close_upvalues(new_base);
+                                // Pop JIT frame
+                                vm.call_stack.pop();
+                                // Place results without Vec allocation
+                                if num_results < 0 {
+                                    // Multi-return: copy results to func_stack_pos
+                                    for i in 0..nresults_actual {
+                                        vm.stack[func_stack_pos + i] = vm.stack[new_base + i];
+                                    }
+                                    vm.stack_top = func_stack_pos + nresults_actual;
+                                } else {
+                                    let count = num_results as usize;
+                                    for i in 0..count {
+                                        if i < nresults_actual {
+                                            vm.stack[func_stack_pos + i] = vm.stack[new_base + i];
+                                        } else {
+                                            vm.stack[func_stack_pos + i] = TValue::nil();
+                                        }
+                                    }
+                                }
+                                continue;
+                            } else {
+                                // SIDE_EXIT — pop the JIT CallInfo, fall through to interpreter
+                                eprintln!("[JIT] Side-exit proto {} (inline Call)", child_proto_idx);
+                                vm.call_stack.pop();
+                                let count = vm.jit_side_exit_counts
+                                    .entry(child_proto_idx)
+                                    .or_insert(0);
+                                *count += 1;
+                                if *count >= 3 {
+                                    eprintln!("[JIT] Blacklisted proto {}", child_proto_idx);
+                                    vm.jit_functions.remove(&child_proto_idx);
+                                }
+                            }
+                        }
+                    }
+
                     if is_vararg {
                         // Move fixed params to the right, store varargs
                         let _vararg_count = num_args.saturating_sub(num_params);
@@ -4832,6 +4910,67 @@ fn call_function_inner(
 
         let saved_call_depth = vm.call_stack.len();
         let entry_depth = saved_call_depth + 1;
+
+        // --- JIT fast path for call_function_inner ---
+        if vm.jit_enabled && !is_vararg {
+            // Increment call count and trigger compilation if needed
+            if child_proto_idx < vm.jit_call_counts.len() {
+                vm.jit_call_counts[child_proto_idx] += 1;
+                if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
+                    && !vm.jit_functions.contains_key(&child_proto_idx)
+                {
+                    if let Some(cb) = vm.jit_compile_callback {
+                        cb(vm, child_proto_idx);
+                    }
+                }
+            }
+
+            if let Some(&jit_fn) = vm.jit_functions.get(&child_proto_idx) {
+                vm.ensure_stack(new_base, max_stack + 1);
+
+                for i in args.len()..num_params {
+                    vm.stack[new_base + i] = TValue::nil();
+                }
+
+                let saved_top = vm.stack_top;
+
+                // Push CallInfo so runtime helpers can find the closure
+                let mut ci = CallInfo::new(new_base, child_proto_idx);
+                ci.num_results = -1;
+                ci.closure_idx = Some(closure_idx);
+                ci.func_stack_idx = func_pos;
+                ci.ftransfer = 1;
+                ci.ntransfer = num_params as u16;
+                ci.saved_hook_line = vm.hook_last_line;
+                vm.call_stack.push(ci);
+
+                let result = unsafe { jit_fn(vm as *mut Vm, new_base) };
+
+                if result >= 0 {
+                    let nresults_actual = result as usize;
+                    // Copy results to a stack-local buffer to avoid overlap issues
+                    let mut results_buf = [TValue::nil(); 16];
+                    let n = nresults_actual.min(16);
+                    for i in 0..n {
+                        results_buf[i] = vm.stack[new_base + i];
+                    }
+                    vm.close_upvalues(new_base);
+                    vm.call_stack.pop();
+                    vm.stack_top = saved_top;
+                    return Ok(results_buf[..n].to_vec());
+                } else {
+                    // SIDE_EXIT — pop JIT frame, fall through to interpreter
+                    vm.call_stack.pop();
+                    let count = vm.jit_side_exit_counts
+                        .entry(child_proto_idx)
+                        .or_insert(0);
+                    *count += 1;
+                    if *count >= 3 {
+                        vm.jit_functions.remove(&child_proto_idx);
+                    }
+                }
+            }
+        }
 
         if is_vararg {
             let num_args = args.len();
