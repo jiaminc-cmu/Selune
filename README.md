@@ -180,16 +180,19 @@ These benchmarks measure interpreter throughput (each function called once, belo
 
 ### JIT Performance
 
-When the JIT activates (functions called 1000+ times), Selune generates native code via Cranelift that is significantly faster than both the interpreter and PUC Lua:
+When the JIT activates (functions called 1000+ times), Selune generates native code via Cranelift that is significantly faster than PUC Lua on integer-heavy workloads:
 
-| Test | Interpreter | JIT | JIT Speedup | vs PUC Lua |
-|------|------------|-----|-------------|------------|
-| Integer sum loop | 1.21s | 0.16s | **7.1x** | **4.7x faster** |
-| Heavy integer arithmetic | 4.66s | 0.40s | **11.6x** | **4.7x faster** |
+| Benchmark | Selune JIT (s) | PUC Lua (s) | vs PUC Lua |
+|-----------|---------------|-------------|------------|
+| jit_sum_loop | 2.80 | 7.37 | **2.6x faster** |
+| jit_heavy_arith | 0.71 | 3.35 | **4.7x faster** |
+| jit_float_arith | 6.65 | 2.72 | 2.4x slower |
 
-The JIT currently supports 55+ opcodes including integer/float arithmetic, comparisons, control flow, loops, function calls, upvalues, and table access.
+The JIT currently supports 55+ opcodes including integer/float arithmetic, comparisons, control flow, loops, function calls, upvalues, and table access. Float support is functional but not yet optimized to match PUC Lua's C-level float performance.
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full results and analysis. To regenerate: `./benchmarks/run_benchmarks.sh`
+To reproduce: `./benchmarks/run_jit_benchmarks.sh`
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for interpreter benchmark results. To regenerate: `./benchmarks/run_benchmarks.sh`
 
 ## Roadmap
 
