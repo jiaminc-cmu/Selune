@@ -1,5 +1,7 @@
 //! Lua VM state.
 
+use std::collections::HashMap;
+
 use crate::callinfo::CallInfo;
 use crate::dispatch;
 use crate::error::LuaError;
@@ -11,6 +13,10 @@ use selune_core::gc::{
 };
 use selune_core::string::StringInterner;
 use selune_core::value::TValue;
+
+/// Type alias for JIT-compiled function pointers.
+/// Signature: (vm_ptr, base) -> result_count or -1 (side-exit)
+pub type JitFn = unsafe extern "C" fn(*mut Vm, usize) -> i64;
 
 /// Per-coroutine state (stack, call stack, upvalues).
 #[derive(Clone)]
@@ -211,6 +217,21 @@ pub struct Vm {
     pub needs_close_return_resume: bool,
     /// Bitset: redirect_natives[idx] = true if native at GcIdx(idx) needs VM-dispatch redirect.
     pub redirect_natives: Vec<bool>,
+
+    // --- JIT fields ---
+    /// JIT-compiled function cache: proto_idx → native function pointer.
+    pub jit_functions: HashMap<usize, JitFn>,
+    /// Per-proto call counter for tier-up decisions.
+    pub jit_call_counts: Vec<u32>,
+    /// Per-proto side-exit counter. After too many side-exits, stop trying JIT.
+    pub jit_side_exit_counts: HashMap<usize, u32>,
+    /// Threshold: compile to JIT after this many calls.
+    pub jit_threshold: u32,
+    /// Whether JIT is enabled.
+    pub jit_enabled: bool,
+    /// Optional JIT compilation callback. Called when a proto reaches the tier-up threshold.
+    /// The callback should attempt compilation and store the result in vm.jit_functions.
+    pub jit_compile_callback: Option<fn(&mut Vm, usize)>,
 }
 
 /// Format a source name for error messages (matching PUC Lua behavior).
@@ -334,6 +355,12 @@ impl Vm {
             in_gc: false,
             needs_close_return_resume: false,
             redirect_natives: Vec::new(),
+            jit_functions: HashMap::new(),
+            jit_call_counts: Vec::new(),
+            jit_side_exit_counts: HashMap::new(),
+            jit_threshold: 1000,
+            jit_enabled: false,
+            jit_compile_callback: None,
         }
     }
 
@@ -599,6 +626,8 @@ impl Vm {
     fn store_proto_tree(&mut self, proto: &Proto) -> usize {
         let idx = self.protos.len();
         self.protos.push(proto.clone());
+        // Keep jit_call_counts in sync with protos
+        self.jit_call_counts.push(0);
         // Recursively flatten child protos into vm.protos and record flat indices
         let num_children = self.protos[idx].protos.len();
         let mut flat_indices = Vec::with_capacity(num_children);
