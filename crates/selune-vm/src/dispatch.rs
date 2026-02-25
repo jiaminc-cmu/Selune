@@ -12,6 +12,81 @@ use selune_compiler::proto::{Constant, Proto};
 use selune_core::gc::{GcIdx, NativeContext, NativeError};
 use selune_core::value::TValue;
 
+/// Check if a back-edge should trigger JIT compilation.
+/// Also triggers OSR compilation when applicable.
+/// Returns `true` if an OSR function is now available for `(proto_idx, osr_pc)`.
+#[inline]
+fn check_backedge_jit(vm: &mut Vm, proto_idx: usize, osr_pc: usize) -> bool {
+    if !vm.jit_enabled
+        || vm.jit_blacklist.contains(&proto_idx)
+        || proto_idx >= vm.jit_backedge_counts.len()
+    {
+        return false;
+    }
+    // If already have a normal JIT entry, no need for back-edge counting
+    if vm.jit_functions.contains_key(&proto_idx) {
+        return false;
+    }
+    vm.jit_backedge_counts[proto_idx] += 1;
+    if vm.jit_backedge_counts[proto_idx] >= vm.jit_backedge_threshold {
+        vm.jit_backedge_counts[proto_idx] = 0;
+        // Compile normal entry for future calls
+        if let Some(cb) = vm.jit_compile_callback {
+            cb(vm, proto_idx);
+        }
+        // Compile OSR entry for current execution
+        if let Some(osr_cb) = vm.jit_osr_compile_callback {
+            osr_cb(vm, proto_idx, osr_pc);
+        }
+        return vm.jit_osr_functions.contains_key(&(proto_idx, osr_pc));
+    }
+    false
+}
+
+/// Attempt OSR execution at a back-edge. Returns `Some(ControlFlow)` if OSR handled control,
+/// or `None` if execution should continue normally in the interpreter.
+/// `osr_pc` is the loop body PC that the OSR function will enter at.
+#[inline]
+fn attempt_osr(
+    vm: &mut Vm,
+    proto_idx: usize,
+    osr_pc: usize,
+    base: usize,
+    ci_idx: usize,
+    pc: usize,
+    entry_depth: usize,
+) -> Result<Option<OsrResult>, LuaError> {
+    if !check_backedge_jit(vm, proto_idx, osr_pc) {
+        return Ok(None);
+    }
+    if let Some(&osr_fn) = vm.jit_osr_functions.get(&(proto_idx, osr_pc)) {
+        let result = unsafe { osr_fn(vm as *mut Vm, base) };
+        if result >= 0 {
+            let nresults_actual = result as usize;
+            let results: Vec<TValue> = (0..nresults_actual)
+                .map(|i| vm.stack[base + i])
+                .collect();
+            vm.call_stack[ci_idx].pc = pc;
+            vm.close_upvalues(base);
+            if vm.call_stack.len() <= entry_depth {
+                return Ok(Some(OsrResult::Return(results)));
+            }
+            return_from_call(vm, &results)?;
+            return Ok(Some(OsrResult::Continue));
+        } else {
+            vm.jit_osr_functions.remove(&(proto_idx, osr_pc));
+        }
+    }
+    Ok(None)
+}
+
+enum OsrResult {
+    /// OSR succeeded, return results to caller (at entry_depth)
+    Return(Vec<TValue>),
+    /// OSR succeeded, continue outer dispatch loop (return_from_call already done)
+    Continue,
+}
+
 /// Format a runtime error with "source:line: " prefix using current call stack state.
 pub fn runtime_error(vm: &Vm, msg: &str) -> LuaError {
     let prefix = get_error_prefix(vm, 0);
@@ -1600,8 +1675,16 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
             // ---- Control flow ----
             OpCode::Jmp => {
                 let sj = inst.get_sj();
-                let new_pc = pc as i64 + sj as i64;
-                pc = new_pc as usize;
+                let new_pc = (pc as i64 + sj as i64) as usize;
+                if sj < 0 {
+                    if let Some(osr_result) = attempt_osr(vm, proto_idx, new_pc, base, ci_idx, pc, entry_depth)? {
+                        match osr_result {
+                            OsrResult::Return(results) => return Ok(results),
+                            OsrResult::Continue => continue,
+                        }
+                    }
+                }
+                pc = new_pc;
             }
 
             // ---- Numeric for loop ----
@@ -1798,6 +1881,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         let sbx = inst.sbx();
                         pc =
                             (pc as i64 + sbx as i64) as usize;
+                        if let Some(osr_result) = attempt_osr(vm, proto_idx, pc, base, ci_idx, pc, entry_depth)? {
+                            match osr_result {
+                                OsrResult::Return(results) => return Ok(results),
+                                OsrResult::Continue => continue,
+                            }
+                        }
                     }
                 } else if counter.is_float() {
                     // Float path (includes !is_tagged plain floats and canonical NaN)
@@ -1821,6 +1910,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             let sbx = inst.sbx();
                             pc =
                                 (pc as i64 + sbx as i64) as usize;
+                            if let Some(osr_result) = attempt_osr(vm, proto_idx, pc, base, ci_idx, pc, entry_depth)? {
+                                match osr_result {
+                                    OsrResult::Return(results) => return Ok(results),
+                                    OsrResult::Continue => continue,
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1845,6 +1940,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             let sbx = inst.sbx();
                             pc =
                                 (pc as i64 + sbx as i64) as usize;
+                            if let Some(osr_result) = attempt_osr(vm, proto_idx, pc, base, ci_idx, pc, entry_depth)? {
+                                match osr_result {
+                                    OsrResult::Return(results) => return Ok(results),
+                                    OsrResult::Continue => continue,
+                                }
+                            }
                         }
                     }
                 }
@@ -2101,6 +2202,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             vm.jit_call_counts[child_proto_idx] += 1;
                             if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
                                 && !vm.jit_functions.contains_key(&child_proto_idx)
+                                && !vm.jit_blacklist.contains(&child_proto_idx)
                             {
                                 if let Some(cb) = vm.jit_compile_callback {
                                     vm.call_stack[ci_idx].pc = pc;
@@ -2165,6 +2267,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 *count += 1;
                                 if *count >= 3 {
                                     vm.jit_functions.remove(&child_proto_idx);
+                                    vm.jit_blacklist.insert(child_proto_idx);
                                 }
                             }
                         }
@@ -3047,6 +3150,12 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                     // Jump back to loop body
                     pc =
                         (pc as i64 + sbx as i64) as usize;
+                    if let Some(osr_result) = attempt_osr(vm, proto_idx, pc, base, ci_idx, pc, entry_depth)? {
+                        match osr_result {
+                            OsrResult::Return(results) => return Ok(results),
+                            OsrResult::Continue => continue,
+                        }
+                    }
                 }
             }
 
@@ -3391,7 +3500,7 @@ fn get_proto(vm: &Vm, ci_idx: usize) -> &Proto {
 /// **replaces** the current error and is passed to subsequent __close calls.
 /// All TBC variables are always closed regardless of errors.
 /// Returns the final (possibly replaced) error.
-fn close_tbc_variables(
+pub fn close_tbc_variables(
     vm: &mut Vm,
     ci_idx: usize,
     from_level: usize,
@@ -4916,6 +5025,7 @@ fn call_function_inner(
                 vm.jit_call_counts[child_proto_idx] += 1;
                 if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
                     && !vm.jit_functions.contains_key(&child_proto_idx)
+                    && !vm.jit_blacklist.contains(&child_proto_idx)
                 {
                     if let Some(cb) = vm.jit_compile_callback {
                         cb(vm, child_proto_idx);
@@ -4965,6 +5075,7 @@ fn call_function_inner(
                     *count += 1;
                     if *count >= 3 {
                         vm.jit_functions.remove(&child_proto_idx);
+                        vm.jit_blacklist.insert(child_proto_idx);
                     }
                 }
             }
