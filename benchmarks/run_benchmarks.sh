@@ -97,6 +97,9 @@ BENCHMARKS=(
     binary_trees
     spectral_norm
     mandelbrot
+    nbody
+    raytracer
+    particle_sim
 )
 
 # Extract time from benchmark output
