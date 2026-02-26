@@ -7,7 +7,7 @@ use crate::dispatch;
 use crate::error::LuaError;
 use crate::metamethod::MetamethodNames;
 use selune_compiler::opcode::OpCode;
-use selune_compiler::proto::Proto;
+use selune_compiler::proto::{Constant, Proto};
 use selune_core::gc::{
     GcHeap, GcIdx, NativeContext, NativeError, NativeFunction, UpVal, UpValLocation,
 };
@@ -41,6 +41,15 @@ pub enum BuiltinId {
     MathCos = 5,
 }
 
+/// Identifies tiny method patterns that can be inlined at call sites.
+#[derive(Debug, Clone, Copy)]
+pub enum TinyMethodKind {
+    /// Not a recognized tiny method pattern.
+    None,
+    /// Getter: `return self.<field>` — GetField R[0],R[0],K[c] + Return1 R[0]
+    Getter { field_sid: u32 },
+}
+
 /// Inline cache entry for Self_ (method dispatch).
 /// Caches the resolved method for a specific (metatable, __index_table_version) pair.
 /// All zeroes = empty/unpopulated.
@@ -58,6 +67,12 @@ pub struct SelfIcEntry {
     /// If shape_version hasn't changed, the instance doesn't have this key
     /// (no new keys were inserted since IC population).
     pub cached_instance_shape: u64,
+    /// Callee closure GcIdx.0 (for identity guard). 0 = not cached.
+    pub cached_closure_idx: u64,
+    /// Callee's proto_idx in vm.protos[].
+    pub cached_proto_idx: u64,
+    /// Callee's JIT function pointer (0 if not compiled or invalidated).
+    pub cached_jit_fn_ptr: u64,
 }
 
 /// Per-table metadata for JIT inline caches. #[repr(C)] for predictable layout
@@ -121,6 +136,10 @@ pub enum CoroutineStatus {
 pub struct Vm {
     /// Value stack (registers) — belongs to the running thread.
     pub stack: Vec<TValue>,
+    /// Cached raw pointer to stack data buffer (`stack.as_ptr()`).
+    /// Kept in sync whenever the stack may be reallocated.
+    /// JIT code reads this field directly via a Cranelift load (avoiding extern "C" call).
+    pub stack_data_ptr: *const TValue,
     /// Call stack (frames) — belongs to the running thread.
     pub call_stack: Vec<CallInfo>,
     /// Lightweight JIT call stack (shadow stack) — used for JIT-to-JIT calls only.
@@ -307,6 +326,9 @@ pub struct Vm {
     /// Keyed by (proto_idx, pc) → Box<SelfIcEntry>. Boxed for stable pointer identity
     /// (the JIT bakes the IC entry pointer as a constant).
     pub jit_self_ic: HashMap<(usize, usize), Box<SelfIcEntry>>,
+    /// Per-proto tiny method classification. Parallel to `protos`.
+    /// Populated at proto store time by `analyze_tiny_method()`.
+    pub tiny_methods: Vec<TinyMethodKind>,
     /// Per-table metadata side-table for JIT inline access.
     /// Parallel to gc.tables — updated when metatable or version changes.
     pub table_meta: Vec<TableMeta>,
@@ -356,8 +378,10 @@ impl Vm {
     /// Create a new empty VM.
     pub fn new() -> Self {
         let stack = vec![TValue::nil(); 1024];
+        let stack_data_ptr = stack.as_ptr();
         Vm {
             stack,
+            stack_data_ptr,
             call_stack: Vec::with_capacity(32),
             jit_call_stack: Vec::with_capacity(32),
             gc: GcHeap::new(),
@@ -447,6 +471,7 @@ impl Vm {
             jit_osr_compile_callback: None,
             builtin_natives: HashMap::new(),
             jit_self_ic: HashMap::new(),
+            tiny_methods: Vec::new(),
             table_meta: Vec::new(),
         }
     }
@@ -510,6 +535,9 @@ impl Vm {
                     cached_version: 0,
                     cached_method_bits: 0,
                     cached_instance_shape: u64::MAX, // sentinel: force raw check on first call
+                    cached_closure_idx: 0,
+                    cached_proto_idx: 0,
+                    cached_jit_fn_ptr: 0,
                 })
             });
         &mut **entry as *mut SelfIcEntry
@@ -527,6 +555,13 @@ impl Vm {
                 self.jit_proto_state[proto_idx] = JitProtoState::Blacklisted;
             }
         }
+    }
+
+    /// Returns the byte offset of `Vm::stack_data_ptr` within `Vm`.
+    /// Used by JIT compiler to inline reload_stack_base as a single Cranelift load.
+    #[inline]
+    pub fn stack_data_ptr_offset() -> i32 {
+        std::mem::offset_of!(Vm, stack_data_ptr) as i32
     }
 
     /// Get the closure_idx of the innermost call frame.
@@ -615,11 +650,19 @@ impl Vm {
         }
     }
 
+    /// Update the cached stack data pointer after any operation that may
+    /// reallocate the stack Vec (resize, swap, etc.).
+    #[inline(always)]
+    pub fn update_stack_data_ptr(&mut self) {
+        self.stack_data_ptr = self.stack.as_ptr();
+    }
+
     /// Ensure the stack has at least `size` slots from `base`.
     pub fn ensure_stack(&mut self, base: usize, size: usize) {
         let needed = base + size;
         if needed > self.stack.len() {
             self.stack.resize(needed, TValue::nil());
+            self.stack_data_ptr = self.stack.as_ptr();
         }
     }
 
@@ -820,6 +863,7 @@ impl Vm {
         self.jit_call_counts.push(0);
         self.jit_side_exit_counts.push(0);
         self.jit_backedge_counts.push(0);
+        self.tiny_methods.push(Self::analyze_tiny_method(proto));
         // Recursively flatten child protos into vm.protos and record flat indices
         let num_children = self.protos[idx].protos.len();
         let mut flat_indices = Vec::with_capacity(num_children);
@@ -831,6 +875,37 @@ impl Vm {
         }
         self.protos[idx].child_flat_indices = flat_indices;
         idx
+    }
+
+    /// Analyze a proto to detect tiny method patterns that can be inlined at call sites.
+    fn analyze_tiny_method(proto: &Proto) -> TinyMethodKind {
+        // Must have 1 param (self), not vararg
+        if proto.num_params != 1 || proto.is_vararg {
+            return TinyMethodKind::None;
+        }
+        // Accept 2 or 3 instructions (compiler always appends a trailing Return0)
+        let len = proto.code.len();
+        if len != 2 && len != 3 {
+            return TinyMethodKind::None;
+        }
+        if len == 3 && proto.code[2].opcode() != OpCode::Return0 {
+            return TinyMethodKind::None;
+        }
+        let i0 = proto.code[0];
+        let i1 = proto.code[1];
+        // Pattern: GetField R[0], R[0], K[c] + Return1 R[0]
+        if i0.opcode() == OpCode::GetField
+            && i0.a() == 0
+            && i0.b() == 0
+            && i1.opcode() == OpCode::Return1
+            && i1.a() == 0
+        {
+            let c = i0.c() as usize;
+            if let Some(Constant::String(sid)) = proto.constants.get(c) {
+                return TinyMethodKind::Getter { field_sid: sid.0 };
+            }
+        }
+        TinyMethodKind::None
     }
 
     /// Register built-in native functions into _ENV.
@@ -1165,6 +1240,7 @@ impl Vm {
     /// in `thread` (typically empty Vecs from a freshly-created LuaThread).
     pub fn save_running_state_swap(&mut self, thread: &mut LuaThread) {
         std::mem::swap(&mut self.stack, &mut thread.stack);
+        self.stack_data_ptr = self.stack.as_ptr();
         std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
         std::mem::swap(&mut self.jit_call_stack, &mut thread.jit_call_stack);
         std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
@@ -1183,6 +1259,7 @@ impl Vm {
     /// Vecs if the VM was just swapped out via save_running_state_swap).
     pub fn restore_running_state_swap(&mut self, thread: &mut LuaThread) {
         std::mem::swap(&mut self.stack, &mut thread.stack);
+        self.stack_data_ptr = self.stack.as_ptr();
         std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
         std::mem::swap(&mut self.jit_call_stack, &mut thread.jit_call_stack);
         std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
@@ -1199,6 +1276,7 @@ impl Vm {
     /// Save the current running state back into the coroutine slot by swapping.
     pub fn save_coro_state(&mut self, coro_id: usize) {
         std::mem::swap(&mut self.stack, &mut self.coroutines[coro_id].stack);
+        self.stack_data_ptr = self.stack.as_ptr();
         std::mem::swap(
             &mut self.call_stack,
             &mut self.coroutines[coro_id].call_stack,
@@ -1225,6 +1303,7 @@ impl Vm {
     /// by swapping. After this, the coroutine slot contains empty Vecs.
     pub fn restore_coro_into_running(&mut self, coro_id: usize) {
         std::mem::swap(&mut self.stack, &mut self.coroutines[coro_id].stack);
+        self.stack_data_ptr = self.stack.as_ptr();
         std::mem::swap(
             &mut self.call_stack,
             &mut self.coroutines[coro_id].call_stack,

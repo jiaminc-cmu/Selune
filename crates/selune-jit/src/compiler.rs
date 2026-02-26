@@ -13,7 +13,7 @@ use selune_compiler::proto::{Constant, Proto};
 use selune_core::gc::GcHeap;
 use selune_core::string::StringInterner;
 use selune_core::value::{self, TValue};
-use selune_vm::vm::BuiltinId;
+use selune_vm::vm::{BuiltinId, Vm};
 
 use crate::abi::{self, JitFunction};
 use crate::runtime;
@@ -140,12 +140,24 @@ impl JitCompiler {
             runtime::jit_rt_self_ic_check as *const u8,
         );
         builder.symbol(
+            "jit_rt_self_call_ic",
+            runtime::jit_rt_self_call_ic as *const u8,
+        );
+        builder.symbol(
             "jit_rt_table_index",
             runtime::jit_rt_table_index as *const u8,
         );
         builder.symbol(
             "jit_rt_table_newindex",
             runtime::jit_rt_table_newindex as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_get_field_str",
+            runtime::jit_rt_get_field_str as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_set_field_str",
+            runtime::jit_rt_set_field_str as *const u8,
         );
         builder.symbol("jit_rt_geti", runtime::jit_rt_geti as *const u8);
         builder.symbol("jit_rt_seti", runtime::jit_rt_seti as *const u8);
@@ -597,6 +609,16 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_self_ic_check", Linkage::Import, &self_ic_check_sig)?;
 
+        // jit_rt_self_call_ic(vm_ptr, base, a, b, key_bits, ic_ptr, nargs, nresults) -> i64
+        let mut self_call_ic_sig = Signature::new(call_conv);
+        for _ in 0..8 {
+            self_call_ic_sig.params.push(AbiParam::new(types::I64));
+        }
+        self_call_ic_sig.returns.push(AbiParam::new(types::I64));
+        let self_call_ic_id = self
+            .module
+            .declare_function("jit_rt_self_call_ic", Linkage::Import, &self_call_ic_sig)?;
+
         // jit_rt_get_table_ptr(vm_ptr, table_idx) -> u64
         let mut get_table_ptr_sig = Signature::new(call_conv);
         get_table_ptr_sig.params.push(AbiParam::new(types::I64));
@@ -625,6 +647,26 @@ impl JitCompiler {
         let tbl_ni_id = self
             .module
             .declare_function("jit_rt_table_newindex", Linkage::Import, &tbl_ni_sig)?;
+
+        // jit_rt_get_field_str(vm_ptr, table_bits, string_id) -> u64
+        let mut get_field_str_sig = Signature::new(call_conv);
+        get_field_str_sig.params.push(AbiParam::new(types::I64));
+        get_field_str_sig.params.push(AbiParam::new(types::I64));
+        get_field_str_sig.params.push(AbiParam::new(types::I64));
+        get_field_str_sig.returns.push(AbiParam::new(types::I64));
+        let get_field_str_id = self
+            .module
+            .declare_function("jit_rt_get_field_str", Linkage::Import, &get_field_str_sig)?;
+
+        // jit_rt_set_field_str(vm_ptr, table_bits, string_id, val_bits) -> i64
+        let mut set_field_str_sig = Signature::new(call_conv);
+        for _ in 0..4 {
+            set_field_str_sig.params.push(AbiParam::new(types::I64));
+        }
+        set_field_str_sig.returns.push(AbiParam::new(types::I64));
+        let set_field_str_id = self
+            .module
+            .declare_function("jit_rt_set_field_str", Linkage::Import, &set_field_str_sig)?;
 
         // jit_rt_geti(vm_ptr, table_bits, index) -> u64
         let mut geti_sig = Signature::new(call_conv);
@@ -771,16 +813,6 @@ impl JitCompiler {
             &box_integer_sig,
         )?;
 
-        // jit_rt_get_stack_base(vm_ptr) -> *const u8 (as i64)
-        let mut get_stack_base_sig = Signature::new(call_conv);
-        get_stack_base_sig.params.push(AbiParam::new(types::I64));
-        get_stack_base_sig.returns.push(AbiParam::new(types::I64));
-        let get_stack_base_id = self.module.declare_function(
-            "jit_rt_get_stack_base",
-            Linkage::Import,
-            &get_stack_base_sig,
-        )?;
-
         // jit_rt_ensure_stack(vm_ptr, min_len)
         let mut ensure_stack_sig = Signature::new(call_conv);
         ensure_stack_sig.params.push(AbiParam::new(types::I64));
@@ -837,8 +869,11 @@ impl JitCompiler {
             let self_ic_ref = self.module.declare_func_in_func(self_ic_id, builder.func);
             let get_table_ptr_ref = self.module.declare_func_in_func(get_table_ptr_id, builder.func);
             let self_ic_check_ref = self.module.declare_func_in_func(self_ic_check_id, builder.func);
+            let self_call_ic_ref = self.module.declare_func_in_func(self_call_ic_id, builder.func);
             let tbl_idx_ref = self.module.declare_func_in_func(tbl_idx_id, builder.func);
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
+            let get_field_str_ref = self.module.declare_func_in_func(get_field_str_id, builder.func);
+            let set_field_str_ref = self.module.declare_func_in_func(set_field_str_id, builder.func);
             let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
             let seti_ref = self.module.declare_func_in_func(seti_id, builder.func);
             let len_ref = self.module.declare_func_in_func(len_id, builder.func);
@@ -853,9 +888,6 @@ impl JitCompiler {
             let forprep_float_ref = self.module.declare_func_in_func(forprep_float_id, builder.func);
             let forloop_float_ref = self.module.declare_func_in_func(forloop_float_id, builder.func);
             let box_integer_ref = self.module.declare_func_in_func(box_integer_id, builder.func);
-            let get_stack_base_ref =
-                self.module
-                    .declare_func_in_func(get_stack_base_id, builder.func);
             let ensure_stack_ref =
                 self.module
                     .declare_func_in_func(ensure_stack_id, builder.func);
@@ -878,11 +910,15 @@ impl JitCompiler {
                 .ins()
                 .call(ensure_stack_ref, &[vm_ptr, base_plus_min]);
 
-            // Get stack base pointer for inline access
-            let call_gsb = builder
-                .ins()
-                .call(get_stack_base_ref, &[vm_ptr]);
-            let stack_base_init = builder.inst_results(call_gsb)[0];
+            // Get stack base pointer for inline access — inlined as a load
+            // from vm.stack's data pointer (offset 0 within Vec<T>).
+            let stack_offset = Vm::stack_data_ptr_offset();
+            let stack_base_init = builder.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                vm_ptr,
+                stack_offset,
+            );
 
             // Use a Cranelift Variable for stack_base to avoid SSA domination
             // issues across blocks. Cranelift auto-inserts block params as needed.
@@ -931,8 +967,11 @@ impl JitCompiler {
                 self_ic_ref,
                 get_table_ptr_ref,
                 self_ic_check_ref,
+                self_call_ic_ref,
                 tbl_idx_ref,
                 tbl_ni_ref,
+                get_field_str_ref,
+                set_field_str_ref,
                 geti_ref,
                 seti_ref,
                 len_ref,
@@ -947,7 +986,6 @@ impl JitCompiler {
                 forprep_float_ref,
                 forloop_float_ref,
                 box_integer_ref,
-                get_stack_base_ref,
                 stack_base_var,
                 slot_cache: SlotCache::new(),
                 side_exit_block,
@@ -1238,8 +1276,11 @@ struct BytecodeEmitter<'a, 'b> {
     self_ic_ref: FuncRef,
     get_table_ptr_ref: FuncRef,
     self_ic_check_ref: FuncRef,
+    self_call_ic_ref: FuncRef,
     tbl_idx_ref: FuncRef,
     tbl_ni_ref: FuncRef,
+    get_field_str_ref: FuncRef,
+    set_field_str_ref: FuncRef,
     geti_ref: FuncRef,
     seti_ref: FuncRef,
     len_ref: FuncRef,
@@ -1254,8 +1295,6 @@ struct BytecodeEmitter<'a, 'b> {
     forprep_float_ref: FuncRef,
     forloop_float_ref: FuncRef,
     box_integer_ref: FuncRef,
-    /// Helper to get raw pointer to vm.stack data buffer.
-    get_stack_base_ref: FuncRef,
     /// Cranelift Variable for stack_base pointer. Using a Variable instead
     /// of a raw Value avoids SSA domination issues across blocks — Cranelift
     /// automatically inserts block parameters where needed.
@@ -1313,12 +1352,16 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
     /// Reload stack_base after a runtime helper call that may have
     /// triggered stack reallocation (e.g., Call, table ops).
+    /// Inlined as a single Cranelift load from vm.stack's data pointer,
+    /// avoiding the overhead of an extern "C" call to jit_rt_get_stack_base.
     fn reload_stack_base(&mut self) {
-        let call = self
-            .builder
-            .ins()
-            .call(self.get_stack_base_ref, &[self.vm_ptr]);
-        let new_base = self.builder.inst_results(call)[0];
+        let offset = Vm::stack_data_ptr_offset();
+        let new_base = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.vm_ptr,
+            offset,
+        );
         self.builder.def_var(self.stack_base_var, new_base);
     }
 
@@ -2148,6 +2191,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         let code = &self.proto.code;
         let mut pc = 0;
         let mut block_terminated = false;
+        let mut skip_next = false;
 
         while pc < code.len() {
             // If this PC is a jump target, switch to its block
@@ -2160,6 +2204,16 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
             // If the current block was terminated (by a return/jump), skip
             // until we hit a new block (a jump target).
             if block_terminated {
+                pc += 1;
+                skip_next = false;
+                continue;
+            }
+
+            // Skip this instruction if it was fused with the previous one
+            // (e.g., Call fused into Self_+Call). If this PC is a jump target,
+            // the block switch already happened above, but we still skip emission.
+            if skip_next {
+                skip_next = false;
                 pc += 1;
                 continue;
             }
@@ -3335,60 +3389,106 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     };
 
                     if let Some(&ic_ptr) = self.self_ic_ptrs.get(&pc) {
-                        // IC-enabled path: fast probe + slow fallback
-                        // Step 1: Load R[B] and store R[A+1] = R[B] (inline)
-                        let table_val = self.cached_get_slot(b);
-                        self.cached_set_slot((a + 1) as i64, table_val);
+                        // Check if next instruction is Call R[A] — if so, fuse Self_+Call
+                        let next_pc = pc + 1;
+                        let can_fuse = next_pc < self.proto.code.len() && {
+                            let next_inst = self.proto.code[next_pc];
+                            next_inst.opcode() == OpCode::Call
+                                && next_inst.a() == inst.a()
+                                && next_inst.b() > 0 // fixed args only
+                        };
 
-                        // Step 2: Flush cache — the miss path writes directly to stack
-                        self.flush_and_invalidate_cache();
+                        if can_fuse {
+                            // --- FUSED Self_+Call path ---
+                            let next_inst = self.proto.code[next_pc];
+                            let call_b = next_inst.b() as i64;
+                            let call_c = next_inst.c() as i64;
+                            let nargs = if call_b > 0 { call_b - 1 } else { 0 };
+                            let nresults = if call_c > 0 { call_c - 1 } else { -1i64 };
 
-                        // Step 3: IC probe — returns method bits on hit, 0 on miss
-                        let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
-                        let probe_call = self.builder.ins().call(
-                            self.self_ic_check_ref,
-                            &[self.vm_ptr, table_val, ic_val],
-                        );
-                        let method_bits = self.builder.inst_results(probe_call)[0];
-                        // ic_check doesn't allocate → no need to reload_stack_base
+                            self.flush_and_invalidate_cache();
+                            let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
+                            let a_val = self.builder.ins().iconst(types::I64, a);
+                            let b_val = self.builder.ins().iconst(types::I64, b);
+                            let nargs_val = self.builder.ins().iconst(types::I64, nargs);
+                            let nresults_val = self.builder.ins().iconst(types::I64, nresults);
 
-                        let zero = self.builder.ins().iconst(types::I64, 0);
-                        let is_hit = self.builder.ins().icmp(IntCC::NotEqual, method_bits, zero);
+                            let fused_call = self.builder.ins().call(
+                                self.self_call_ic_ref,
+                                &[self.vm_ptr, self.base, a_val, b_val, key, ic_val, nargs_val, nresults_val],
+                            );
+                            let result = self.builder.inst_results(fused_call)[0];
+                            // Fused call may resize stack
+                            self.reload_stack_base();
+                            // Check for SIDE_EXIT
+                            let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                            let is_exit = self.builder.ins().icmp(IntCC::Equal, result, exit_val);
+                            let cont = self.builder.create_block();
+                            self.builder
+                                .ins()
+                                .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                            self.builder.switch_to_block(cont);
+                            self.builder.seal_block(cont);
 
-                        let ic_hit_block = self.builder.create_block();
-                        let ic_miss_block = self.builder.create_block();
-                        let cont = self.builder.create_block();
+                            // Skip the next Call opcode (it's been fused)
+                            // Need to advance past the Call's pc_block if it exists
+                            skip_next = true;
+                        } else {
+                            // IC-enabled path (no fusion): fast probe + slow fallback
+                            // Step 1: Load R[B] and store R[A+1] = R[B] (inline)
+                            let table_val = self.cached_get_slot(b);
+                            self.cached_set_slot((a + 1) as i64, table_val);
 
-                        self.builder
-                            .ins()
-                            .brif(is_hit, ic_hit_block, &[], ic_miss_block, &[]);
+                            // Step 2: Flush cache — the miss path writes directly to stack
+                            self.flush_and_invalidate_cache();
 
-                        // IC HIT: store cached method to R[A]
-                        self.builder.switch_to_block(ic_hit_block);
-                        self.builder.seal_block(ic_hit_block);
-                        self.emit_set_slot(a as i64, method_bits);
-                        self.builder.ins().jump(cont, &[]);
+                            // Step 3: IC probe — returns method bits on hit, 0 on miss
+                            let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
+                            let probe_call = self.builder.ins().call(
+                                self.self_ic_check_ref,
+                                &[self.vm_ptr, table_val, ic_val],
+                            );
+                            let method_bits = self.builder.inst_results(probe_call)[0];
+                            // ic_check doesn't allocate → no need to reload_stack_base
 
-                        // IC MISS: call full jit_rt_self_ic
-                        self.builder.switch_to_block(ic_miss_block);
-                        self.builder.seal_block(ic_miss_block);
-                        let a_val = self.builder.ins().iconst(types::I64, a);
-                        let b_val = self.builder.ins().iconst(types::I64, b);
-                        let miss_call = self.builder.ins().call(
-                            self.self_ic_ref,
-                            &[self.vm_ptr, self.base, a_val, b_val, key, ic_val],
-                        );
-                        let miss_result = self.builder.inst_results(miss_call)[0];
-                        // Miss path may trigger metamethods → reload stack base
-                        self.reload_stack_base();
-                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
-                        let is_exit = self.builder.ins().icmp(IntCC::Equal, miss_result, exit_val);
-                        self.builder
-                            .ins()
-                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let is_hit = self.builder.ins().icmp(IntCC::NotEqual, method_bits, zero);
 
-                        self.builder.switch_to_block(cont);
-                        self.builder.seal_block(cont);
+                            let ic_hit_block = self.builder.create_block();
+                            let ic_miss_block = self.builder.create_block();
+                            let cont = self.builder.create_block();
+
+                            self.builder
+                                .ins()
+                                .brif(is_hit, ic_hit_block, &[], ic_miss_block, &[]);
+
+                            // IC HIT: store cached method to R[A]
+                            self.builder.switch_to_block(ic_hit_block);
+                            self.builder.seal_block(ic_hit_block);
+                            self.emit_set_slot(a as i64, method_bits);
+                            self.builder.ins().jump(cont, &[]);
+
+                            // IC MISS: call full jit_rt_self_ic
+                            self.builder.switch_to_block(ic_miss_block);
+                            self.builder.seal_block(ic_miss_block);
+                            let a_val = self.builder.ins().iconst(types::I64, a);
+                            let b_val = self.builder.ins().iconst(types::I64, b);
+                            let miss_call = self.builder.ins().call(
+                                self.self_ic_ref,
+                                &[self.vm_ptr, self.base, a_val, b_val, key, ic_val],
+                            );
+                            let miss_result = self.builder.inst_results(miss_call)[0];
+                            // Miss path may trigger metamethods → reload stack base
+                            self.reload_stack_base();
+                            let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                            let is_exit = self.builder.ins().icmp(IntCC::Equal, miss_result, exit_val);
+                            self.builder
+                                .ins()
+                                .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+
+                            self.builder.switch_to_block(cont);
+                            self.builder.seal_block(cont);
+                        }
                     } else {
                         // Non-IC path: call jit_rt_self_fast
                         self.flush_and_invalidate_cache();
@@ -3434,18 +3534,29 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let b = inst.b() as i64;
                     let c = inst.c() as usize;
                     let table_val = self.cached_get_slot(b);
-                    let key_raw = self
-                        .constant_to_raw_bits(&self.proto.constants[c]);
-                    let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
-                    // Flush and invalidate before runtime helper that may trigger Lua code
                     self.flush_and_invalidate_cache();
-                    let call = self.builder.ins().call(
-                        self.tbl_idx_ref,
-                        &[self.vm_ptr, table_val, key_val],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    self.reload_stack_base();
-                    self.cached_set_slot(a, result);
+                    // Use fast string-keyed helper when key is a string constant
+                    if let Constant::String(sid) = &self.proto.constants[c] {
+                        let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
+                        let call = self.builder.ins().call(
+                            self.get_field_str_ref,
+                            &[self.vm_ptr, table_val, sid_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        self.cached_set_slot(a, result);
+                    } else {
+                        let key_raw = self
+                            .constant_to_raw_bits(&self.proto.constants[c]);
+                        let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
+                        let call = self.builder.ins().call(
+                            self.tbl_idx_ref,
+                            &[self.vm_ptr, table_val, key_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        self.cached_set_slot(a, result);
+                    }
                 }
 
                 OpCode::SetField => {
@@ -3454,9 +3565,6 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let c = inst.c() as usize;
                     let k = inst.k();
                     let table_val = self.cached_get_slot(a);
-                    let key_raw = self
-                        .constant_to_raw_bits(&self.proto.constants[b]);
-                    let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
                     let val = if k {
                         let raw = self
                             .constant_to_raw_bits(&self.proto.constants[c]);
@@ -3466,25 +3574,64 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     };
                     // Flush and invalidate before runtime helper that may trigger Lua code
                     self.flush_and_invalidate_cache();
-                    let call = self.builder.ins().call(
-                        self.tbl_ni_ref,
-                        &[self.vm_ptr, table_val, key_val, val],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    // table_newindex may trigger metamethods → stack reallocation
-                    self.reload_stack_base();
-                    // Check for SIDE_EXIT (cache already flushed above)
-                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
-                    let is_exit =
+                    // Use fast string-keyed helper when key is a string constant
+                    if let Constant::String(sid) = &self.proto.constants[b] {
+                        let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
+                        let call = self.builder.ins().call(
+                            self.set_field_str_ref,
+                            &[self.vm_ptr, table_val, sid_val, val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        // Check for SIDE_EXIT first
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, result, exit_val);
+                        let check_reload = self.builder.create_block();
                         self.builder
                             .ins()
-                            .icmp(IntCC::Equal, result, exit_val);
-                    let cont = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
-                    self.builder.switch_to_block(cont);
-                    self.builder.seal_block(cont);
+                            .brif(is_exit, self.side_exit_block, &[], check_reload, &[]);
+                        self.builder.switch_to_block(check_reload);
+                        self.builder.seal_block(check_reload);
+                        // Conditional reload: 0 = no-alloc (skip reload), != 0 = reload
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let needs_reload = self.builder.ins().icmp(
+                            IntCC::NotEqual, result, zero,
+                        );
+                        let reload_block = self.builder.create_block();
+                        let cont = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(needs_reload, reload_block, &[], cont, &[]);
+                        self.builder.switch_to_block(reload_block);
+                        self.builder.seal_block(reload_block);
+                        self.reload_stack_base();
+                        self.builder.ins().jump(cont, &[]);
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                    } else {
+                        let key_raw = self
+                            .constant_to_raw_bits(&self.proto.constants[b]);
+                        let key_val = self.builder.ins().iconst(types::I64, key_raw as i64);
+                        let call = self.builder.ins().call(
+                            self.tbl_ni_ref,
+                            &[self.vm_ptr, table_val, key_val, val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, result, exit_val);
+                        let cont = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                    }
                 }
 
                 OpCode::GetI => {
@@ -6977,6 +7124,105 @@ mod tests {
         );
         let i = results[0].as_integer().unwrap();
         assert_eq!(i, 7 * 2000, "expected {}, got {i}", 7 * 2000);
+    }
+
+    // --- Tiny method inlining tests ---
+
+    #[test]
+    fn test_tiny_getter_inlining() {
+        // Simple getter: return self.val — should be inlined via TinyMethodKind::Getter
+        let results = run_lua_with_jit_ic(
+            "local Obj = {}
+            Obj.__index = Obj
+            function Obj:get_val() return self.val end
+            local o = setmetatable({val = 7}, Obj)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + o:get_val() end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 7 * 2000, "getter inlining: expected {}, got {i}", 7 * 2000);
+    }
+
+    #[test]
+    fn test_tiny_getter_nil_field_fallback() {
+        // Field is on __index table, not instance — raw_get_str returns nil, must fall through
+        let results = run_lua_with_jit_ic(
+            "local Obj = {}
+            Obj.__index = Obj
+            Obj.shared = 99
+            function Obj:get_shared() return self.shared end
+            local o = setmetatable({}, Obj)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + o:get_shared() end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 99 * 2000, "nil field fallback: expected {}, got {i}", 99 * 2000);
+    }
+
+    #[test]
+    fn test_tiny_getter_mixed_methods() {
+        // Mix of getter (tiny) and normal (non-tiny) methods
+        let results = run_lua_with_jit_ic(
+            "local Obj = {}
+            Obj.__index = Obj
+            function Obj:get_x() return self.x end
+            function Obj:add(v) self.x = self.x + v; return self.x end
+            local o = setmetatable({x = 0}, Obj)
+            local function f()
+                for i = 1, 2000 do o:add(1) end
+                return o:get_x()
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 2000, "mixed methods: expected 2000, got {i}");
+    }
+
+    #[test]
+    fn test_tiny_getter_method_calls_pattern() {
+        // Mini version of the method_calls benchmark pattern
+        let results = run_lua_with_jit_ic(
+            "local Animal = {}
+            Animal.__index = Animal
+            function Animal.new(name)
+                return setmetatable({name = name, count = 0}, Animal)
+            end
+            function Animal:speak()
+                self.count = self.count + 1
+                return self.count
+            end
+            function Animal:get_count() return self.count end
+            local cat = Animal.new('cat')
+            local dog = Animal.new('dog')
+            local function f()
+                local s = 0
+                for i = 1, 2000 do
+                    cat:speak()
+                    dog:speak()
+                    s = s + cat:get_count() + dog:get_count()
+                end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        // Each iter: cat.count goes 1..2000, dog.count goes 1..2000
+        // s += cat_count + dog_count each iter
+        // sum = 2 * sum(1..2000) = 2 * 2001000 = 4002000
+        let expected = 2 * (2000 * 2001 / 2);
+        assert_eq!(i, expected, "method_calls pattern: expected {expected}, got {i}");
     }
 }
 
