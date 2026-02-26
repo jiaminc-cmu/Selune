@@ -32,6 +32,24 @@ pub unsafe extern "C" fn jit_rt_get_stack_len(vm_ptr: *mut Vm) -> u64 {
     vm.stack.len() as u64
 }
 
+/// Get a raw pointer to a Table in the GC heap by its index.
+/// Returns the pointer as u64 (0 if the slot is empty/freed).
+/// JIT code uses this to load table fields (metatable, version) at known offsets.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid, non-null pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_get_table_ptr(vm_ptr: *mut Vm, table_idx: u64) -> u64 {
+    let vm = &*vm_ptr;
+    let idx = table_idx as usize;
+    if idx < vm.gc.tables.len() {
+        if let Some(ref table) = vm.gc.tables[idx] {
+            return table as *const _ as u64;
+        }
+    }
+    0
+}
+
 /// Ensure vm.stack has at least `min_len` slots. Called before JIT
 /// function entry or when inline access detects potential out-of-bounds.
 ///
@@ -685,6 +703,195 @@ pub unsafe extern "C" fn jit_rt_self_fast(
     }
 
     // Slow path: full metamethod dispatch
+    match table_index(vm, table_val, key) {
+        Ok(result) => {
+            vm.stack[base + a] = result;
+            0
+        }
+        Err(_) => SIDE_EXIT,
+    }
+}
+
+/// Ultra-fast IC probe for Self_. Returns cached method bits if IC hits, 0 if miss.
+/// JIT code calls this first, and only calls jit_rt_self_ic on miss.
+///
+/// IC hit criteria: table has metatable matching IC, __index table version matches,
+/// AND instance table shape hasn't changed (no new keys added).
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+/// - `ic_ptr` must be a valid pointer to a `SelfIcEntry`.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn jit_rt_self_ic_check(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    ic_ptr: u64,
+) -> u64 {
+    use selune_vm::vm::SelfIcEntry;
+
+    let vm = &*vm_ptr;
+    let table_val = TValue::from_raw_bits(table_bits);
+
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let ic = &*(ic_ptr as *const SelfIcEntry);
+
+        // Quick check: IC populated?
+        if ic.cached_mt_tag != 0 {
+            let table = vm.gc.get_table(table_idx);
+
+            // Check 1: metatable identity
+            let mt_raw = table.metatable_raw();
+            if mt_raw as u64 + 1 == ic.cached_mt_tag {
+                // Check 2: __index table version
+                let idx_tbl_idx = ic.cached_index_table_idx as u32;
+                let idx_table = vm.gc.get_table(
+                    selune_core::gc::GcIdx(idx_tbl_idx, std::marker::PhantomData),
+                );
+                if idx_table.version as u64 == ic.cached_version {
+                    // Check 3: instance shape hasn't changed (no new keys)
+                    if table.shape_version as u64 == ic.cached_instance_shape {
+                        // IC HIT! Return cached method bits
+                        return ic.cached_method_bits;
+                    }
+                }
+            }
+        }
+    }
+
+    0 // IC miss
+}
+
+/// Inline-cache-guarded Self_ dispatch.
+///
+/// On IC hit: loads cached method directly (zero hash lookups on __index table).
+/// On IC miss: does full resolution (same as jit_rt_self_fast) and updates the IC.
+///
+/// The IC is guarded by (metatable identity, __index table version).
+/// Both `cat:speak()` and `dog:speak()` hit the same IC as long as they share
+/// the same metatable whose __index table hasn't been modified.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+/// - `ic_ptr` must be a valid pointer to a `SelfIcEntry`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_self_ic(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+    b: u64,
+    key_bits: u64,
+    ic_ptr: u64,
+) -> i64 {
+    use selune_vm::vm::SelfIcEntry;
+
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let b = b as usize;
+
+    let table_val = vm.stack[base + b];
+    // R[A+1] = R[B] (self/receiver)
+    vm.stack[base + a + 1] = table_val;
+
+    let ic = &mut *(ic_ptr as *mut SelfIcEntry);
+
+    // Fast path: if receiver is a table, try IC hit
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let table = vm.gc.get_table(table_idx);
+
+        // Check metatable for IC path
+        if let Some(mt_idx) = table.metatable {
+            let mt_tag = mt_idx.0 as u64 + 1;
+
+            if ic.cached_mt_tag == mt_tag {
+                // Metatable matches — check __index table version
+                let idx_tbl_idx = ic.cached_index_table_idx as u32;
+                let idx_table = vm.gc.get_table(
+                    selune_core::gc::GcIdx(idx_tbl_idx, std::marker::PhantomData),
+                );
+                if idx_table.version as u64 == ic.cached_version {
+                    // IC HIT!
+                    // Check if instance shape changed since IC was populated.
+                    // If not, the instance doesn't have this key (skip raw lookup).
+                    if table.shape_version as u64 != ic.cached_instance_shape {
+                        // Shape changed — need to check for instance override
+                        let key = TValue::from_raw_bits(key_bits);
+                        if let Some(sid) = key.as_string_id() {
+                            let raw = table.raw_get_str(sid);
+                            if !raw.is_nil() {
+                                vm.stack[base + a] = raw;
+                                return 0;
+                            }
+                        }
+                        // Key not on instance — update cached shape
+                        ic.cached_instance_shape = table.shape_version as u64;
+                    }
+                    // Use cached method (no instance override)
+                    vm.stack[base + a] = TValue::from_raw_bits(ic.cached_method_bits);
+                    return 0;
+                }
+            }
+
+            // IC miss — do full resolution
+            let key = TValue::from_raw_bits(key_bits);
+            let key_sid = key.as_string_id();
+
+            // Step 1: raw lookup on instance
+            let raw_result = if let Some(sid) = key_sid {
+                vm.gc.get_table(table_idx).raw_get_str(sid)
+            } else {
+                vm.gc.table_raw_get(table_idx, key)
+            };
+
+            if !raw_result.is_nil() {
+                vm.stack[base + a] = raw_result;
+                return 0;
+            }
+
+            // Step 2: resolve via metatable.__index
+            let mm_index_name = vm.mm_names.as_ref().unwrap().index;
+            let mm_val = vm.gc.get_table(mt_idx).raw_get_str(mm_index_name);
+
+            if let Some(idx_table_idx) = mm_val.as_table_idx() {
+                let idx_result = if let Some(sid) = key_sid {
+                    vm.gc.get_table(idx_table_idx).raw_get_str(sid)
+                } else {
+                    vm.gc.table_raw_get(idx_table_idx, key)
+                };
+
+                if !idx_result.is_nil() {
+                    // Update IC
+                    let idx_table = vm.gc.get_table(idx_table_idx);
+                    let inst_table = vm.gc.get_table(table_idx);
+                    ic.cached_mt_tag = mt_tag;
+                    ic.cached_index_table_idx = idx_table_idx.0 as u64;
+                    ic.cached_version = idx_table.version as u64;
+                    ic.cached_method_bits = idx_result.raw_bits();
+                    ic.cached_instance_shape = inst_table.shape_version as u64;
+
+                    vm.stack[base + a] = idx_result;
+                    return 0;
+                }
+            }
+            // Fall through to slow path
+        } else {
+            // No metatable — check raw lookup
+            let key = TValue::from_raw_bits(key_bits);
+            if let Some(sid) = key.as_string_id() {
+                let raw = table.raw_get_str(sid);
+                if !raw.is_nil() {
+                    vm.stack[base + a] = raw;
+                    return 0;
+                }
+            }
+            vm.stack[base + a] = TValue::nil();
+            return 0;
+        }
+    }
+
+    // Slow path: full metamethod dispatch
+    let key = TValue::from_raw_bits(key_bits);
     match table_index(vm, table_val, key) {
         Ok(result) => {
             vm.stack[base + a] = result;

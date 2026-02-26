@@ -29,6 +29,49 @@ pub enum JitProtoState {
     Blacklisted,
 }
 
+/// Identifies a builtin native function that the JIT can inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum BuiltinId {
+    MathAbs = 0,
+    MathFloor = 1,
+    MathCeil = 2,
+    MathSqrt = 3,
+    MathSin = 4,
+    MathCos = 5,
+}
+
+/// Inline cache entry for Self_ (method dispatch).
+/// Caches the resolved method for a specific (metatable, __index_table_version) pair.
+/// All zeroes = empty/unpopulated.
+#[repr(C)]
+pub struct SelfIcEntry {
+    /// Metatable GcIdx.0 + 1 (0 means IC is empty/unpopulated).
+    pub cached_mt_tag: u64,
+    /// GcIdx.0 of the __index table (the table where the method was found).
+    pub cached_index_table_idx: u64,
+    /// Version of the __index table when the method was cached.
+    pub cached_version: u64,
+    /// The resolved method TValue raw bits.
+    pub cached_method_bits: u64,
+    /// Shape version of the instance table when IC was populated.
+    /// If shape_version hasn't changed, the instance doesn't have this key
+    /// (no new keys were inserted since IC population).
+    pub cached_instance_shape: u64,
+}
+
+/// Per-table metadata for JIT inline caches. #[repr(C)] for predictable layout
+/// accessible from JIT-generated code via pointer arithmetic.
+/// Parallel to gc.tables — index i corresponds to table GcIdx(i).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TableMeta {
+    /// Metatable GcIdx.0 + 1, or 0 if no metatable. (+1 so 0 is the sentinel.)
+    pub metatable_tag: u32,
+    /// Mirror of Table.version — incremented on hash mutations.
+    pub version: u32,
+}
+
 /// Per-coroutine state (stack, call stack, upvalues).
 #[derive(Clone)]
 pub struct LuaThread {
@@ -256,6 +299,17 @@ pub struct Vm {
     pub jit_osr_blacklist: HashSet<(usize, usize)>,
     /// Optional OSR compilation callback. Called when a back-edge triggers OSR.
     pub jit_osr_compile_callback: Option<fn(&mut Vm, usize, usize)>,
+    /// Maps native function TValue raw bits → BuiltinId for JIT inlining.
+    /// Populated after stdlib registration. The JIT compiler uses this at
+    /// compile time to resolve known builtins and emit guarded inline IR.
+    pub builtin_natives: HashMap<u64, BuiltinId>,
+    /// Inline cache entries for Self_ method dispatch.
+    /// Keyed by (proto_idx, pc) → Box<SelfIcEntry>. Boxed for stable pointer identity
+    /// (the JIT bakes the IC entry pointer as a constant).
+    pub jit_self_ic: HashMap<(usize, usize), Box<SelfIcEntry>>,
+    /// Per-table metadata side-table for JIT inline access.
+    /// Parallel to gc.tables — updated when metatable or version changes.
+    pub table_meta: Vec<TableMeta>,
 }
 
 /// Format a source name for error messages (matching PUC Lua behavior).
@@ -391,6 +445,9 @@ impl Vm {
             jit_osr_functions: HashMap::new(),
             jit_osr_blacklist: HashSet::new(),
             jit_osr_compile_callback: None,
+            builtin_natives: HashMap::new(),
+            jit_self_ic: HashMap::new(),
+            table_meta: Vec::new(),
         }
     }
 
@@ -438,6 +495,24 @@ impl Vm {
                 .resize(proto_idx + 1, JitProtoState::None);
         }
         self.jit_proto_state[proto_idx] = JitProtoState::Compiled(jit_fn);
+    }
+
+    /// Get or create an IC entry for a Self_ site, returning a raw pointer to it.
+    /// The Box ensures the pointer is stable across HashMap resizes.
+    pub fn jit_get_or_create_self_ic(&mut self, proto_idx: usize, pc: usize) -> *mut SelfIcEntry {
+        let entry = self
+            .jit_self_ic
+            .entry((proto_idx, pc))
+            .or_insert_with(|| {
+                Box::new(SelfIcEntry {
+                    cached_mt_tag: 0,
+                    cached_index_table_idx: 0,
+                    cached_version: 0,
+                    cached_method_bits: 0,
+                    cached_instance_shape: u64::MAX, // sentinel: force raw check on first call
+                })
+            });
+        &mut **entry as *mut SelfIcEntry
     }
 
     /// Record a side-exit for a proto. After 3 exits, blacklists the proto.
@@ -516,6 +591,30 @@ impl Vm {
         }
     }
 
+    /// Populate the `builtin_natives` map by walking the math table in _ENV.
+    /// Maps each known builtin's TValue raw bits → BuiltinId for JIT inlining.
+    fn register_builtin_natives(&mut self, env_idx: GcIdx<selune_core::table::Table>) {
+        let math_key = self.strings.intern(b"math");
+        let math_val = self.gc.get_table(env_idx).raw_get_str(math_key);
+        if let Some(math_table_idx) = math_val.as_table_idx() {
+            let builtins: &[(&[u8], BuiltinId)] = &[
+                (b"abs", BuiltinId::MathAbs),
+                (b"floor", BuiltinId::MathFloor),
+                (b"ceil", BuiltinId::MathCeil),
+                (b"sqrt", BuiltinId::MathSqrt),
+                (b"sin", BuiltinId::MathSin),
+                (b"cos", BuiltinId::MathCos),
+            ];
+            for &(name, id) in builtins {
+                let key = self.strings.intern(name);
+                let val = self.gc.get_table(math_table_idx).raw_get_str(key);
+                if val.as_native_idx().is_some() {
+                    self.builtin_natives.insert(val.raw_bits(), id);
+                }
+            }
+        }
+    }
+
     /// Ensure the stack has at least `size` slots from `base`.
     pub fn ensure_stack(&mut self, base: usize, size: usize) {
         let needed = base + size;
@@ -587,6 +686,9 @@ impl Vm {
 
         // Mark all redirect natives for fast bitset lookup in Call/TailCall dispatch
         self.mark_redirect_natives();
+
+        // Populate builtin_natives map for JIT inlining
+        self.register_builtin_natives(env_idx);
 
         // Create main thread handle (stable identity for coroutine.running() in main thread)
         let main_handle = self.gc.alloc_table(4, 0);

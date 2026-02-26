@@ -11,7 +11,9 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 use selune_compiler::opcode::OpCode;
 use selune_compiler::proto::{Constant, Proto};
 use selune_core::gc::GcHeap;
+use selune_core::string::StringInterner;
 use selune_core::value::{self, TValue};
+use selune_vm::vm::BuiltinId;
 
 use crate::abi::{self, JitFunction};
 use crate::runtime;
@@ -51,6 +53,16 @@ impl From<cranelift_module::ModuleError> for JitError {
     fn from(e: cranelift_module::ModuleError) -> Self {
         JitError::Module(e)
     }
+}
+
+/// Libm wrapper: sin(f64) -> f64 for JIT inline calls.
+unsafe extern "C" fn jit_libm_sin(x: f64) -> f64 {
+    x.sin()
+}
+
+/// Libm wrapper: cos(f64) -> f64 for JIT inline calls.
+unsafe extern "C" fn jit_libm_cos(x: f64) -> f64 {
+    x.cos()
 }
 
 /// The JIT compiler. Wraps a Cranelift JITModule and reusable compilation context.
@@ -116,6 +128,18 @@ impl JitCompiler {
             runtime::jit_rt_self_fast as *const u8,
         );
         builder.symbol(
+            "jit_rt_self_ic",
+            runtime::jit_rt_self_ic as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_get_table_ptr",
+            runtime::jit_rt_get_table_ptr as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_self_ic_check",
+            runtime::jit_rt_self_ic_check as *const u8,
+        );
+        builder.symbol(
             "jit_rt_table_index",
             runtime::jit_rt_table_index as *const u8,
         );
@@ -158,6 +182,10 @@ impl JitCompiler {
             "jit_rt_box_integer",
             runtime::jit_rt_box_integer as *const u8,
         );
+
+        // Register libm wrappers for inlined math builtins
+        builder.symbol("jit_libm_sin", jit_libm_sin as *const u8);
+        builder.symbol("jit_libm_cos", jit_libm_cos as *const u8);
 
         let module = JITModule::new(builder);
         let ctx = module.make_context();
@@ -287,7 +315,22 @@ impl JitCompiler {
         gc: &mut GcHeap,
         proto_idx: usize,
     ) -> Result<JitFunction, JitError> {
-        self.compile_proto_inner(proto, gc, proto_idx, None)
+        // Dummy interner - not used when builtin_natives is empty
+        let dummy = StringInterner::new();
+        self.compile_proto_inner(proto, gc, proto_idx, None, &HashMap::new(), &dummy, &HashMap::new())
+    }
+
+    /// Compile with builtin inlining support.
+    pub fn compile_proto_with_builtins(
+        &mut self,
+        proto: &Proto,
+        gc: &mut GcHeap,
+        proto_idx: usize,
+        builtin_natives: &HashMap<u64, BuiltinId>,
+        strings: &StringInterner,
+        self_ic_ptrs: &HashMap<usize, u64>,
+    ) -> Result<JitFunction, JitError> {
+        self.compile_proto_inner(proto, gc, proto_idx, None, builtin_natives, strings, self_ic_ptrs)
     }
 
     /// Compile an OSR (On-Stack Replacement) variant of a proto.
@@ -300,7 +343,22 @@ impl JitCompiler {
         proto_idx: usize,
         entry_pc: usize,
     ) -> Result<JitFunction, JitError> {
-        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc))
+        let dummy = StringInterner::new();
+        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), &HashMap::new(), &dummy, &HashMap::new())
+    }
+
+    /// Compile an OSR variant with builtin inlining support.
+    pub fn compile_proto_osr_with_builtins(
+        &mut self,
+        proto: &Proto,
+        gc: &mut GcHeap,
+        proto_idx: usize,
+        entry_pc: usize,
+        builtin_natives: &HashMap<u64, BuiltinId>,
+        strings: &StringInterner,
+        self_ic_ptrs: &HashMap<usize, u64>,
+    ) -> Result<JitFunction, JitError> {
+        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), builtin_natives, strings, self_ic_ptrs)
     }
 
     fn compile_proto_inner(
@@ -309,6 +367,9 @@ impl JitCompiler {
         gc: &mut GcHeap,
         proto_idx: usize,
         entry_pc: Option<usize>,
+        builtin_natives: &HashMap<u64, BuiltinId>,
+        strings: &StringInterner,
+        self_ic_ptrs: &HashMap<usize, u64>,
     ) -> Result<JitFunction, JitError> {
         // First pass: check all opcodes are supported (except MMBin* which are skipped)
         let mut skip_next = false;
@@ -516,6 +577,35 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_self_fast", Linkage::Import, &self_fast_sig)?;
 
+        // jit_rt_self_ic(vm_ptr, base, a, b, key_bits, ic_ptr) -> i64
+        let mut self_ic_sig = Signature::new(call_conv);
+        for _ in 0..6 {
+            self_ic_sig.params.push(AbiParam::new(types::I64));
+        }
+        self_ic_sig.returns.push(AbiParam::new(types::I64));
+        let self_ic_id = self
+            .module
+            .declare_function("jit_rt_self_ic", Linkage::Import, &self_ic_sig)?;
+
+        // jit_rt_self_ic_check(vm_ptr, table_bits, ic_ptr) -> u64 (method_bits or 0)
+        let mut self_ic_check_sig = Signature::new(call_conv);
+        self_ic_check_sig.params.push(AbiParam::new(types::I64));
+        self_ic_check_sig.params.push(AbiParam::new(types::I64));
+        self_ic_check_sig.params.push(AbiParam::new(types::I64));
+        self_ic_check_sig.returns.push(AbiParam::new(types::I64));
+        let self_ic_check_id = self
+            .module
+            .declare_function("jit_rt_self_ic_check", Linkage::Import, &self_ic_check_sig)?;
+
+        // jit_rt_get_table_ptr(vm_ptr, table_idx) -> u64
+        let mut get_table_ptr_sig = Signature::new(call_conv);
+        get_table_ptr_sig.params.push(AbiParam::new(types::I64));
+        get_table_ptr_sig.params.push(AbiParam::new(types::I64));
+        get_table_ptr_sig.returns.push(AbiParam::new(types::I64));
+        let get_table_ptr_id = self
+            .module
+            .declare_function("jit_rt_get_table_ptr", Linkage::Import, &get_table_ptr_sig)?;
+
         // jit_rt_table_index(vm_ptr, table_bits, key_bits) -> u64
         let mut tbl_idx_sig = Signature::new(call_conv);
         tbl_idx_sig.params.push(AbiParam::new(types::I64));
@@ -701,6 +791,26 @@ impl JitCompiler {
             &ensure_stack_sig,
         )?;
 
+        // jit_libm_sin(f64) -> f64
+        let mut libm_sin_sig = Signature::new(call_conv);
+        libm_sin_sig.params.push(AbiParam::new(types::F64));
+        libm_sin_sig.returns.push(AbiParam::new(types::F64));
+        let libm_sin_id = self.module.declare_function(
+            "jit_libm_sin",
+            Linkage::Import,
+            &libm_sin_sig,
+        )?;
+
+        // jit_libm_cos(f64) -> f64
+        let mut libm_cos_sig = Signature::new(call_conv);
+        libm_cos_sig.params.push(AbiParam::new(types::F64));
+        libm_cos_sig.returns.push(AbiParam::new(types::F64));
+        let libm_cos_id = self.module.declare_function(
+            "jit_libm_cos",
+            Linkage::Import,
+            &libm_cos_sig,
+        )?;
+
         self.ctx.func.signature = sig;
 
         {
@@ -724,6 +834,9 @@ impl JitCompiler {
             let tailcall_ref = self.module.declare_func_in_func(tailcall_id, builder.func);
             let self_ref = self.module.declare_func_in_func(self_id, builder.func);
             let self_fast_ref = self.module.declare_func_in_func(self_fast_id, builder.func);
+            let self_ic_ref = self.module.declare_func_in_func(self_ic_id, builder.func);
+            let get_table_ptr_ref = self.module.declare_func_in_func(get_table_ptr_id, builder.func);
+            let self_ic_check_ref = self.module.declare_func_in_func(self_ic_check_id, builder.func);
             let tbl_idx_ref = self.module.declare_func_in_func(tbl_idx_id, builder.func);
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
             let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
@@ -746,6 +859,8 @@ impl JitCompiler {
             let ensure_stack_ref =
                 self.module
                     .declare_func_in_func(ensure_stack_id, builder.func);
+            let libm_sin_ref = self.module.declare_func_in_func(libm_sin_id, builder.func);
+            let libm_cos_ref = self.module.declare_func_in_func(libm_cos_id, builder.func);
 
             // Side-exit block: return SIDE_EXIT
             let side_exit_block = builder.create_block();
@@ -813,6 +928,9 @@ impl JitCompiler {
                 tailcall_ref,
                 self_ref,
                 self_fast_ref,
+                self_ic_ref,
+                get_table_ptr_ref,
+                self_ic_check_ref,
                 tbl_idx_ref,
                 tbl_ni_ref,
                 geti_ref,
@@ -837,7 +955,15 @@ impl JitCompiler {
                 gc,
                 pc_blocks: &pc_blocks,
                 proto_idx,
+                builtin_inlines: HashMap::new(),
+                strings,
+                libm_sin_ref,
+                libm_cos_ref,
+                self_ic_ptrs,
             };
+
+            // Pre-analyze builtin call sites for inline emission
+            emitter.pre_analyze_builtins(builtin_natives);
 
             emitter.emit_instructions()?;
 
@@ -1109,6 +1235,9 @@ struct BytecodeEmitter<'a, 'b> {
     tailcall_ref: FuncRef,
     self_ref: FuncRef,
     self_fast_ref: FuncRef,
+    self_ic_ref: FuncRef,
+    get_table_ptr_ref: FuncRef,
+    self_ic_check_ref: FuncRef,
     tbl_idx_ref: FuncRef,
     tbl_ni_ref: FuncRef,
     geti_ref: FuncRef,
@@ -1140,6 +1269,19 @@ struct BytecodeEmitter<'a, 'b> {
     pc_blocks: &'a HashMap<usize, Block>,
     /// Index of this proto in vm.protos[], used by runtime helpers.
     proto_idx: usize,
+    /// Pre-analyzed builtin call sites: Call PC → list of (BuiltinId, expected_native_raw_bits).
+    /// Only populated when builtin_natives is non-empty. Used to emit guarded inline IR.
+    /// For known single-builtin sites (GetTabUp+GetField+Call), the list has exactly 1 entry.
+    /// For upvalue-sourced calls (GetUpval+Call), the list has all 6 builtins for speculative matching.
+    builtin_inlines: HashMap<usize, Vec<(BuiltinId, u64)>>,
+    /// String interner for resolving constant string names during builtin pre-analysis.
+    strings: &'a StringInterner,
+    /// Libm sin(f64) -> f64 for inlined math.sin.
+    libm_sin_ref: FuncRef,
+    /// Libm cos(f64) -> f64 for inlined math.cos.
+    libm_cos_ref: FuncRef,
+    /// Per-Self_ IC entry pointers: pc → raw pointer to SelfIcEntry (as u64).
+    self_ic_ptrs: &'a HashMap<usize, u64>,
 }
 
 impl<'a, 'b> BytecodeEmitter<'a, 'b> {
@@ -1586,6 +1728,375 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
     /// start as Float. Also identifies slots written by float-producing ops
     /// within the loop body. Seeds type_hints so the first iteration can
     /// skip type guards for known-float slots.
+    /// Emit a guarded inline call for known builtin function(s).
+    ///
+    /// Supports both single-candidate (known builtin from GetTabUp+GetField+Call) and
+    /// multi-candidate (speculative match from GetUpval+Call) patterns.
+    ///
+    /// For single-candidate: simple guard → inline or generic fallback.
+    /// For multi-candidate: cascading guards, each with a compact inline path.
+    /// All candidate paths share argument loading and float checks to minimize code bloat.
+    fn emit_builtin_inline_call(
+        &mut self,
+        a: i64,
+        nargs: i64,
+        nresults: i64,
+        candidates: &[(BuiltinId, u64)],
+    ) {
+        // Flush cache before branching — all paths need consistent stack state
+        self.flush_and_invalidate_cache();
+
+        // Load the function value from stack (not cache — already flushed)
+        let func_val = self.emit_get_slot(a);
+
+        let generic_block = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        // For multi-candidate: use a shared float check + operation dispatch block
+        // to reduce code bloat. We convert the func_val to a "builtin index" (0-5 or -1),
+        // then use a single shared arg-load + float-check, followed by if-else on the index.
+        if candidates.len() == 1 {
+            // Single candidate: simple direct guard (most efficient, no index indirection)
+            let (builtin_id, expected_bits) = candidates[0];
+            let expected = self.builder.ins().iconst(types::I64, expected_bits as i64);
+            let is_match = self.builder.ins().icmp(IntCC::Equal, func_val, expected);
+
+            let inline_block = self.builder.create_block();
+            self.builder.ins().brif(is_match, inline_block, &[], generic_block, &[]);
+
+            self.builder.switch_to_block(inline_block);
+            self.builder.seal_block(inline_block);
+
+            self.emit_single_builtin_inline(a, nresults, builtin_id, generic_block, cont_block);
+        } else {
+            // Multi-candidate: cascading guards to find which builtin (if any)
+            // Each guard checks one candidate and branches to its operation block
+            for (i, &(builtin_id, expected_bits)) in candidates.iter().enumerate() {
+                let expected = self.builder.ins().iconst(types::I64, expected_bits as i64);
+                let is_match = self.builder.ins().icmp(IntCC::Equal, func_val, expected);
+
+                let inline_block = self.builder.create_block();
+                let next_check = if i + 1 < candidates.len() {
+                    self.builder.create_block()
+                } else {
+                    generic_block
+                };
+
+                self.builder.ins().brif(is_match, inline_block, &[], next_check, &[]);
+
+                // === Inline path for this candidate ===
+                self.builder.switch_to_block(inline_block);
+                self.builder.seal_block(inline_block);
+
+                self.emit_single_builtin_inline(a, nresults, builtin_id, generic_block, cont_block);
+
+                // Switch to next check block if more candidates
+                if i + 1 < candidates.len() {
+                    self.builder.switch_to_block(next_check);
+                    self.builder.seal_block(next_check);
+                }
+            }
+        }
+
+        // === Generic call path (all guards missed or non-float arg) ===
+        self.builder.switch_to_block(generic_block);
+        self.builder.seal_block(generic_block);
+
+        self.flush_and_invalidate_cache();
+        let func_off = self.builder.ins().iconst(types::I64, a);
+        let nargs_val = self.builder.ins().iconst(types::I64, nargs);
+        let nresults_val = self.builder.ins().iconst(types::I64, nresults);
+        let call = self.builder.ins().call(
+            self.call_fast_ref,
+            &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
+        );
+        let result = self.builder.inst_results(call)[0];
+        self.reload_stack_base();
+        // Check for SIDE_EXIT
+        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+        let is_exit = self.builder.ins().icmp(IntCC::Equal, result, exit_val);
+        let after_generic = self.builder.create_block();
+        self.builder.ins().brif(is_exit, self.side_exit_block, &[], after_generic, &[]);
+        self.builder.switch_to_block(after_generic);
+        self.builder.seal_block(after_generic);
+        self.builder.ins().jump(cont_block, &[]);
+
+        // === Continuation ===
+        self.builder.switch_to_block(cont_block);
+        self.builder.seal_block(cont_block);
+
+        // Invalidate cache after call (generic path may have changed anything)
+        self.slot_cache.invalidate_all();
+    }
+
+    /// Emit the inline body for a single matched builtin: load arg, float check, apply op, store result.
+    /// Branches to generic_block on non-float arg, jumps to cont_block on success.
+    fn emit_single_builtin_inline(
+        &mut self,
+        a: i64,
+        nresults: i64,
+        builtin_id: BuiltinId,
+        generic_block: Block,
+        cont_block: Block,
+    ) {
+        // Load argument from R[a+1]
+        let arg_raw = self.emit_get_slot(a + 1);
+
+        // Check if argument is a float (fast path)
+        let qnan = self.builder.ins().iconst(types::I64, value::QNAN as i64);
+        let masked = self.builder.ins().band(arg_raw, qnan);
+        let is_float = self.builder.ins().icmp(IntCC::NotEqual, masked, qnan);
+
+        let float_path = self.builder.create_block();
+        self.builder.ins().brif(is_float, float_path, &[], generic_block, &[]);
+
+        self.builder.switch_to_block(float_path);
+        self.builder.seal_block(float_path);
+
+        // Extract f64 value
+        let arg_f64 = self.builder.ins().bitcast(types::F64, MemFlags::new(), arg_raw);
+
+        // Apply the builtin operation
+        let result_raw = match builtin_id {
+            BuiltinId::MathSqrt => {
+                let result_f64 = self.builder.ins().sqrt(arg_f64);
+                self.emit_box_float(result_f64)
+            }
+            BuiltinId::MathAbs => {
+                let result_f64 = self.builder.ins().fabs(arg_f64);
+                self.emit_box_float_fast(result_f64)
+            }
+            BuiltinId::MathFloor => {
+                let result_f64 = self.builder.ins().floor(arg_f64);
+                self.emit_floor_ceil_to_value(result_f64)
+            }
+            BuiltinId::MathCeil => {
+                let result_f64 = self.builder.ins().ceil(arg_f64);
+                self.emit_floor_ceil_to_value(result_f64)
+            }
+            BuiltinId::MathSin => {
+                let func_ref = self.libm_sin_ref;
+                let call = self.builder.ins().call(func_ref, &[arg_f64]);
+                let result_f64 = self.builder.inst_results(call)[0];
+                self.emit_box_float(result_f64)
+            }
+            BuiltinId::MathCos => {
+                let func_ref = self.libm_cos_ref;
+                let call = self.builder.ins().call(func_ref, &[arg_f64]);
+                let result_f64 = self.builder.inst_results(call)[0];
+                self.emit_box_float(result_f64)
+            }
+        };
+
+        // Store result to R[a]
+        self.emit_set_slot(a, result_raw);
+
+        // Fill extra result slots with nil if needed
+        if nresults > 1 {
+            let nil_bits = self.builder.ins().iconst(types::I64, TValue::nil().raw_bits() as i64);
+            for j in 1..nresults {
+                self.emit_set_slot(a + j, nil_bits);
+            }
+        }
+
+        self.builder.ins().jump(cont_block, &[]);
+    }
+
+    /// Emit floor/ceil → integer conversion for Lua semantics.
+    /// Lua's math.floor/ceil return integer when the result is representable.
+    fn emit_floor_ceil_to_value(&mut self, result_f64: Value) -> Value {
+        // Try to convert float to integer: fcvt_to_sint_sat
+        let int_val = self.builder.ins().fcvt_to_sint_sat(types::I64, result_f64);
+
+        // Check if conversion was lossless: convert back and compare
+        let back_f64 = self.builder.ins().fcvt_from_sint(types::F64, int_val);
+        let is_exact = self.builder.ins().fcmp(FloatCC::Equal, result_f64, back_f64);
+
+        // Also check it's not NaN or infinity (fcmp Equal with NaN returns false, so NaN is handled)
+        // and that the integer fits in small int range
+        let min_val = self.builder.ins().iconst(types::I64, SMALL_INT_MIN);
+        let max_val = self.builder.ins().iconst(types::I64, SMALL_INT_MAX);
+        let ge_min = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, int_val, min_val);
+        let le_max = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, int_val, max_val);
+        let in_range = self.builder.ins().band(ge_min, le_max);
+        let can_int = self.builder.ins().band(is_exact, in_range);
+
+        let int_block = self.builder.create_block();
+        let float_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder.append_block_param(merge, types::I64);
+
+        self.builder.ins().brif(can_int, int_block, &[], float_block, &[]);
+
+        // Integer path: box as small integer
+        self.builder.switch_to_block(int_block);
+        self.builder.seal_block(int_block);
+        let boxed_int = self.emit_box_integer(int_val);
+        self.builder.ins().jump(merge, &[BlockArg::Value(boxed_int)]);
+
+        // Float path: box as float (for infinity, NaN, or out-of-range)
+        self.builder.switch_to_block(float_block);
+        self.builder.seal_block(float_block);
+        // floor/ceil can produce NaN (from NaN input) → canonicalize
+        let boxed_float = self.emit_box_float(result_f64);
+        self.builder.ins().jump(merge, &[BlockArg::Value(boxed_float)]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+
+        self.builder.block_params(merge)[0]
+    }
+
+    /// Pre-scan bytecodes to identify builtin function call sites that can be inlined.
+    /// Detects patterns like: GetTabUp(up0, K["math"]) + GetField(_, _, K["abs"]) + Call
+    /// and resolves the expected native TValue raw bits at compile time.
+    fn pre_analyze_builtins(&mut self, builtin_natives: &HashMap<u64, BuiltinId>) {
+        if builtin_natives.is_empty() {
+            return;
+        }
+
+        // Build reverse map: BuiltinId → expected raw bits
+        let mut id_to_bits: HashMap<BuiltinId, u64> = HashMap::new();
+        for (&bits, &id) in builtin_natives {
+            id_to_bits.insert(id, bits);
+        }
+
+        // Build a list of all (BuiltinId, expected_bits) for speculative matching
+        let all_builtins: Vec<(BuiltinId, u64)> = id_to_bits.iter()
+            .map(|(&id, &bits)| (id, bits))
+            .collect();
+
+        // Map string constant names to BuiltinId
+        let builtin_names: &[(&[u8], BuiltinId)] = &[
+            (b"abs", BuiltinId::MathAbs),
+            (b"floor", BuiltinId::MathFloor),
+            (b"ceil", BuiltinId::MathCeil),
+            (b"sqrt", BuiltinId::MathSqrt),
+            (b"sin", BuiltinId::MathSin),
+            (b"cos", BuiltinId::MathCos),
+        ];
+
+        let code = &self.proto.code;
+        let constants = &self.proto.constants;
+
+        // Unified pattern matching: Track registers that may hold builtin functions from:
+        //   a) GetUpval R[x], Up[n] — builtin captured as upvalue
+        //   b) GetTabUp(R[x], Up[0], K["math"]) + GetField(R[x], R[x], K[name]) — direct load
+        //   c) Move R[y], R[x] — alias of a known-builtin register
+        // Then at Call R[x], 2, c, emit speculative guards.
+        if !all_builtins.is_empty() {
+            // Track which registers may hold a builtin function.
+            // None = unknown/not a builtin, Some(vec) = specific known candidates
+            let mut builtin_regs: HashMap<usize, Vec<(BuiltinId, u64)>> = HashMap::new();
+            // Track registers loaded from GetTabUp+GetField "math.X" that could be builtin
+            let mut pending_math_reg: Option<usize> = None; // register that holds the "math" table
+
+            for pc in 0..code.len() {
+                let inst = code[pc];
+                let op = inst.opcode();
+
+                match op {
+                    OpCode::GetUpval => {
+                        // R[a] holds an upvalue — could be any builtin
+                        builtin_regs.insert(inst.a() as usize, all_builtins.clone());
+                    }
+                    OpCode::GetTabUp => {
+                        let a = inst.a() as usize;
+                        let up_idx = inst.b() as usize;
+                        let k_idx = inst.c() as usize;
+                        // Check if this is _ENV["math"]
+                        if up_idx == 0 && k_idx < constants.len() {
+                            let is_math = matches!(&constants[k_idx], Constant::String(sid) if {
+                                self.strings.get_bytes(*sid) == b"math"
+                            });
+                            if is_math {
+                                pending_math_reg = Some(a);
+                            } else {
+                                pending_math_reg = None;
+                            }
+                        } else {
+                            pending_math_reg = None;
+                        }
+                        builtin_regs.remove(&a);
+                    }
+                    OpCode::GetField => {
+                        let a = inst.a() as usize;
+                        let b = inst.b() as usize;
+                        // If we just loaded "math" into R[b] and now GetField R[a], R[b], K[name]
+                        if Some(b) == pending_math_reg {
+                            let k_name_idx = inst.c() as usize;
+                            if k_name_idx < constants.len() {
+                                let specific_builtin = if let Constant::String(sid) = &constants[k_name_idx] {
+                                    let name_bytes = self.strings.get_bytes(*sid);
+                                    builtin_names.iter()
+                                        .find(|&&(n, _)| n == name_bytes)
+                                        .and_then(|&(_, id)| {
+                                            id_to_bits.get(&id).map(|&bits| vec![(id, bits)])
+                                        })
+                                } else {
+                                    None
+                                };
+                                if let Some(candidates) = specific_builtin {
+                                    builtin_regs.insert(a, candidates);
+                                } else {
+                                    builtin_regs.remove(&a);
+                                }
+                            } else {
+                                builtin_regs.remove(&a);
+                            }
+                        } else {
+                            builtin_regs.remove(&a);
+                        }
+                        pending_math_reg = None;
+                    }
+                    OpCode::Move => {
+                        let a = inst.a() as usize;
+                        let b = inst.b() as usize;
+                        // Propagate builtin knowledge through Move
+                        if let Some(candidates) = builtin_regs.get(&b).cloned() {
+                            builtin_regs.insert(a, candidates);
+                        } else {
+                            builtin_regs.remove(&a);
+                        }
+                        // Move doesn't clear pending_math_reg unless it overwrites it
+                        if pending_math_reg == Some(a) && a != b {
+                            pending_math_reg = None;
+                        }
+                    }
+                    OpCode::Call => {
+                        let a = inst.a() as usize;
+                        let b = inst.b() as usize;
+                        // Only for single-arg calls (b=2) where the function may be a builtin
+                        if b == 2 && !self.builtin_inlines.contains_key(&pc) {
+                            if let Some(candidates) = builtin_regs.get(&a) {
+                                self.builtin_inlines.insert(pc, candidates.clone());
+                            }
+                        }
+                        // Call clobbers R[a], clear it
+                        builtin_regs.remove(&a);
+                        pending_math_reg = None;
+                    }
+                    _ => {
+                        let a = inst.a() as usize;
+                        // Most instructions write to R[a]; clear builtin tracking.
+                        match op {
+                            OpCode::Test | OpCode::SetTabUp | OpCode::SetList
+                            | OpCode::SetField | OpCode::SetI | OpCode::SetTable
+                            | OpCode::Jmp | OpCode::ForLoop | OpCode::TForCall
+                            | OpCode::Return | OpCode::Return0 | OpCode::Return1
+                            | OpCode::TailCall | OpCode::ExtraArg | OpCode::MMBin
+                            | OpCode::MMBinI | OpCode::MMBinK => {}
+                            _ => { builtin_regs.remove(&a); }
+                        }
+                        if op != OpCode::GetTabUp && op != OpCode::GetField {
+                            pending_math_reg = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn pre_analyze_types(&mut self) {
         let code = &self.proto.code;
         // Track the last load type for each slot sequentially.
@@ -2779,30 +3290,35 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         continue;
                     }
 
-                    // Flush and invalidate before call that may trigger Lua code
-                    self.flush_and_invalidate_cache();
-                    let func_off = self.builder.ins().iconst(types::I64, a);
-                    let nargs_val = self.builder.ins().iconst(types::I64, nargs);
-                    let nresults_val = self.builder.ins().iconst(types::I64, nresults);
-                    let call = self.builder.ins().call(
-                        self.call_fast_ref,
-                        &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    // call may resize stack → reload pointer
-                    self.reload_stack_base();
-                    // Check for SIDE_EXIT (cache already flushed above)
-                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
-                    let is_exit =
+                    // Check for builtin inline opportunity
+                    if let Some(candidates) = self.builtin_inlines.remove(&pc) {
+                        self.emit_builtin_inline_call(a, nargs, nresults, &candidates);
+                    } else {
+                        // Generic call path
+                        self.flush_and_invalidate_cache();
+                        let func_off = self.builder.ins().iconst(types::I64, a);
+                        let nargs_val = self.builder.ins().iconst(types::I64, nargs);
+                        let nresults_val = self.builder.ins().iconst(types::I64, nresults);
+                        let call = self.builder.ins().call(
+                            self.call_fast_ref,
+                            &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        // call may resize stack → reload pointer
+                        self.reload_stack_base();
+                        // Check for SIDE_EXIT (cache already flushed above)
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, result, exit_val);
+                        let cont = self.builder.create_block();
                         self.builder
                             .ins()
-                            .icmp(IntCC::Equal, result, exit_val);
-                    let cont = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
-                    self.builder.switch_to_block(cont);
-                    self.builder.seal_block(cont);
+                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                    }
                 }
 
                 OpCode::Self_ => {
@@ -2817,30 +3333,85 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     } else {
                         self.cached_get_slot(c)
                     };
-                    // Flush and invalidate before runtime helper that may trigger Lua code
-                    // (Self_ helper writes R[A+1] and R[A] directly to stack)
-                    self.flush_and_invalidate_cache();
-                    let a_val = self.builder.ins().iconst(types::I64, a);
-                    let b_val = self.builder.ins().iconst(types::I64, b);
-                    let call = self.builder.ins().call(
-                        self.self_fast_ref,
-                        &[self.vm_ptr, self.base, a_val, b_val, key],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    // Self_ may call table_index → may trigger metamethods
-                    self.reload_stack_base();
-                    // Check for SIDE_EXIT (cache already flushed above)
-                    let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
-                    let is_exit =
+
+                    if let Some(&ic_ptr) = self.self_ic_ptrs.get(&pc) {
+                        // IC-enabled path: fast probe + slow fallback
+                        // Step 1: Load R[B] and store R[A+1] = R[B] (inline)
+                        let table_val = self.cached_get_slot(b);
+                        self.cached_set_slot((a + 1) as i64, table_val);
+
+                        // Step 2: Flush cache — the miss path writes directly to stack
+                        self.flush_and_invalidate_cache();
+
+                        // Step 3: IC probe — returns method bits on hit, 0 on miss
+                        let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
+                        let probe_call = self.builder.ins().call(
+                            self.self_ic_check_ref,
+                            &[self.vm_ptr, table_val, ic_val],
+                        );
+                        let method_bits = self.builder.inst_results(probe_call)[0];
+                        // ic_check doesn't allocate → no need to reload_stack_base
+
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let is_hit = self.builder.ins().icmp(IntCC::NotEqual, method_bits, zero);
+
+                        let ic_hit_block = self.builder.create_block();
+                        let ic_miss_block = self.builder.create_block();
+                        let cont = self.builder.create_block();
+
                         self.builder
                             .ins()
-                            .icmp(IntCC::Equal, result, exit_val);
-                    let cont = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(is_exit, self.side_exit_block, &[], cont, &[]);
-                    self.builder.switch_to_block(cont);
-                    self.builder.seal_block(cont);
+                            .brif(is_hit, ic_hit_block, &[], ic_miss_block, &[]);
+
+                        // IC HIT: store cached method to R[A]
+                        self.builder.switch_to_block(ic_hit_block);
+                        self.builder.seal_block(ic_hit_block);
+                        self.emit_set_slot(a as i64, method_bits);
+                        self.builder.ins().jump(cont, &[]);
+
+                        // IC MISS: call full jit_rt_self_ic
+                        self.builder.switch_to_block(ic_miss_block);
+                        self.builder.seal_block(ic_miss_block);
+                        let a_val = self.builder.ins().iconst(types::I64, a);
+                        let b_val = self.builder.ins().iconst(types::I64, b);
+                        let miss_call = self.builder.ins().call(
+                            self.self_ic_ref,
+                            &[self.vm_ptr, self.base, a_val, b_val, key, ic_val],
+                        );
+                        let miss_result = self.builder.inst_results(miss_call)[0];
+                        // Miss path may trigger metamethods → reload stack base
+                        self.reload_stack_base();
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit = self.builder.ins().icmp(IntCC::Equal, miss_result, exit_val);
+                        self.builder
+                            .ins()
+                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                    } else {
+                        // Non-IC path: call jit_rt_self_fast
+                        self.flush_and_invalidate_cache();
+                        let a_val = self.builder.ins().iconst(types::I64, a);
+                        let b_val = self.builder.ins().iconst(types::I64, b);
+                        let call = self.builder.ins().call(
+                            self.self_fast_ref,
+                            &[self.vm_ptr, self.base, a_val, b_val, key],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, result, exit_val);
+                        let cont = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                    }
                 }
 
                 OpCode::GetTable => {
@@ -5897,6 +6468,515 @@ mod tests {
         );
         let f = results[0].as_float().unwrap();
         assert!((f - 2.5).abs() < 1e-10, "expected 2.5, got {f}");
+    }
+
+    // --- Builtin inlining tests ---
+
+    /// Helper: run Lua source with JIT + builtin inlining enabled.
+    fn run_lua_with_jit_builtins(source: &str, jit_threshold: u32) -> Vec<TValue> {
+        let init_source = b"";
+        let (proto, strings) = compile(init_source, "=(init)").unwrap();
+        let mut vm = Vm::new();
+        let _ = vm.execute(&proto, strings);
+
+        // Enable JIT with builtin inlining
+        fn test_jit_builtin_hook(vm: &mut Vm, proto_idx: usize) {
+            use std::cell::RefCell;
+            thread_local! {
+                static HOOK_JIT: RefCell<Option<JitCompiler>> = RefCell::new(None);
+            }
+            HOOK_JIT.with(|cell| {
+                let mut opt = cell.borrow_mut();
+                if opt.is_none() {
+                    *opt = JitCompiler::new().ok();
+                }
+                if let Some(jit) = opt.as_mut() {
+                    if let Ok(jit_fn) = jit.compile_proto_with_builtins(
+                        &vm.protos[proto_idx],
+                        &mut vm.gc,
+                        proto_idx,
+                        &vm.builtin_natives,
+                        &vm.strings,
+                        &HashMap::new(),
+                    ) {
+                        vm.jit_register(proto_idx, jit_fn);
+                    }
+                }
+            });
+        }
+        vm.jit_enabled = true;
+        vm.jit_threshold = jit_threshold;
+        vm.jit_compile_callback = Some(test_jit_builtin_hook);
+
+        let closure_val = vm.load_chunk(source.as_bytes(), "=test", None).unwrap();
+        selune_vm::dispatch::call_function(&mut vm, closure_val, &[]).unwrap()
+    }
+
+    #[test]
+    fn test_builtin_sqrt_inline() {
+        // math.sqrt(4.0) == 2.0, called in a loop to trigger JIT
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local sum = 0.0
+                for i = 1, 2000 do
+                    sum = sum + math.sqrt(4.0)
+                end
+                return sum
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 4000.0).abs() < 1e-6, "expected 4000.0, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_abs_float_inline() {
+        // math.abs(-3.14) == 3.14
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.abs(-3.14)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 3.14).abs() < 1e-10, "expected 3.14, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_abs_integer_fallback() {
+        // math.abs(-42) should work (falls to generic path for int args)
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.abs(-42)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 42, "expected 42, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_floor_inline() {
+        // math.floor(3.7) == 3 (returns integer)
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.floor(3.7)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 3, "expected 3, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_ceil_inline() {
+        // math.ceil(3.2) == 4 (returns integer)
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.ceil(3.2)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 4, "expected 4, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_sin_inline() {
+        // math.sin(0.0) == 0.0
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.sin(0.0)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!(f.abs() < 1e-15, "expected 0.0, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_cos_inline() {
+        // math.cos(0.0) == 1.0
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.cos(0.0)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 1.0).abs() < 1e-15, "expected 1.0, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_guard_failure() {
+        // Override math.sqrt, guard should fail and use generic path
+        let results = run_lua_with_jit_builtins(
+            "math.sqrt = function(x) return x * 2 end
+            local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.sqrt(4.0)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 8.0).abs() < 1e-10, "expected 8.0 (custom sqrt), got {f}");
+    }
+
+    #[test]
+    fn test_builtin_floor_negative() {
+        // math.floor(-3.7) == -4
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.floor(-3.7)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, -4, "expected -4, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_ceil_negative() {
+        // math.ceil(-3.2) == -3
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.ceil(-3.2)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, -3, "expected -3, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_sqrt_accumulate() {
+        // Sum of sqrt(i) for i = 1.0 to 100.0 — verifies correctness in a real loop
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local sum = 0.0
+                for i = 1, 2000 do
+                    sum = sum + math.sqrt(i * 1.0)
+                end
+                return sum
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        // Expected: sum of sqrt(1) + sqrt(2) + ... + sqrt(2000)
+        let expected: f64 = (1..=2000).map(|i| (i as f64).sqrt()).sum();
+        assert!((f - expected).abs() < 1e-6, "expected {expected}, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_sin_pi() {
+        // math.sin(math.pi) should be very close to 0
+        let results = run_lua_with_jit_builtins(
+            "local function f()
+                local r
+                for i = 1, 2000 do
+                    r = math.sin(math.pi)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!(f.abs() < 1e-14, "expected ~0, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_sqrt_upvalue_inline() {
+        // sqrt captured as upvalue: `local sqrt = math.sqrt; function f() ... sqrt(x) ... end`
+        let results = run_lua_with_jit_builtins(
+            "local sqrt = math.sqrt
+            local function f()
+                local sum = 0.0
+                for i = 1, 2000 do
+                    sum = sum + sqrt(4.0)
+                end
+                return sum
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 4000.0).abs() < 1e-6, "expected 4000.0, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_abs_upvalue_inline() {
+        // abs captured as upvalue
+        let results = run_lua_with_jit_builtins(
+            "local abs = math.abs
+            local function f()
+                local r
+                for i = 1, 2000 do
+                    r = abs(-3.14)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 3.14).abs() < 1e-10, "expected 3.14, got {f}");
+    }
+
+    #[test]
+    fn test_builtin_floor_upvalue_inline() {
+        // floor captured as upvalue, should return integer
+        let results = run_lua_with_jit_builtins(
+            "local floor = math.floor
+            local function f()
+                local r
+                for i = 1, 2000 do
+                    r = floor(3.7)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 3, "expected 3, got {i}");
+    }
+
+    #[test]
+    fn test_builtin_guard_failure_upvalue() {
+        // Reassigned builtin captured as upvalue - guard must fail, generic path handles it
+        let results = run_lua_with_jit_builtins(
+            "local my_fn = function(x) return x * 2 end
+            local function f()
+                local r
+                for i = 1, 2000 do
+                    r = my_fn(5.0)
+                end
+                return r
+            end
+            return f()",
+            1,
+        );
+        let f = results[0].as_float().unwrap();
+        assert!((f - 10.0).abs() < 1e-10, "expected 10.0, got {f}");
+    }
+
+    // =====================================================================
+    // Self_ Inline Cache (IC) tests
+    // =====================================================================
+
+    /// Helper: run Lua source with JIT + IC enabled. Uses low threshold so hot
+    /// inner functions get JIT-compiled with Self_ IC entries allocated.
+    fn run_lua_with_jit_ic(source: &str, jit_threshold: u32) -> Vec<TValue> {
+        let init_source = b"";
+        let (proto, strings) = compile(init_source, "=(init)").unwrap();
+        let mut vm = Vm::new();
+        let _ = vm.execute(&proto, strings);
+
+        fn test_jit_ic_hook(vm: &mut Vm, proto_idx: usize) {
+            use selune_compiler::opcode::OpCode;
+            use std::cell::RefCell;
+            thread_local! {
+                static HOOK_JIT: RefCell<Option<JitCompiler>> = RefCell::new(None);
+            }
+            // Allocate IC entries for Self_ sites with constant keys
+            let self_pcs: Vec<usize> = vm.protos[proto_idx]
+                .code
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| inst.opcode() == OpCode::Self_ && inst.k())
+                .map(|(pc, _)| pc)
+                .collect();
+            let mut ic_ptrs = HashMap::new();
+            for pc in self_pcs {
+                let ptr = vm.jit_get_or_create_self_ic(proto_idx, pc);
+                ic_ptrs.insert(pc, ptr as u64);
+            }
+
+            HOOK_JIT.with(|cell| {
+                let mut opt = cell.borrow_mut();
+                if opt.is_none() {
+                    *opt = JitCompiler::new().ok();
+                }
+                if let Some(jit) = opt.as_mut() {
+                    if let Ok(jit_fn) = jit.compile_proto_with_builtins(
+                        &vm.protos[proto_idx],
+                        &mut vm.gc,
+                        proto_idx,
+                        &vm.builtin_natives,
+                        &vm.strings,
+                        &ic_ptrs,
+                    ) {
+                        vm.jit_register(proto_idx, jit_fn);
+                    }
+                }
+            });
+        }
+        vm.jit_enabled = true;
+        vm.jit_threshold = jit_threshold;
+        vm.jit_compile_callback = Some(test_jit_ic_hook);
+
+        let closure_val = vm.load_chunk(source.as_bytes(), "=test", None).unwrap();
+        selune_vm::dispatch::call_function(&mut vm, closure_val, &[]).unwrap()
+    }
+
+    #[test]
+    fn test_self_ic_basic_method_call() {
+        // Basic method call: single object, single method, IC should hit after first miss
+        let results = run_lua_with_jit_ic(
+            "local Cls = {}
+            Cls.__index = Cls
+            function Cls:foo() return 42 end
+            local obj = setmetatable({}, Cls)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + obj:foo() end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 42 * 2000, "expected {}, got {i}", 42 * 2000);
+    }
+
+    #[test]
+    fn test_self_ic_two_objects_same_metatable() {
+        // Two objects sharing the same metatable — both should hit IC
+        let results = run_lua_with_jit_ic(
+            "local Cls = {}
+            Cls.__index = Cls
+            function Cls:foo() return 10 end
+            local a = setmetatable({}, Cls)
+            local b = setmetatable({}, Cls)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do
+                    s = s + a:foo() + b:foo()
+                end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 20 * 2000, "expected {}, got {i}", 20 * 2000);
+    }
+
+    #[test]
+    fn test_self_ic_method_override_on_instance() {
+        // Instance overrides a method with a raw field — raw lookup should find it,
+        // bypassing the IC fast path (which caches from __index).
+        let results = run_lua_with_jit_ic(
+            "local Cls = {}
+            Cls.__index = Cls
+            function Cls:foo() return 10 end
+            local obj = setmetatable({}, Cls)
+            -- Override on instance
+            obj.foo = function(self) return 99 end
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + obj:foo() end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 99 * 2000, "expected {}, got {i}", 99 * 2000);
+    }
+
+    #[test]
+    fn test_self_ic_invalidation() {
+        // IC invalidation: modify the class table after IC is populated.
+        // The version changes, IC misses, and re-resolves correctly.
+        let results = run_lua_with_jit_ic(
+            "local Cls = {}
+            Cls.__index = Cls
+            function Cls:foo() return 10 end
+            local obj = setmetatable({}, Cls)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + obj:foo() end
+                return s
+            end
+            -- First call: IC populates with foo=10
+            local r1 = f()
+            -- Modify class table: IC should invalidate
+            Cls.foo = function(self) return 20 end
+            -- Second call: IC re-resolves, now returns 20
+            local r2 = f()
+            return r1, r2",
+            1,
+        );
+        let r1 = results[0].as_integer().unwrap();
+        let r2 = results[1].as_integer().unwrap();
+        assert_eq!(r1, 10 * 2000, "first run: expected {}, got {r1}", 10 * 2000);
+        assert_eq!(r2, 20 * 2000, "second run: expected {}, got {r2}", 20 * 2000);
+    }
+
+    #[test]
+    fn test_self_ic_no_metatable() {
+        // No metatable: method is a direct field on the table.
+        // IC doesn't apply (no metatable → IC miss), but Self_ must still work.
+        let results = run_lua_with_jit_ic(
+            "local obj = { foo = function(self) return 7 end }
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + obj:foo() end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 7 * 2000, "expected {}, got {i}", 7 * 2000);
     }
 }
 

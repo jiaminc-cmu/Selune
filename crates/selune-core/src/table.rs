@@ -26,15 +26,48 @@ pub struct Table {
     hash: IndexMap<TableKey, TValue>,
     /// Metatable (if any).
     pub metatable: Option<GcIdx<Table>>,
+    /// Version counter: incremented on any hash mutation. Used by JIT inline caches
+    /// to detect when a table's contents have changed.
+    pub version: u32,
+    /// Shape version: incremented only when new keys are inserted into the hash part.
+    /// This does NOT increment on value updates to existing keys.
+    /// Used by JIT inline caches to skip raw lookups when the key set hasn't changed.
+    pub shape_version: u32,
 }
 
 impl Table {
+    /// Byte offset of the `metatable` field within Table.
+    /// Used by JIT to load metatable directly from a table pointer.
+    pub fn metatable_offset() -> usize {
+        std::mem::offset_of!(Table, metatable)
+    }
+
+    /// Byte offset of the `version` field within Table.
+    /// Used by JIT to load version directly from a table pointer.
+    pub fn version_offset() -> usize {
+        std::mem::offset_of!(Table, version)
+    }
+
+    /// Byte offset of the `shape_version` field within Table.
+    /// Used by JIT to check if new keys were inserted (for IC instance check).
+    pub fn shape_version_offset() -> usize {
+        std::mem::offset_of!(Table, shape_version)
+    }
+
+    /// Get metatable index as u32 (for JIT IC checks). Returns u32::MAX if no metatable.
+    #[inline]
+    pub fn metatable_raw(&self) -> u32 {
+        self.metatable.map_or(u32::MAX, |idx| idx.0)
+    }
+
     /// Create a new empty table with size hints.
     pub fn new(array_hint: usize, hash_hint: usize) -> Self {
         Table {
             array: Vec::with_capacity(array_hint),
             hash: IndexMap::with_capacity(hash_hint),
             metatable: None,
+            version: 0,
+            shape_version: 0,
         }
     }
 
@@ -123,8 +156,12 @@ impl Table {
                 self.hash.insert(tk, value);
             }
         } else {
-            self.hash.insert(tk, value);
+            let old = self.hash.insert(tk, value);
+            if old.is_none() {
+                self.shape_version = self.shape_version.wrapping_add(1);
+            }
         }
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -155,10 +192,16 @@ impl Table {
             }
         }
         if value.is_nil() {
-            self.hash.shift_remove(&TableKey::Integer(key));
+            if self.hash.shift_remove(&TableKey::Integer(key)).is_some() {
+                self.shape_version = self.shape_version.wrapping_add(1);
+            }
         } else {
-            self.hash.insert(TableKey::Integer(key), value);
+            let old = self.hash.insert(TableKey::Integer(key), value);
+            if old.is_none() {
+                self.shape_version = self.shape_version.wrapping_add(1);
+            }
         }
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Fast string key get.
@@ -172,10 +215,17 @@ impl Table {
     /// Fast string key set.
     pub fn raw_set_str(&mut self, key: StringId, value: TValue) {
         if value.is_nil() {
-            self.hash.shift_remove(&TableKey::String(key));
+            if self.hash.shift_remove(&TableKey::String(key)).is_some() {
+                self.shape_version = self.shape_version.wrapping_add(1);
+            }
         } else {
-            self.hash.insert(TableKey::String(key), value);
+            // insert() returns None if key was new, Some(old_value) if already existed
+            let old = self.hash.insert(TableKey::String(key), value);
+            if old.is_none() {
+                self.shape_version = self.shape_version.wrapping_add(1);
+            }
         }
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Get the "length" of a table (boundary for array part).
