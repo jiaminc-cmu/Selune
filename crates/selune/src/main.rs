@@ -194,15 +194,49 @@ fn allocate_self_ic_entries(vm: &mut Vm, proto_idx: usize) -> HashMap<usize, u64
     ic_ptrs
 }
 
+/// Scan a proto for GetField/SetField sites with string constant keys and allocate IC entries.
+/// Returns a map of pc → IC entry pointer (as u64) for use by the JIT compiler.
+fn allocate_field_ic_entries(vm: &mut Vm, proto_idx: usize) -> HashMap<usize, u64> {
+    let field_pcs: Vec<usize> = vm.protos[proto_idx]
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| {
+            let op = inst.opcode();
+            if op == OpCode::GetField {
+                matches!(
+                    vm.protos[proto_idx].constants.get(inst.c() as usize),
+                    Some(selune_compiler::proto::Constant::String(_))
+                )
+            } else if op == OpCode::SetField {
+                matches!(
+                    vm.protos[proto_idx].constants.get(inst.b() as usize),
+                    Some(selune_compiler::proto::Constant::String(_))
+                )
+            } else {
+                false
+            }
+        })
+        .map(|(pc, _)| pc)
+        .collect();
+    let mut ic_ptrs = HashMap::new();
+    for pc in field_pcs {
+        let ptr = vm.jit_get_or_create_field_ic(proto_idx, pc);
+        ic_ptrs.insert(pc, ptr as u64);
+    }
+    ic_ptrs
+}
+
 fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
     let self_ic_ptrs = allocate_self_ic_entries(vm, proto_idx);
+    let field_ic_ptrs = allocate_field_ic_entries(vm, proto_idx);
     JIT_COMPILER.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
             *opt = JitCompiler::new().ok();
         }
         if let Some(jit) = opt.as_mut() {
-            match jit.compile_proto_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, &vm.builtin_natives, &vm.strings, &self_ic_ptrs) {
+            match jit.compile_proto_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, &vm.builtin_natives, &vm.strings, &self_ic_ptrs, &field_ic_ptrs) {
                 Ok(jit_fn) => {
                     vm.jit_register(proto_idx, jit_fn);
                 }
@@ -214,13 +248,14 @@ fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
 
 fn jit_compile_osr_hook(vm: &mut Vm, proto_idx: usize, entry_pc: usize) {
     let self_ic_ptrs = allocate_self_ic_entries(vm, proto_idx);
+    let field_ic_ptrs = allocate_field_ic_entries(vm, proto_idx);
     JIT_COMPILER.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
             *opt = JitCompiler::new().ok();
         }
         if let Some(jit) = opt.as_mut() {
-            match jit.compile_proto_osr_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, entry_pc, &vm.builtin_natives, &vm.strings, &self_ic_ptrs) {
+            match jit.compile_proto_osr_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, entry_pc, &vm.builtin_natives, &vm.strings, &self_ic_ptrs, &field_ic_ptrs) {
                 Ok(jit_fn) => {
                     vm.jit_osr_functions.insert((proto_idx, entry_pc), jit_fn);
                 }

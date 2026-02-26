@@ -33,6 +33,11 @@ pub struct Table {
     /// This does NOT increment on value updates to existing keys.
     /// Used by JIT inline caches to skip raw lookups when the key set hasn't changed.
     pub shape_version: u32,
+    // --- JIT inline access cache (avoids reaching into Vec internals) ---
+    /// Cached array data pointer (array.as_ptr() as usize). Updated on array mutations.
+    pub array_data_ptr: usize,
+    /// Cached array length. Updated on array mutations.
+    pub array_len: usize,
 }
 
 impl Table {
@@ -60,14 +65,35 @@ impl Table {
         self.metatable.map_or(u32::MAX, |idx| idx.0)
     }
 
+    /// Byte offset of `array_data_ptr` field. Used by JIT for inline GetI.
+    pub fn array_data_ptr_offset() -> usize {
+        std::mem::offset_of!(Table, array_data_ptr)
+    }
+
+    /// Byte offset of `array_len` field. Used by JIT for inline GetI.
+    pub fn array_len_offset() -> usize {
+        std::mem::offset_of!(Table, array_len)
+    }
+
+    /// Sync cached array pointer and length after any array mutation.
+    #[inline(always)]
+    pub fn sync_array_cache(&mut self) {
+        self.array_data_ptr = self.array.as_ptr() as usize;
+        self.array_len = self.array.len();
+    }
+
     /// Create a new empty table with size hints.
     pub fn new(array_hint: usize, hash_hint: usize) -> Self {
+        let array = Vec::with_capacity(array_hint);
+        let array_data_ptr = array.as_ptr() as usize;
         Table {
-            array: Vec::with_capacity(array_hint),
+            array,
             hash: IndexMap::with_capacity(hash_hint),
             metatable: None,
             version: 0,
             shape_version: 0,
+            array_data_ptr,
+            array_len: 0,
         }
     }
 
@@ -228,6 +254,28 @@ impl Table {
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Get field by IndexMap index (O(1)). Returns Some((key, value)) or None.
+    /// Used by field IC for direct indexed access without hash lookup.
+    #[inline]
+    pub fn hash_get_index(&self, index: usize) -> Option<(&TableKey, &TValue)> {
+        self.hash.get_index(index)
+    }
+
+    /// Set field by IndexMap index (O(1) overwrite). Returns true if key matches.
+    /// Caller is responsible for incrementing version.
+    #[inline]
+    pub fn hash_get_index_mut(&mut self, index: usize) -> Option<(&TableKey, &mut TValue)> {
+        self.hash.get_index_mut(index)
+    }
+
+    /// Get full (index, key, value) for a hash key. Used by field IC miss to populate the cache.
+    #[inline]
+    pub fn hash_get_full_str(&self, key: StringId) -> Option<(usize, &TValue)> {
+        self.hash
+            .get_full(&TableKey::String(key))
+            .map(|(idx, _, val)| (idx, val))
+    }
+
     /// Get the "length" of a table (boundary for array part).
     /// Returns the largest n such that t[n] is non-nil and t[n+1] is nil.
     pub fn length(&self) -> i64 {
@@ -333,6 +381,7 @@ impl Table {
                 break;
             }
         }
+        self.sync_array_cache();
     }
 
     /// Clear weak entries: remove entries with dead keys/values.
@@ -352,6 +401,7 @@ impl Table {
             while self.array.last().is_some_and(|v| v.is_nil()) {
                 self.array.pop();
             }
+            self.sync_array_cache();
         }
         // Clear dead keys/values in hash part
         let mut to_remove = Vec::new();
@@ -391,6 +441,7 @@ impl Table {
         while self.array.last().is_some_and(|v| v.is_nil()) {
             self.array.pop();
         }
+        self.sync_array_cache();
     }
 
     /// Iterate over all key-value pairs in the hash part (for GC traversal).

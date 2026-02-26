@@ -12,6 +12,7 @@ use selune_compiler::opcode::OpCode;
 use selune_compiler::proto::{Constant, Proto};
 use selune_core::gc::GcHeap;
 use selune_core::string::StringInterner;
+use selune_core::table::Table;
 use selune_core::value::{self, TValue};
 use selune_vm::vm::{BuiltinId, Vm};
 
@@ -158,6 +159,14 @@ impl JitCompiler {
         builder.symbol(
             "jit_rt_set_field_str",
             runtime::jit_rt_set_field_str as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_get_field_ic",
+            runtime::jit_rt_get_field_ic as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_set_field_ic",
+            runtime::jit_rt_set_field_ic as *const u8,
         );
         builder.symbol("jit_rt_geti", runtime::jit_rt_geti as *const u8);
         builder.symbol("jit_rt_seti", runtime::jit_rt_seti as *const u8);
@@ -329,7 +338,7 @@ impl JitCompiler {
     ) -> Result<JitFunction, JitError> {
         // Dummy interner - not used when builtin_natives is empty
         let dummy = StringInterner::new();
-        self.compile_proto_inner(proto, gc, proto_idx, None, &HashMap::new(), &dummy, &HashMap::new())
+        self.compile_proto_inner(proto, gc, proto_idx, None, &HashMap::new(), &dummy, &HashMap::new(), &HashMap::new())
     }
 
     /// Compile with builtin inlining support.
@@ -341,8 +350,9 @@ impl JitCompiler {
         builtin_natives: &HashMap<u64, BuiltinId>,
         strings: &StringInterner,
         self_ic_ptrs: &HashMap<usize, u64>,
+        field_ic_ptrs: &HashMap<usize, u64>,
     ) -> Result<JitFunction, JitError> {
-        self.compile_proto_inner(proto, gc, proto_idx, None, builtin_natives, strings, self_ic_ptrs)
+        self.compile_proto_inner(proto, gc, proto_idx, None, builtin_natives, strings, self_ic_ptrs, field_ic_ptrs)
     }
 
     /// Compile an OSR (On-Stack Replacement) variant of a proto.
@@ -356,7 +366,7 @@ impl JitCompiler {
         entry_pc: usize,
     ) -> Result<JitFunction, JitError> {
         let dummy = StringInterner::new();
-        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), &HashMap::new(), &dummy, &HashMap::new())
+        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), &HashMap::new(), &dummy, &HashMap::new(), &HashMap::new())
     }
 
     /// Compile an OSR variant with builtin inlining support.
@@ -369,8 +379,9 @@ impl JitCompiler {
         builtin_natives: &HashMap<u64, BuiltinId>,
         strings: &StringInterner,
         self_ic_ptrs: &HashMap<usize, u64>,
+        field_ic_ptrs: &HashMap<usize, u64>,
     ) -> Result<JitFunction, JitError> {
-        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), builtin_natives, strings, self_ic_ptrs)
+        self.compile_proto_inner(proto, gc, proto_idx, Some(entry_pc), builtin_natives, strings, self_ic_ptrs, field_ic_ptrs)
     }
 
     fn compile_proto_inner(
@@ -382,6 +393,7 @@ impl JitCompiler {
         builtin_natives: &HashMap<u64, BuiltinId>,
         strings: &StringInterner,
         self_ic_ptrs: &HashMap<usize, u64>,
+        field_ic_ptrs: &HashMap<usize, u64>,
     ) -> Result<JitFunction, JitError> {
         // First pass: check all opcodes are supported (except MMBin* which are skipped)
         let mut skip_next = false;
@@ -668,6 +680,26 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_set_field_str", Linkage::Import, &set_field_str_sig)?;
 
+        // jit_rt_get_field_ic(vm_ptr, table_bits, string_id, ic_ptr) -> u64
+        let mut get_field_ic_sig = Signature::new(call_conv);
+        for _ in 0..4 {
+            get_field_ic_sig.params.push(AbiParam::new(types::I64));
+        }
+        get_field_ic_sig.returns.push(AbiParam::new(types::I64));
+        let get_field_ic_id = self
+            .module
+            .declare_function("jit_rt_get_field_ic", Linkage::Import, &get_field_ic_sig)?;
+
+        // jit_rt_set_field_ic(vm_ptr, table_bits, string_id, val_bits, ic_ptr) -> i64
+        let mut set_field_ic_sig = Signature::new(call_conv);
+        for _ in 0..5 {
+            set_field_ic_sig.params.push(AbiParam::new(types::I64));
+        }
+        set_field_ic_sig.returns.push(AbiParam::new(types::I64));
+        let set_field_ic_id = self
+            .module
+            .declare_function("jit_rt_set_field_ic", Linkage::Import, &set_field_ic_sig)?;
+
         // jit_rt_geti(vm_ptr, table_bits, index) -> u64
         let mut geti_sig = Signature::new(call_conv);
         geti_sig.params.push(AbiParam::new(types::I64));
@@ -874,6 +906,8 @@ impl JitCompiler {
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
             let get_field_str_ref = self.module.declare_func_in_func(get_field_str_id, builder.func);
             let set_field_str_ref = self.module.declare_func_in_func(set_field_str_id, builder.func);
+            let get_field_ic_ref = self.module.declare_func_in_func(get_field_ic_id, builder.func);
+            let set_field_ic_ref = self.module.declare_func_in_func(set_field_ic_id, builder.func);
             let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
             let seti_ref = self.module.declare_func_in_func(seti_id, builder.func);
             let len_ref = self.module.declare_func_in_func(len_id, builder.func);
@@ -972,6 +1006,8 @@ impl JitCompiler {
                 tbl_ni_ref,
                 get_field_str_ref,
                 set_field_str_ref,
+                get_field_ic_ref,
+                set_field_ic_ref,
                 geti_ref,
                 seti_ref,
                 len_ref,
@@ -998,6 +1034,7 @@ impl JitCompiler {
                 libm_sin_ref,
                 libm_cos_ref,
                 self_ic_ptrs,
+                field_ic_ptrs,
             };
 
             // Pre-analyze builtin call sites for inline emission
@@ -1281,6 +1318,8 @@ struct BytecodeEmitter<'a, 'b> {
     tbl_ni_ref: FuncRef,
     get_field_str_ref: FuncRef,
     set_field_str_ref: FuncRef,
+    get_field_ic_ref: FuncRef,
+    set_field_ic_ref: FuncRef,
     geti_ref: FuncRef,
     seti_ref: FuncRef,
     len_ref: FuncRef,
@@ -1321,6 +1360,8 @@ struct BytecodeEmitter<'a, 'b> {
     libm_cos_ref: FuncRef,
     /// Per-Self_ IC entry pointers: pc → raw pointer to SelfIcEntry (as u64).
     self_ic_ptrs: &'a HashMap<usize, u64>,
+    /// Per-GetField/SetField IC entry pointers: pc → raw pointer to FieldIcEntry (as u64).
+    field_ic_ptrs: &'a HashMap<usize, u64>,
 }
 
 impl<'a, 'b> BytecodeEmitter<'a, 'b> {
@@ -3535,16 +3576,29 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let c = inst.c() as usize;
                     let table_val = self.cached_get_slot(b);
                     self.flush_and_invalidate_cache();
-                    // Use fast string-keyed helper when key is a string constant
                     if let Constant::String(sid) = &self.proto.constants[c] {
-                        let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
-                        let call = self.builder.ins().call(
-                            self.get_field_str_ref,
-                            &[self.vm_ptr, table_val, sid_val],
-                        );
-                        let result = self.builder.inst_results(call)[0];
-                        self.reload_stack_base();
-                        self.cached_set_slot(a, result);
+                        if let Some(&ic_ptr) = self.field_ic_ptrs.get(&pc) {
+                            // Field IC path: single combined call (IC check + fallback)
+                            let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
+                            let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
+                            let call = self.builder.ins().call(
+                                self.get_field_ic_ref,
+                                &[self.vm_ptr, table_val, sid_val, ic_val],
+                            );
+                            let result = self.builder.inst_results(call)[0];
+                            self.reload_stack_base();
+                            self.cached_set_slot(a, result);
+                        } else {
+                            // No IC: use fast string helper
+                            let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
+                            let call = self.builder.ins().call(
+                                self.get_field_str_ref,
+                                &[self.vm_ptr, table_val, sid_val],
+                            );
+                            let result = self.builder.inst_results(call)[0];
+                            self.reload_stack_base();
+                            self.cached_set_slot(a, result);
+                        }
                     } else {
                         let key_raw = self
                             .constant_to_raw_bits(&self.proto.constants[c]);
@@ -3577,11 +3631,21 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // Use fast string-keyed helper when key is a string constant
                     if let Constant::String(sid) = &self.proto.constants[b] {
                         let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
-                        let call = self.builder.ins().call(
-                            self.set_field_str_ref,
-                            &[self.vm_ptr, table_val, sid_val, val],
-                        );
-                        let result = self.builder.inst_results(call)[0];
+                        // Use IC-accelerated helper if IC pointer available
+                        let result = if let Some(&ic_ptr) = self.field_ic_ptrs.get(&pc) {
+                            let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
+                            let call = self.builder.ins().call(
+                                self.set_field_ic_ref,
+                                &[self.vm_ptr, table_val, sid_val, val, ic_val],
+                            );
+                            self.builder.inst_results(call)[0]
+                        } else {
+                            let call = self.builder.ins().call(
+                                self.set_field_str_ref,
+                                &[self.vm_ptr, table_val, sid_val, val],
+                            );
+                            self.builder.inst_results(call)[0]
+                        };
                         // Check for SIDE_EXIT first
                         let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
                         let is_exit =
@@ -3636,18 +3700,90 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                 OpCode::GetI => {
                     // R[A] = R[B][C] where C is an integer index
+                    // Inline fast path for plain tables (no metatable, index in array range)
                     let b = inst.b() as i64;
                     let c = inst.c() as i64;
                     let table_val = self.cached_get_slot(b);
                     self.flush_and_invalidate_cache();
-                    let index_val = self.builder.ins().iconst(types::I64, c);
-                    let call = self.builder.ins().call(
-                        self.geti_ref,
-                        &[self.vm_ptr, table_val, index_val],
-                    );
-                    let result = self.builder.inst_results(call)[0];
-                    self.reload_stack_base();
-                    self.cached_set_slot(a, result);
+
+                    if c >= 1 {
+                        // Inline fast path: get_table_ptr -> check no metatable -> bounds check -> load
+                        let check_mt_block = self.builder.create_block();
+                        let bounds_check_block = self.builder.create_block();
+                        let fast_load_block = self.builder.create_block();
+                        let slow_block = self.builder.create_block();
+                        let cont_block = self.builder.create_block();
+                        self.builder.append_block_param(cont_block, types::I64);
+
+                        // Step 1: Get raw table pointer (small extern call, no alloc)
+                        let call = self.builder.ins().call(
+                            self.get_table_ptr_ref,
+                            &[self.vm_ptr, table_val],
+                        );
+                        let table_ptr = self.builder.inst_results(call)[0];
+
+                        // Step 2: Check table_ptr != 0 (is a valid table)
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        let is_valid = self.builder.ins().icmp(IntCC::NotEqual, table_ptr, zero);
+                        self.builder.ins().brif(is_valid, check_mt_block, &[], slow_block, &[]);
+
+                        // --- check_mt_block: load & check metatable discriminant ---
+                        // Option<GcIdx<Table>> layout: [discriminant: u32, payload: u32]
+                        // discriminant == 0 means None (no metatable)
+                        self.builder.switch_to_block(check_mt_block);
+                        let mt_offset = Table::metatable_offset() as i32;
+                        let mt_disc = self.builder.ins().load(types::I32, MemFlags::trusted(), table_ptr, mt_offset);
+                        let zero_i32 = self.builder.ins().iconst(types::I32, 0);
+                        let has_no_mt = self.builder.ins().icmp(IntCC::Equal, mt_disc, zero_i32);
+                        self.builder.ins().brif(has_no_mt, bounds_check_block, &[], slow_block, &[]);
+
+                        // --- bounds_check_block: check c <= array_len ---
+                        self.builder.switch_to_block(bounds_check_block);
+                        let arr_len_offset = Table::array_len_offset() as i32;
+                        let arr_len = self.builder.ins().load(types::I64, MemFlags::trusted(), table_ptr, arr_len_offset);
+                        let c_val = self.builder.ins().iconst(types::I64, c);
+                        let in_range = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, c_val, arr_len);
+                        self.builder.ins().brif(in_range, fast_load_block, &[], slow_block, &[]);
+
+                        // --- fast_load_block: direct array element load ---
+                        self.builder.switch_to_block(fast_load_block);
+                        let arr_ptr_offset = Table::array_data_ptr_offset() as i32;
+                        let arr_ptr = self.builder.ins().load(types::I64, MemFlags::trusted(), table_ptr, arr_ptr_offset);
+                        let byte_offset = ((c - 1) * 8) as i32;
+                        let result_fast = self.builder.ins().load(types::I64, MemFlags::trusted(), arr_ptr, byte_offset);
+                        self.builder.ins().jump(cont_block, &[BlockArg::Value(result_fast)]);
+
+                        // --- slow_block: fallback to jit_rt_geti ---
+                        self.builder.switch_to_block(slow_block);
+                        let index_val = self.builder.ins().iconst(types::I64, c);
+                        let call = self.builder.ins().call(
+                            self.geti_ref,
+                            &[self.vm_ptr, table_val, index_val],
+                        );
+                        let result_slow = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        self.builder.ins().jump(cont_block, &[BlockArg::Value(result_slow)]);
+
+                        // --- cont_block: merge results ---
+                        self.builder.switch_to_block(cont_block);
+                        self.builder.seal_block(check_mt_block);
+                        self.builder.seal_block(bounds_check_block);
+                        self.builder.seal_block(fast_load_block);
+                        self.builder.seal_block(slow_block);
+                        self.builder.seal_block(cont_block);
+                        let result = self.builder.block_params(cont_block)[0];
+                        self.cached_set_slot(a, result);
+                    } else {
+                        // c < 1: always use slow path (negative/zero index)
+                        let index_val = self.builder.ins().iconst(types::I64, c);
+                        let call = self.builder.ins().call(
+                            self.geti_ref,
+                            &[self.vm_ptr, table_val, index_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        self.reload_stack_base();
+                        self.cached_set_slot(a, result);
+                    }
                 }
 
                 OpCode::SetI => {
@@ -6645,6 +6781,7 @@ mod tests {
                         &vm.builtin_natives,
                         &vm.strings,
                         &HashMap::new(),
+                        &HashMap::new(),
                     ) {
                         vm.jit_register(proto_idx, jit_fn);
                     }
@@ -6968,6 +7105,7 @@ mod tests {
 
         fn test_jit_ic_hook(vm: &mut Vm, proto_idx: usize) {
             use selune_compiler::opcode::OpCode;
+            use selune_compiler::proto::Constant;
             use std::cell::RefCell;
             thread_local! {
                 static HOOK_JIT: RefCell<Option<JitCompiler>> = RefCell::new(None);
@@ -6986,6 +7124,29 @@ mod tests {
                 ic_ptrs.insert(pc, ptr as u64);
             }
 
+            // Allocate field IC entries for GetField/SetField with string keys
+            let field_pcs: Vec<usize> = vm.protos[proto_idx]
+                .code
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| {
+                    let op = inst.opcode();
+                    if op == OpCode::GetField {
+                        matches!(vm.protos[proto_idx].constants.get(inst.c() as usize), Some(Constant::String(_)))
+                    } else if op == OpCode::SetField {
+                        matches!(vm.protos[proto_idx].constants.get(inst.b() as usize), Some(Constant::String(_)))
+                    } else {
+                        false
+                    }
+                })
+                .map(|(pc, _)| pc)
+                .collect();
+            let mut field_ic_ptrs = HashMap::new();
+            for pc in field_pcs {
+                let ptr = vm.jit_get_or_create_field_ic(proto_idx, pc);
+                field_ic_ptrs.insert(pc, ptr as u64);
+            }
+
             HOOK_JIT.with(|cell| {
                 let mut opt = cell.borrow_mut();
                 if opt.is_none() {
@@ -6999,6 +7160,7 @@ mod tests {
                         &vm.builtin_natives,
                         &vm.strings,
                         &ic_ptrs,
+                        &field_ic_ptrs,
                     ) {
                         vm.jit_register(proto_idx, jit_fn);
                     }
@@ -7223,6 +7385,205 @@ mod tests {
         // sum = 2 * sum(1..2000) = 2 * 2001000 = 4002000
         let expected = 2 * (2000 * 2001 / 2);
         assert_eq!(i, expected, "method_calls pattern: expected {expected}, got {i}");
+    }
+
+    // =====================================================================
+    // Field IC (GetField/SetField inline cache) tests
+    // =====================================================================
+
+    #[test]
+    fn test_field_ic_basic_getfield() {
+        // Basic GetField IC: read same field from same table 2000 times
+        let results = run_lua_with_jit_ic(
+            "local t = {x = 42}
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + t.x end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 42 * 2000, "field_ic GetField: expected {}, got {i}", 42 * 2000);
+    }
+
+    #[test]
+    fn test_field_ic_getfield_after_setfield() {
+        // SetField then GetField on same table: IC should still work (shape unchanged)
+        let results = run_lua_with_jit_ic(
+            "local t = {count = 0}
+            local function f()
+                for i = 1, 2000 do
+                    t.count = t.count + 1
+                end
+                return t.count
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 2000, "field_ic Set+Get: expected 2000, got {i}");
+    }
+
+    #[test]
+    fn test_field_ic_different_tables_same_shape() {
+        // Two tables with same shape — IC should handle polymorphic access
+        let results = run_lua_with_jit_ic(
+            "local a = {val = 10}
+            local b = {val = 20}
+            local function f()
+                local s = 0
+                for i = 1, 2000 do
+                    s = s + a.val + b.val
+                end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 30 * 2000, "field_ic different tables: expected {}, got {i}", 30 * 2000);
+    }
+
+    #[test]
+    fn test_field_ic_nil_field_metamethod_fallback() {
+        // Field not in table, resolved via __index metamethod
+        let results = run_lua_with_jit_ic(
+            "local mt = {__index = {secret = 99}}
+            local t = setmetatable({}, mt)
+            local function f()
+                local s = 0
+                for i = 1, 2000 do s = s + t.secret end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 99 * 2000, "field_ic metamethod fallback: expected {}, got {i}", 99 * 2000);
+    }
+
+    #[test]
+    fn test_field_ic_method_calls_pattern() {
+        // Full method_calls-like pattern with field IC for GetField/SetField
+        let results = run_lua_with_jit_ic(
+            "local Animal = {}
+            Animal.__index = Animal
+            function Animal.new(name, sound)
+                return setmetatable({name = name, sound = sound, count = 0}, Animal)
+            end
+            function Animal:speak()
+                self.count = self.count + 1
+                return self.sound
+            end
+            function Animal:get_count() return self.count end
+            local cat = Animal.new('cat', 'meow')
+            local dog = Animal.new('dog', 'woof')
+            local function f()
+                local s = 0
+                for i = 1, 2000 do
+                    cat:speak()
+                    dog:speak()
+                    s = s + cat:get_count() + dog:get_count()
+                end
+                return s
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        let expected = 2 * (2000 * 2001 / 2);
+        assert_eq!(i, expected, "field_ic method_calls: expected {expected}, got {i}");
+    }
+
+    // =====================================================================
+    // Inline GetI tests (Phase 5 Inc 12)
+    // =====================================================================
+
+    #[test]
+    fn test_jit_inline_geti_basic() {
+        // Basic array access: t[1], t[2], t[3] on a plain table
+        let results = run_lua_with_jit(
+            "local t = {10, 20, 30}
+            local function f()
+                return t[1] + t[2] + t[3]
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 60, "inline_geti basic: expected 60, got {i}");
+    }
+
+    #[test]
+    fn test_jit_inline_geti_out_of_bounds() {
+        // Out of bounds access falls back to slow path, returns nil
+        let results = run_lua_with_jit(
+            "local t = {10}
+            local function f()
+                local v = t[5]
+                if v == nil then return 1 else return 0 end
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 1, "inline_geti out-of-bounds: expected nil (1), got {i}");
+    }
+
+    #[test]
+    fn test_jit_inline_geti_with_metatable() {
+        // Table with __index metamethod — slow path must handle it
+        let results = run_lua_with_jit(
+            "local base = {0, 0, 99}
+            local t = setmetatable({}, {__index = base})
+            local function f()
+                return t[3]
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 99, "inline_geti metamethod: expected 99, got {i}");
+    }
+
+    #[test]
+    fn test_jit_inline_geti_hot_loop() {
+        // Hot loop with GetI — triggers JIT compilation, verify correctness
+        let results = run_lua_with_jit(
+            "local t = {10, 20, 30}
+            local function f()
+                local sum = 0
+                for i = 1, 2000 do
+                    sum = sum + t[1] + t[2] + t[3]
+                end
+                return sum
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 60 * 2000, "inline_geti hot loop: expected {}, got {i}", 60 * 2000);
+    }
+
+    #[test]
+    fn test_jit_inline_geti_mixed_array_hash() {
+        // Table with both array and hash entries — GetI should use array fast path
+        let results = run_lua_with_jit(
+            "local t = {100, 200, 300, x = 'hello'}
+            local function f()
+                local sum = 0
+                for i = 1, 2000 do
+                    sum = sum + t[1] + t[2] + t[3]
+                end
+                return sum
+            end
+            return f()",
+            1,
+        );
+        let i = results[0].as_integer().unwrap();
+        assert_eq!(i, 600 * 2000, "inline_geti mixed: expected {}, got {i}", 600 * 2000);
     }
 }
 

@@ -7,7 +7,7 @@ use selune_vm::dispatch::{
     call_function, close_tbc_variables, constant_to_tvalue, execute_from, table_index,
     table_newindex,
 };
-use selune_vm::vm::{JitFn, JitProtoState, TinyMethodKind, Vm};
+use selune_vm::vm::{FieldIcEntry, JitFn, JitProtoState, TinyMethodKind, Vm};
 
 use crate::compiler::SIDE_EXIT;
 
@@ -1327,6 +1327,101 @@ pub unsafe extern "C" fn jit_rt_set_field_str(
         Ok(()) => 1,
         Err(_) => SIDE_EXIT,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Field IC: GetField/SetField inline cache with indexed access
+// ---------------------------------------------------------------------------
+
+/// Combined field IC GetField: checks IC then falls back to hash lookup + IC update.
+/// Single extern "C" call handles both hit and miss, avoiding split-pattern overhead.
+/// IC hit uses O(1) indexed access into IndexMap (no hash computation).
+/// IC miss falls back to full hash lookup + metamethod chain.
+///
+/// Returns value bits. May trigger metamethods on miss — caller must reload stack base.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+/// - `ic_ptr` must be a valid pointer to a `FieldIcEntry`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_get_field_ic(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    string_id: u64,
+    ic_ptr: u64,
+) -> u64 {
+    let ic = &*(ic_ptr as *const FieldIcEntry);
+    if let Some(table_idx) = TValue::from_raw_bits(table_bits).as_table_idx() {
+        let table = (*vm_ptr).gc.get_table_unchecked(table_idx);
+        // IC check: same table + same shape?
+        if ic.cached_table_idx != 0
+            && table_idx.0 as u64 == ic.cached_table_idx
+            && table.shape_version as u64 == ic.cached_shape_version
+        {
+            // IC hit: O(1) indexed access
+            if let Some((_, &val)) = table.hash_get_index(ic.cached_field_index as usize) {
+                return val.raw_bits();
+            }
+        }
+        // IC miss: hash lookup + IC update
+        if let Some((index, &val)) = table.hash_get_full_str(StringId(string_id as u32)) {
+            if !val.is_nil() {
+                let ic = &mut *(ic_ptr as *mut FieldIcEntry);
+                ic.cached_table_idx = table_idx.0 as u64;
+                ic.cached_shape_version = table.shape_version as u64;
+                ic.cached_field_index = index as u64;
+                return val.raw_bits();
+            }
+        }
+        if table.metatable.is_none() {
+            return TValue::nil().raw_bits();
+        }
+    }
+    // Slow path: full metamethod chain
+    let vm = &mut *vm_ptr;
+    let table_val = TValue::from_raw_bits(table_bits);
+    let key = TValue::from_string_id(StringId(string_id as u32));
+    match table_index(vm, table_val, key) {
+        Ok(result) => result.raw_bits(),
+        Err(_) => TValue::nil().raw_bits(),
+    }
+}
+
+/// IC-accelerated SetField for string keys. Checks IC first for O(1) overwrite,
+/// falls back to jit_rt_set_field_str on miss.
+/// Returns: 0 = no-alloc, 1 = possible alloc, SIDE_EXIT = error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+/// - `ic_ptr` must be a valid pointer to a `FieldIcEntry`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_set_field_ic(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    string_id: u64,
+    val_bits: u64,
+    ic_ptr: u64,
+) -> i64 {
+    let ic = &*(ic_ptr as *const FieldIcEntry);
+    if ic.cached_table_idx != 0 {
+        if let Some(table_idx) = TValue::from_raw_bits(table_bits).as_table_idx() {
+            if table_idx.0 as u64 == ic.cached_table_idx {
+                let vm = &mut *vm_ptr;
+                let table = vm.gc.get_table_unchecked(table_idx);
+                if table.shape_version as u64 == ic.cached_shape_version {
+                    // IC hit: direct indexed overwrite
+                    let table_mut = vm.gc.get_table_mut_unchecked(table_idx);
+                    if let Some((_, v)) = table_mut.hash_get_index_mut(ic.cached_field_index as usize) {
+                        *v = TValue::from_raw_bits(val_bits);
+                        table_mut.version = table_mut.version.wrapping_add(1);
+                        return 0; // no-alloc fast path
+                    }
+                }
+            }
+        }
+    }
+    // IC miss: fall back to existing set_field_str logic
+    jit_rt_set_field_str(vm_ptr, table_bits, string_id, val_bits)
 }
 
 // ---------------------------------------------------------------------------
