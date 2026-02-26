@@ -1,4 +1,5 @@
 use selune_compiler::proto::Constant;
+use selune_core::string::StringId;
 use selune_core::value::TValue;
 use selune_vm::arith;
 use selune_vm::callinfo::{CallInfo, JitCallInfo};
@@ -6,7 +7,7 @@ use selune_vm::dispatch::{
     call_function, close_tbc_variables, constant_to_tvalue, execute_from, table_index,
     table_newindex,
 };
-use selune_vm::vm::Vm;
+use selune_vm::vm::{JitFn, JitProtoState, TinyMethodKind, Vm};
 
 use crate::compiler::SIDE_EXIT;
 
@@ -61,6 +62,7 @@ pub unsafe extern "C" fn jit_rt_ensure_stack(vm_ptr: *mut Vm, min_len: u64) {
     let needed = min_len as usize;
     if vm.stack.len() < needed {
         vm.stack.resize(needed, TValue::nil());
+        vm.update_stack_data_ptr();
     }
 }
 
@@ -81,6 +83,7 @@ pub unsafe extern "C" fn jit_rt_set_stack_slot(
     // Ensure the stack is large enough
     if idx >= vm.stack.len() {
         vm.stack.resize(idx + 1, TValue::nil());
+        vm.update_stack_data_ptr();
     }
     vm.stack[idx] = TValue::from_raw_bits(raw_bits);
 }
@@ -277,6 +280,7 @@ pub unsafe extern "C" fn jit_rt_call(
                 let idx = func_idx + i;
                 if idx >= vm.stack.len() {
                     vm.stack.resize(idx + 1, TValue::nil());
+                    vm.update_stack_data_ptr();
                 }
                 vm.stack[idx] = val;
             }
@@ -315,7 +319,7 @@ pub unsafe extern "C" fn jit_rt_call_fast(
 ) -> i64 {
     let vm = &mut *vm_ptr;
     let func_idx = base as usize + func_off as usize;
-    let func_val = vm.stack[func_idx];
+    let func_val = *vm.stack.get_unchecked(func_idx);
     let nargs = nargs as usize;
     let arg_end = func_idx + 1 + nargs;
 
@@ -329,10 +333,40 @@ pub unsafe extern "C" fn jit_rt_call_fast(
         // Lua closure call — fast path
         let closure = vm.gc.get_closure(closure_idx);
         let child_proto_idx = closure.proto_idx;
-        let child_proto = &vm.protos[child_proto_idx];
+        let child_proto = vm.protos.get_unchecked(child_proto_idx);
         let num_params = child_proto.num_params as usize;
         let is_vararg = child_proto.is_vararg;
         let max_stack = child_proto.max_stack_size as usize;
+
+        // --- Try tiny method inlining ---
+        if nargs >= 1 {
+            if let TinyMethodKind::Getter { field_sid } = *vm.tiny_methods.get_unchecked(child_proto_idx) {
+                let self_val = *vm.stack.get_unchecked(func_idx + 1);
+                if let Some(tbl_idx) = self_val.as_table_idx() {
+                    let table = vm.gc.get_table_unchecked(tbl_idx);
+                    let result = table.raw_get_str(StringId(field_sid));
+                    if !result.is_nil() {
+                        vm.stack_top = saved_stack_top;
+                        if nresults == 1 {
+                            *vm.stack.get_unchecked_mut(func_idx) = result;
+                            return 1;
+                        } else if nresults == 0 {
+                            return 0;
+                        } else if nresults < 0 {
+                            *vm.stack.get_unchecked_mut(func_idx) = result;
+                            return 1;
+                        } else {
+                            *vm.stack.get_unchecked_mut(func_idx) = result;
+                            for i in 1..nresults as usize {
+                                *vm.stack.get_unchecked_mut(func_idx + i) = TValue::nil();
+                            }
+                            return nresults;
+                        }
+                    }
+                    // raw_get_str returned nil — field might be on metatable, fall through
+                }
+            }
+        }
 
         if vm.call_stack.len() + vm.jit_call_stack.len() >= vm.max_call_depth {
             vm.stack_top = saved_stack_top;
@@ -345,11 +379,12 @@ pub unsafe extern "C" fn jit_rt_call_fast(
         let needed = new_base + max_stack + num_params + 1;
         if needed > vm.stack.len() {
             vm.stack.resize(needed, TValue::nil());
+            vm.update_stack_data_ptr();
         }
 
         // Pad with nil if fewer args than params
         for i in nargs..num_params {
-            vm.stack[new_base + i] = TValue::nil();
+            *vm.stack.get_unchecked_mut(new_base + i) = TValue::nil();
         }
 
         // --- JIT-to-JIT fast path (non-vararg only) ---
@@ -379,7 +414,7 @@ pub unsafe extern "C" fn jit_rt_call_fast(
                     // Specialized result placement (most common cases first)
                     if nresults == 1 {
                         // Single result — most common for expressions like f(x) + g(x)
-                        vm.stack[func_idx] = if result > 0 { vm.stack[new_base] } else { TValue::nil() };
+                        *vm.stack.get_unchecked_mut(func_idx) = if result > 0 { *vm.stack.get_unchecked(new_base) } else { TValue::nil() };
                         return 1;
                     } else if nresults == 0 {
                         // Zero results — call for side effects only
@@ -394,10 +429,10 @@ pub unsafe extern "C" fn jit_rt_call_fast(
                         };
                         let n = (wanted as usize).min(nresults_actual);
                         for i in 0..n {
-                            vm.stack[func_idx + i] = vm.stack[new_base + i];
+                            *vm.stack.get_unchecked_mut(func_idx + i) = *vm.stack.get_unchecked(new_base + i);
                         }
                         for i in n..wanted as usize {
-                            vm.stack[func_idx + i] = TValue::nil();
+                            *vm.stack.get_unchecked_mut(func_idx + i) = TValue::nil();
                         }
                         return wanted;
                     }
@@ -430,6 +465,7 @@ pub unsafe extern "C" fn jit_rt_call_fast(
             let needed_va = actual_base + max_stack + 1;
             if needed_va > vm.stack.len() {
                 vm.stack.resize(needed_va, TValue::nil());
+                vm.update_stack_data_ptr();
             }
             for i in 0..num_params.min(nargs) {
                 vm.stack[actual_base + i] = vm.stack[new_base + i];
@@ -534,6 +570,7 @@ pub unsafe extern "C" fn jit_rt_call_fast(
                 let val = results.get(i).copied().unwrap_or(TValue::nil());
                 if func_idx + i >= vm.stack.len() {
                     vm.stack.resize(func_idx + i + 1, TValue::nil());
+                    vm.update_stack_data_ptr();
                 }
                 vm.stack[func_idx + i] = val;
             }
@@ -610,6 +647,7 @@ pub unsafe extern "C" fn jit_rt_self(
     let idx_a1 = base + a + 1;
     if idx_a1 >= vm.stack.len() {
         vm.stack.resize(idx_a1 + 1, TValue::nil());
+        vm.update_stack_data_ptr();
     }
     vm.stack[idx_a1] = table_val;
 
@@ -619,6 +657,7 @@ pub unsafe extern "C" fn jit_rt_self(
             let idx_a = base + a;
             if idx_a >= vm.stack.len() {
                 vm.stack.resize(idx_a + 1, TValue::nil());
+                vm.update_stack_data_ptr();
             }
             vm.stack[idx_a] = result;
             0
@@ -870,6 +909,22 @@ pub unsafe extern "C" fn jit_rt_self_ic(
                     ic.cached_method_bits = idx_result.raw_bits();
                     ic.cached_instance_shape = inst_table.shape_version as u64;
 
+                    // Cache callee JIT function info for Self_+Call fusion
+                    ic.cached_closure_idx = 0;
+                    ic.cached_proto_idx = 0;
+                    ic.cached_jit_fn_ptr = 0;
+                    if let Some(closure_idx) = idx_result.as_closure_idx() {
+                        let closure = vm.gc.get_closure(closure_idx);
+                        let proto_idx = closure.proto_idx;
+                        ic.cached_closure_idx = closure_idx.0 as u64;
+                        ic.cached_proto_idx = proto_idx as u64;
+                        if let Some(JitProtoState::Compiled(jit_fn)) =
+                            vm.jit_proto_state.get(proto_idx)
+                        {
+                            ic.cached_jit_fn_ptr = *jit_fn as u64;
+                        }
+                    }
+
                     vm.stack[base + a] = idx_result;
                     return 0;
                 }
@@ -899,6 +954,224 @@ pub unsafe extern "C" fn jit_rt_self_ic(
         }
         Err(_) => SIDE_EXIT,
     }
+}
+
+/// Fused Self_+Call: IC-guarded method resolution + direct JIT-to-JIT dispatch.
+///
+/// Combines `jit_rt_self_ic_check_fast` + `jit_rt_call_fast` into a single extern "C" call.
+/// On IC hit with a cached JIT function pointer, does the full JIT-to-JIT call internally
+/// (push JitCallInfo, indirect call, pop, copy results) without any intermediate extern "C" overhead.
+///
+/// On IC miss or no cached JIT fn: falls back to separate Self_ resolution + generic call_fast.
+///
+/// Returns: number of results placed (>=0), or SIDE_EXIT on error/deopt.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+/// - `ic_ptr` must be a valid pointer to a `SelfIcEntry`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_self_call_ic(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+    b: u64,
+    key_bits: u64,
+    ic_ptr: u64,
+    nargs: u64,
+    nresults: i64,
+) -> i64 {
+    use selune_vm::vm::SelfIcEntry;
+
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let b_val = b as usize;
+
+    let table_val = *vm.stack.get_unchecked(base + b_val);
+    // R[A+1] = R[B] (self/receiver)
+    *vm.stack.get_unchecked_mut(base + a + 1) = table_val;
+
+    let ic = &mut *(ic_ptr as *mut SelfIcEntry);
+    let nargs = nargs as usize;
+
+    // --- IC probe ---
+    if let Some(table_idx) = table_val.as_table_idx() {
+        if ic.cached_mt_tag != 0 {
+            let table = vm.gc.get_table_unchecked(table_idx);
+            let mt_raw = table.metatable_raw();
+            if mt_raw as u64 + 1 == ic.cached_mt_tag {
+                let idx_tbl_idx = ic.cached_index_table_idx as u32;
+                let idx_table = vm.gc.get_table_unchecked(
+                    selune_core::gc::GcIdx(idx_tbl_idx, std::marker::PhantomData),
+                );
+                if idx_table.version as u64 == ic.cached_version {
+                    // Check instance shape
+                    let mut method_bits = ic.cached_method_bits;
+                    if table.shape_version as u64 != ic.cached_instance_shape {
+                        // Shape changed — check for instance override
+                        let key = TValue::from_raw_bits(key_bits);
+                        if let Some(sid) = key.as_string_id() {
+                            let raw = table.raw_get_str(sid);
+                            if !raw.is_nil() {
+                                method_bits = raw.raw_bits();
+                            } else {
+                                ic.cached_instance_shape = table.shape_version as u64;
+                            }
+                        }
+                    }
+
+                    // IC HIT! Store method to R[A]
+                    let method = TValue::from_raw_bits(method_bits);
+                    let func_idx = base + a;
+                    *vm.stack.get_unchecked_mut(func_idx) = method;
+
+                    // --- Try tiny method inlining ---
+                    if let Some(closure_idx) = method.as_closure_idx() {
+                        let closure = vm.gc.get_closure(closure_idx);
+                        let proto_idx = closure.proto_idx;
+                        if let TinyMethodKind::Getter { field_sid } = *vm.tiny_methods.get_unchecked(proto_idx) {
+                            // self is at R[A+1] (already stored above)
+                            let self_val = *vm.stack.get_unchecked(base + a + 1);
+                            if let Some(tbl_idx) = self_val.as_table_idx() {
+                                let table = vm.gc.get_table_unchecked(tbl_idx);
+                                let result = table.raw_get_str(StringId(field_sid));
+                                if !result.is_nil() {
+                                    if nresults == 1 {
+                                        *vm.stack.get_unchecked_mut(func_idx) = result;
+                                        return 1;
+                                    } else if nresults == 0 {
+                                        return 0;
+                                    } else if nresults < 0 {
+                                        *vm.stack.get_unchecked_mut(func_idx) = result;
+                                        return 1;
+                                    } else {
+                                        *vm.stack.get_unchecked_mut(func_idx) = result;
+                                        for i in 1..nresults as usize {
+                                            *vm.stack.get_unchecked_mut(func_idx + i) = TValue::nil();
+                                        }
+                                        return nresults;
+                                    }
+                                }
+                                // raw_get_str returned nil — field might be on metatable, fall through
+                            }
+                        }
+                    }
+
+                    // --- Try fused JIT-to-JIT call ---
+                    if ic.cached_jit_fn_ptr != 0 && method_bits == ic.cached_method_bits {
+                        // Verify the callee is still the same closure
+                        if let Some(closure_idx) = method.as_closure_idx() {
+                            if closure_idx.0 as u64 == ic.cached_closure_idx {
+                                let jit_fn: JitFn = std::mem::transmute(ic.cached_jit_fn_ptr as usize);
+                                let child_proto_idx = ic.cached_proto_idx as usize;
+                                let child_proto = vm.protos.get_unchecked(child_proto_idx);
+                                let num_params = child_proto.num_params as usize;
+                                let max_stack = child_proto.max_stack_size as usize;
+
+                                // Stack depth check
+                                if vm.call_stack.len() + vm.jit_call_stack.len() >= vm.max_call_depth {
+                                    return SIDE_EXIT;
+                                }
+
+                                let new_base = func_idx + 1;
+
+                                // Save/restore stack_top
+                                let saved_stack_top = vm.stack_top;
+                                let arg_end = new_base + nargs;
+                                if vm.stack_top < arg_end {
+                                    vm.stack_top = arg_end;
+                                }
+
+                                // Ensure stack space
+                                let needed = new_base + max_stack + num_params + 1;
+                                if needed > vm.stack.len() {
+                                    vm.stack.resize(needed, TValue::nil());
+                                    vm.update_stack_data_ptr();
+                                }
+
+                                // Nil-pad args if needed
+                                for i in nargs..num_params {
+                                    *vm.stack.get_unchecked_mut(new_base + i) = TValue::nil();
+                                }
+
+                                // Push JitCallInfo
+                                let jit_ci = JitCallInfo {
+                                    base: new_base,
+                                    func_stack_idx: func_idx,
+                                    proto_idx: child_proto_idx,
+                                    closure_idx_raw: closure_idx.0,
+                                    num_results: nresults as i32,
+                                };
+                                vm.jit_call_stack.push(jit_ci);
+
+                                // Direct JIT call
+                                let result = jit_fn(vm as *mut Vm, new_base);
+
+                                if result >= 0 {
+                                    if !vm.open_upvals.is_empty() {
+                                        vm.close_upvalues(new_base);
+                                    }
+                                    vm.jit_call_stack.pop();
+                                    vm.stack_top = saved_stack_top;
+
+                                    // Copy results
+                                    if nresults == 1 {
+                                        *vm.stack.get_unchecked_mut(func_idx) = if result > 0 { *vm.stack.get_unchecked(new_base) } else { TValue::nil() };
+                                        return 1;
+                                    } else if nresults == 0 {
+                                        return 0;
+                                    } else {
+                                        let nresults_actual = result as usize;
+                                        let wanted = if nresults < 0 { nresults_actual as i64 } else { nresults };
+                                        let n = (wanted as usize).min(nresults_actual);
+                                        for i in 0..n {
+                                            *vm.stack.get_unchecked_mut(func_idx + i) = *vm.stack.get_unchecked(new_base + i);
+                                        }
+                                        for i in n..wanted as usize {
+                                            *vm.stack.get_unchecked_mut(func_idx + i) = TValue::nil();
+                                        }
+                                        return wanted;
+                                    }
+                                } else {
+                                    // SIDE_EXIT from callee
+                                    vm.jit_call_stack.pop();
+                                    vm.jit_record_side_exit(child_proto_idx);
+                                    vm.stack_top = saved_stack_top;
+                                    // Invalidate cached JIT fn (callee was blacklisted)
+                                    ic.cached_jit_fn_ptr = 0;
+                                    // Fall through to generic call_fast for interpreter fallback
+                                }
+                            }
+                        }
+                    } else if ic.cached_jit_fn_ptr == 0 && method_bits == ic.cached_method_bits {
+                        // JIT fn not cached yet — try to refresh it
+                        if let Some(closure_idx) = method.as_closure_idx() {
+                            let closure = vm.gc.get_closure(closure_idx);
+                            let proto_idx = closure.proto_idx;
+                            if let Some(JitProtoState::Compiled(jit_fn)) = vm.jit_proto_state.get(proto_idx) {
+                                ic.cached_closure_idx = closure_idx.0 as u64;
+                                ic.cached_proto_idx = proto_idx as u64;
+                                ic.cached_jit_fn_ptr = *jit_fn as u64;
+                            }
+                        }
+                    }
+
+                    // IC hit but no fused call — fall through to generic call_fast
+                    return jit_rt_call_fast(vm_ptr, base as u64, a as u64, nargs as u64, nresults);
+                }
+            }
+        }
+    }
+
+    // --- IC miss: full Self_ resolution + call ---
+    // Call jit_rt_self_ic for the Self_ part
+    let self_result = jit_rt_self_ic(vm_ptr, base as u64, a as u64, b, key_bits, ic_ptr);
+    if self_result == SIDE_EXIT {
+        return SIDE_EXIT;
+    }
+
+    // Then call_fast for the Call part
+    jit_rt_call_fast(vm_ptr, base as u64, a as u64, nargs as u64, nresults)
 }
 
 /// Table index: R[A] = R[B][key]
@@ -966,6 +1239,92 @@ pub unsafe extern "C" fn jit_rt_table_newindex(
     // Slow path: full metamethod dispatch
     match table_newindex(vm, table_val, key, val) {
         Ok(()) => 0,
+        Err(_) => SIDE_EXIT,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast string-keyed field access helpers (GetField/SetField optimization)
+// ---------------------------------------------------------------------------
+
+/// Fast GetField for string constant keys: R[A] = R[B][K[C]]
+/// Takes StringId.0 directly (avoids NaN-unboxing the key TValue).
+/// Fast path: raw_get_str first. If found, return immediately.
+/// If not found and no metatable, return nil.
+/// If not found and has metatable, fall back to full table_index.
+/// Returns result as raw TValue bits.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_get_field_str(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    string_id: u64,
+) -> u64 {
+    let vm = &mut *vm_ptr;
+    let sid = StringId(string_id as u32);
+    if let Some(table_idx) = TValue::from_raw_bits(table_bits).as_table_idx() {
+        let table = vm.gc.get_table_unchecked(table_idx);
+        // Try raw lookup first — works whether or not table has a metatable
+        let result = table.raw_get_str(sid);
+        if !result.is_nil() {
+            return result.raw_bits();
+        }
+        // Key not found: check metatable
+        if table.metatable.is_none() {
+            return TValue::nil().raw_bits();
+        }
+    }
+    // Slow path: full metamethod chain
+    let table_val = TValue::from_raw_bits(table_bits);
+    let key = TValue::from_string_id(sid);
+    match table_index(vm, table_val, key) {
+        Ok(result) => result.raw_bits(),
+        Err(_) => TValue::nil().raw_bits(),
+    }
+}
+
+/// Fast SetField for string constant keys: R[A][K[B]] = RK(C)
+/// Takes StringId.0 directly (avoids NaN-unboxing the key TValue).
+/// Fast path: raw_get_str first. If key exists, overwrite in-place (no alloc → return 0).
+/// If key doesn't exist and no metatable, insert new key (possible alloc → return 1).
+/// If key doesn't exist and has metatable, fall back to full table_newindex.
+/// Returns: 0 = no-alloc (existing key overwrite), 1 = possible alloc, SIDE_EXIT = error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_set_field_str(
+    vm_ptr: *mut Vm,
+    table_bits: u64,
+    string_id: u64,
+    val_bits: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let sid = StringId(string_id as u32);
+    let val = TValue::from_raw_bits(val_bits);
+    if let Some(table_idx) = TValue::from_raw_bits(table_bits).as_table_idx() {
+        let table = vm.gc.get_table_unchecked(table_idx);
+        // Check if key already exists
+        let existing = table.raw_get_str(sid);
+        if !existing.is_nil() {
+            // Key exists: overwrite in-place, no allocation needed
+            vm.gc.get_table_mut_unchecked(table_idx).raw_set_str(sid, val);
+            return 0; // no-alloc fast path
+        }
+        // Key doesn't exist
+        if table.metatable.is_none() {
+            // No metatable: insert directly
+            vm.gc.get_table_mut_unchecked(table_idx).raw_set_str(sid, val);
+            return 1; // possible alloc (new key insertion)
+        }
+    }
+    // Slow path: full metamethod chain
+    let table_val = TValue::from_raw_bits(table_bits);
+    let key = TValue::from_string_id(sid);
+    match table_newindex(vm, table_val, key, val) {
+        Ok(()) => 1,
         Err(_) => SIDE_EXIT,
     }
 }
@@ -1056,6 +1415,7 @@ pub unsafe extern "C" fn jit_rt_len(
         let idx = base + dest;
         if idx >= vm.stack.len() {
             vm.stack.resize(idx + 1, TValue::nil());
+            vm.update_stack_data_ptr();
         }
         vm.stack[idx] = result;
         return 0;
@@ -1072,6 +1432,7 @@ pub unsafe extern "C" fn jit_rt_len(
                         let idx = base + dest;
                         if idx >= vm.stack.len() {
                             vm.stack.resize(idx + 1, TValue::nil());
+                            vm.update_stack_data_ptr();
                         }
                         vm.stack[idx] = results.first().copied().unwrap_or(TValue::nil());
                         return 0;
@@ -1086,6 +1447,7 @@ pub unsafe extern "C" fn jit_rt_len(
         let idx = base + dest;
         if idx >= vm.stack.len() {
             vm.stack.resize(idx + 1, TValue::nil());
+            vm.update_stack_data_ptr();
         }
         vm.stack[idx] = result;
         return 0;
@@ -1100,6 +1462,7 @@ pub unsafe extern "C" fn jit_rt_len(
                     let idx = base + dest;
                     if idx >= vm.stack.len() {
                         vm.stack.resize(idx + 1, TValue::nil());
+                        vm.update_stack_data_ptr();
                     }
                     vm.stack[idx] = results.first().copied().unwrap_or(TValue::nil());
                     return 0;
@@ -1145,6 +1508,7 @@ pub unsafe extern "C" fn jit_rt_concat(
             let idx = base + dest;
             if idx >= vm.stack.len() {
                 vm.stack.resize(idx + 1, TValue::nil());
+                vm.update_stack_data_ptr();
             }
             vm.stack[idx] = result;
             0
@@ -1274,6 +1638,7 @@ pub unsafe extern "C" fn jit_rt_tforcall(
     let min_top = base + a + 4 + c;
     if min_top >= vm.stack.len() {
         vm.stack.resize(min_top + 1, TValue::nil());
+        vm.update_stack_data_ptr();
     }
 
     let state = vm.stack[base + a + 1];
@@ -1479,6 +1844,7 @@ pub unsafe extern "C" fn jit_rt_vararg(
         // Ensure stack space
         if base + a + wanted >= vm.stack.len() {
             vm.stack.resize(base + a + wanted + 1, TValue::nil());
+            vm.update_stack_data_ptr();
         }
 
         for i in 0..wanted {
@@ -1492,6 +1858,7 @@ pub unsafe extern "C" fn jit_rt_vararg(
         // No varargs available, fill with nil
         if base + a + wanted >= vm.stack.len() {
             vm.stack.resize(base + a + wanted + 1, TValue::nil());
+            vm.update_stack_data_ptr();
         }
         for i in 0..wanted {
             vm.stack[base + a + i] = TValue::nil();

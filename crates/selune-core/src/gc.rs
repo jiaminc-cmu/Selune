@@ -377,6 +377,30 @@ impl GcHeap {
             .expect("table was freed")
     }
 
+    /// Unchecked table access for JIT hot paths where the index is known valid.
+    ///
+    /// # Safety
+    /// `idx` must be a valid, live table index.
+    #[inline(always)]
+    pub unsafe fn get_table_unchecked(&self, idx: GcIdx<Table>) -> &Table {
+        self.tables
+            .get_unchecked(idx.0 as usize)
+            .as_ref()
+            .unwrap_unchecked()
+    }
+
+    /// Unchecked mutable table access for JIT hot paths.
+    ///
+    /// # Safety
+    /// `idx` must be a valid, live table index.
+    #[inline(always)]
+    pub unsafe fn get_table_mut_unchecked(&mut self, idx: GcIdx<Table>) -> &mut Table {
+        self.tables
+            .get_unchecked_mut(idx.0 as usize)
+            .as_mut()
+            .unwrap_unchecked()
+    }
+
     pub fn alloc_closure(
         &mut self,
         proto_idx: usize,
