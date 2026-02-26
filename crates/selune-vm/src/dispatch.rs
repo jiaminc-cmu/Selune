@@ -6620,19 +6620,36 @@ fn do_debug_traceback(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaEr
         vm.last_error_from_close = false;
     }
 
-    // Get the call_stack and stack to iterate over
+    // Get the call_stack and stack to iterate over.
+    // JIT shadow stack frames (jit_call_stack) are the innermost frames and must
+    // be included — convert them to CallInfo entries and append to call_stack.
     let (call_stack_ref, stack_ref): (Vec<CallInfo>, Vec<TValue>) = if let Some(cid) = coro_id {
         if cid < vm.coroutines.len() {
-            (
-                vm.coroutines[cid].call_stack.clone(),
-                vm.coroutines[cid].stack.clone(),
-            )
+            let mut cs = vm.coroutines[cid].call_stack.clone();
+            // Append JIT shadow stack frames for this coroutine
+            for jf in &vm.coroutines[cid].jit_call_stack {
+                let mut ci = CallInfo::new(jf.base, jf.proto_idx);
+                ci.func_stack_idx = jf.func_stack_idx;
+                ci.closure_idx = Some(GcIdx(jf.closure_idx_raw, std::marker::PhantomData));
+                ci.num_results = jf.num_results;
+                cs.push(ci);
+            }
+            (cs, vm.coroutines[cid].stack.clone())
         } else {
             (vec![], vec![])
         }
     } else {
         // Use current thread's call stack (clone to avoid borrow issues)
-        (vm.call_stack.clone(), vm.stack.clone())
+        let mut cs = vm.call_stack.clone();
+        // Append JIT shadow stack frames (innermost/most recent frames)
+        for jf in &vm.jit_call_stack {
+            let mut ci = CallInfo::new(jf.base, jf.proto_idx);
+            ci.func_stack_idx = jf.func_stack_idx;
+            ci.closure_idx = Some(GcIdx(jf.closure_idx_raw, std::marker::PhantomData));
+            ci.num_results = jf.num_results;
+            cs.push(ci);
+        }
+        (cs, vm.stack.clone())
     };
 
     let stack_len = call_stack_ref.len();
