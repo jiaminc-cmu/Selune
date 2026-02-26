@@ -102,7 +102,19 @@ impl JitCompiler {
             runtime::jit_rt_set_tab_up as *const u8,
         );
         builder.symbol("jit_rt_call", runtime::jit_rt_call as *const u8);
+        builder.symbol(
+            "jit_rt_call_fast",
+            runtime::jit_rt_call_fast as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_tailcall",
+            runtime::jit_rt_tailcall as *const u8,
+        );
         builder.symbol("jit_rt_self", runtime::jit_rt_self as *const u8);
+        builder.symbol(
+            "jit_rt_self_fast",
+            runtime::jit_rt_self_fast as *const u8,
+        );
         builder.symbol(
             "jit_rt_table_index",
             runtime::jit_rt_table_index as *const u8,
@@ -461,6 +473,28 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_call", Linkage::Import, &call_sig)?;
 
+        // jit_rt_call_fast(vm_ptr, base, func_off, nargs, nresults) -> i64
+        // Same signature as jit_rt_call but with JIT-to-JIT fast path
+        let mut call_fast_sig = Signature::new(call_conv);
+        for _ in 0..5 {
+            call_fast_sig.params.push(AbiParam::new(types::I64));
+        }
+        call_fast_sig.returns.push(AbiParam::new(types::I64));
+        let call_fast_id = self
+            .module
+            .declare_function("jit_rt_call_fast", Linkage::Import, &call_fast_sig)?;
+
+        // jit_rt_tailcall(vm_ptr, base, func_off, nargs, nresults) -> i64
+        // Same signature — places results at base+0 instead of base+func_off
+        let mut tailcall_sig = Signature::new(call_conv);
+        for _ in 0..5 {
+            tailcall_sig.params.push(AbiParam::new(types::I64));
+        }
+        tailcall_sig.returns.push(AbiParam::new(types::I64));
+        let tailcall_id = self
+            .module
+            .declare_function("jit_rt_tailcall", Linkage::Import, &tailcall_sig)?;
+
         // jit_rt_self(vm_ptr, base, a, b, key_bits) -> i64
         let mut self_sig = Signature::new(call_conv);
         for _ in 0..5 {
@@ -470,6 +504,17 @@ impl JitCompiler {
         let self_id = self
             .module
             .declare_function("jit_rt_self", Linkage::Import, &self_sig)?;
+
+        // jit_rt_self_fast(vm_ptr, base, a, b, key_bits) -> i64
+        // Same signature — mirrors interpreter's Self_ fast path
+        let mut self_fast_sig = Signature::new(call_conv);
+        for _ in 0..5 {
+            self_fast_sig.params.push(AbiParam::new(types::I64));
+        }
+        self_fast_sig.returns.push(AbiParam::new(types::I64));
+        let self_fast_id = self
+            .module
+            .declare_function("jit_rt_self_fast", Linkage::Import, &self_fast_sig)?;
 
         // jit_rt_table_index(vm_ptr, table_bits, key_bits) -> u64
         let mut tbl_idx_sig = Signature::new(call_conv);
@@ -675,7 +720,10 @@ impl JitCompiler {
             let set_tab_up_ref =
                 self.module.declare_func_in_func(set_tab_up_id, builder.func);
             let call_ref = self.module.declare_func_in_func(call_id, builder.func);
+            let call_fast_ref = self.module.declare_func_in_func(call_fast_id, builder.func);
+            let tailcall_ref = self.module.declare_func_in_func(tailcall_id, builder.func);
             let self_ref = self.module.declare_func_in_func(self_id, builder.func);
+            let self_fast_ref = self.module.declare_func_in_func(self_fast_id, builder.func);
             let tbl_idx_ref = self.module.declare_func_in_func(tbl_idx_id, builder.func);
             let tbl_ni_ref = self.module.declare_func_in_func(tbl_ni_id, builder.func);
             let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
@@ -761,7 +809,10 @@ impl JitCompiler {
                 get_tab_up_ref,
                 set_tab_up_ref,
                 call_ref,
+                call_fast_ref,
+                tailcall_ref,
                 self_ref,
+                self_fast_ref,
                 tbl_idx_ref,
                 tbl_ni_ref,
                 geti_ref,
@@ -1054,7 +1105,10 @@ struct BytecodeEmitter<'a, 'b> {
     get_tab_up_ref: FuncRef,
     set_tab_up_ref: FuncRef,
     call_ref: FuncRef,
+    call_fast_ref: FuncRef,
+    tailcall_ref: FuncRef,
     self_ref: FuncRef,
+    self_fast_ref: FuncRef,
     tbl_idx_ref: FuncRef,
     tbl_ni_ref: FuncRef,
     geti_ref: FuncRef,
@@ -1534,9 +1588,12 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
     /// skip type guards for known-float slots.
     fn pre_analyze_types(&mut self) {
         let code = &self.proto.code;
-        // Phase 1: Track slots that are loaded as Float before any ForPrep
-        let mut known_float: HashMap<usize, bool> = HashMap::new(); // slot → always_float
-        let mut in_loop = false;
+        // Track the last load type for each slot sequentially.
+        // A LoadF marks a slot as Float; any non-float load (LoadI, LoadK, etc.)
+        // overrides it regardless of loop nesting, because bytecode is sequential
+        // and a later LoadI means the register is reused for an integer.
+        let mut known_float: HashMap<usize, bool> = HashMap::new();
+        let mut loop_depth: usize = 0;
 
         for pc in 0..code.len() {
             let inst = code[pc];
@@ -1549,41 +1606,22 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                 }
                 OpCode::LoadI | OpCode::LoadK | OpCode::LoadTrue | OpCode::LoadFalse
                 | OpCode::LoadNil | OpCode::LFalseSkip => {
-                    // Non-float writes
-                    if !in_loop {
-                        known_float.insert(a, false);
-                    }
+                    // Non-float load always clears Float hint for this slot
+                    known_float.insert(a, false);
                 }
                 OpCode::ForPrep => {
-                    in_loop = true;
+                    loop_depth += 1;
                 }
                 OpCode::ForLoop => {
-                    // End of loop — don't track beyond
-                    in_loop = false;
-                }
-                _ => {
-                    if in_loop {
-                        // Float-producing ops in loop body confirm the slot stays float
-                        match op {
-                            OpCode::Add | OpCode::Sub | OpCode::Mul
-                            | OpCode::AddK | OpCode::SubK | OpCode::MulK
-                            | OpCode::Div | OpCode::DivK
-                            | OpCode::IDiv | OpCode::IDivK
-                            | OpCode::Mod | OpCode::ModK
-                            | OpCode::AddI | OpCode::Unm => {
-                                // These produce float results when at least one operand is float.
-                                // If the dest slot was previously known as Float, keep it.
-                                // We can't fully determine without type inference, but if
-                                // it was loaded as Float before the loop, it stays Float.
-                            }
-                            _ => {}
-                        }
+                    if loop_depth > 0 {
+                        loop_depth -= 1;
                     }
                 }
+                _ => {}
             }
         }
 
-        // Seed type hints for slots that are loaded as Float before the loop
+        // Seed type hints for slots whose last load was Float
         for (slot, is_float) in &known_float {
             if *is_float {
                 self.slot_cache.type_hints.insert(*slot, SlotType::Float);
@@ -2388,6 +2426,9 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // count-based integer path. Otherwise fall back to float
                     // via runtime helper.
 
+                    // Snapshot runtime-derived types before flushing, so hints
+                    // reflect actual execution state from preceding instructions.
+                    self.slot_cache.snapshot_type_hints();
                     // Flush cache but keep type hints — pre-analyzed Float hints
                     // (from LoadF before ForPrep) must survive into the body block
                     // so that float slots don't get integer-guarded.
@@ -2744,11 +2785,11 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let nargs_val = self.builder.ins().iconst(types::I64, nargs);
                     let nresults_val = self.builder.ins().iconst(types::I64, nresults);
                     let call = self.builder.ins().call(
-                        self.call_ref,
+                        self.call_fast_ref,
                         &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    // call_function may resize stack → reload pointer
+                    // call may resize stack → reload pointer
                     self.reload_stack_base();
                     // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
@@ -2782,11 +2823,11 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let a_val = self.builder.ins().iconst(types::I64, a);
                     let b_val = self.builder.ins().iconst(types::I64, b);
                     let call = self.builder.ins().call(
-                        self.self_ref,
+                        self.self_fast_ref,
                         &[self.vm_ptr, self.base, a_val, b_val, key],
                     );
                     let result = self.builder.inst_results(call)[0];
-                    // Self_ calls table_index → may trigger metamethods
+                    // Self_ may call table_index → may trigger metamethods
                     self.reload_stack_base();
                     // Check for SIDE_EXIT (cache already flushed above)
                     let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
@@ -3236,11 +3277,85 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     }
                 }
 
-                // Side-exit: complex operations handled by interpreter
-                OpCode::Return | OpCode::TailCall => {
-                    self.flush_and_invalidate_cache();
-                    self.builder.ins().jump(self.side_exit_block, &[]);
-                    block_terminated = true;
+                OpCode::Return => {
+                    let b = inst.b() as i64;
+                    if b > 0 {
+                        // Fixed result count: b-1 results from R[A]..R[A+b-2]
+                        let count = b - 1;
+                        if count == 0 {
+                            // Same as Return0
+                            self.flush_cache();
+                        } else if count == 1 {
+                            // Same as Return1
+                            if a != 0 {
+                                let val = self.cached_get_slot(a);
+                                self.flush_and_invalidate_cache();
+                                self.emit_set_slot(0, val);
+                            } else {
+                                self.flush_cache();
+                            }
+                        } else {
+                            // Multiple results: copy R[A]..R[A+count-1] to R[0]..R[count-1]
+                            // Read all values first, then write (avoid overlap)
+                            let mut vals = Vec::with_capacity(count as usize);
+                            for i in 0..count {
+                                vals.push(self.cached_get_slot(a + i));
+                            }
+                            self.flush_and_invalidate_cache();
+                            for (i, &val) in vals.iter().enumerate() {
+                                self.emit_set_slot(i as i64, val);
+                            }
+                        }
+                        let ret_val = self.builder.ins().iconst(types::I64, count);
+                        self.builder.ins().return_(&[ret_val]);
+                        block_terminated = true;
+                    } else {
+                        // Variable results (b == 0): side-exit
+                        self.flush_and_invalidate_cache();
+                        self.builder.ins().jump(self.side_exit_block, &[]);
+                        block_terminated = true;
+                    }
+                }
+
+                OpCode::TailCall => {
+                    let b = inst.b() as i64;
+                    if b > 0 {
+                        // Fixed arg count: nargs = b - 1
+                        let nargs = b - 1;
+                        // Flush cache so args are on the stack
+                        self.flush_and_invalidate_cache();
+                        let func_off = self.builder.ins().iconst(types::I64, a);
+                        let nargs_val = self.builder.ins().iconst(types::I64, nargs);
+                        // nresults = -1 (return all results from callee)
+                        let nresults_val = self.builder.ins().iconst(types::I64, -1i64);
+                        let call = self.builder.ins().call(
+                            self.tailcall_ref,
+                            &[self.vm_ptr, self.base, func_off, nargs_val, nresults_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        // Stack may have been resized
+                        self.reload_stack_base();
+                        // Check for SIDE_EXIT
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let is_exit =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, result, exit_val);
+                        let cont = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(is_exit, self.side_exit_block, &[], cont, &[]);
+                        self.builder.switch_to_block(cont);
+                        self.builder.seal_block(cont);
+                        // Return the result count (results are at R[0]..R[n-1])
+                        self.builder.ins().return_(&[result]);
+                        block_terminated = true;
+                    } else {
+                        // Variable args (b == 0): side-exit
+                        self.flush_and_invalidate_cache();
+                        self.builder.ins().jump(self.side_exit_block, &[]);
+                        block_terminated = true;
+                    }
                 }
 
                 // These are skipped as part of arithmetic (already incremented pc above)
@@ -4189,8 +4304,8 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_return_general_side_exit() {
-        // `return 1, 2, 3` uses general Return opcode → side exit
+    fn test_proto_return_multiple_values() {
+        // `return 1, 2, 3` uses general Return opcode — now handled natively
         let (proto, _strings) = compile(b"return 1, 2, 3", "test").unwrap();
         let mut compiler = JitCompiler::new().unwrap();
         let mut gc = GcHeap::new();
@@ -4199,7 +4314,10 @@ mod tests {
         let mut vm = Vm::new();
         vm.stack.resize(256, TValue::nil());
         let nresults = unsafe { func(&mut vm as *mut Vm, 0) };
-        assert_eq!(nresults, SIDE_EXIT, "general Return should trigger side exit");
+        assert_eq!(nresults, 3, "Return should return 3 results");
+        assert_eq!(vm.stack[0].as_integer(), Some(1));
+        assert_eq!(vm.stack[1].as_integer(), Some(2));
+        assert_eq!(vm.stack[2].as_integer(), Some(3));
     }
 
     #[test]
@@ -4834,7 +4952,7 @@ mod tests {
                     if let Ok(jit_fn) =
                         jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx)
                     {
-                        vm.jit_functions.insert(proto_idx, jit_fn);
+                        vm.jit_register(proto_idx, jit_fn);
                     }
                 }
             });
@@ -5248,7 +5366,7 @@ mod tests {
                     if let Ok(jit_fn) =
                         jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx)
                     {
-                        vm.jit_functions.insert(proto_idx, jit_fn);
+                        vm.jit_register(proto_idx, jit_fn);
                     }
                 }
             });
@@ -5324,7 +5442,7 @@ mod tests {
         let results = selune_vm::dispatch::call_function(&mut vm, closure_val, &[]).unwrap();
         assert_eq!(results[0].as_integer(), Some(500500));
         // No functions should have been JIT compiled
-        assert!(vm.jit_functions.is_empty());
+        assert!(!vm.jit_proto_state.iter().any(|s| matches!(s, selune_vm::vm::JitProtoState::Compiled(_))));
     }
 
     #[test]
@@ -5537,7 +5655,7 @@ mod tests {
                     if let Ok(jit_fn) =
                         jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx)
                     {
-                        vm.jit_functions.insert(proto_idx, jit_fn);
+                        vm.jit_register(proto_idx, jit_fn);
                     }
                 }
             });

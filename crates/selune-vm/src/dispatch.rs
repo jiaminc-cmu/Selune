@@ -1,7 +1,7 @@
 //! Main bytecode dispatch loop.
 
 use crate::arith::{self, ArithOp};
-use crate::callinfo::{CallInfo, CallStatus, CloseReturnYieldData};
+use crate::callinfo::{CallInfo, CallStatus, CloseReturnYieldData, JitCallInfo};
 use crate::coerce;
 use crate::compare;
 use crate::error::LuaError;
@@ -18,13 +18,13 @@ use selune_core::value::TValue;
 #[inline]
 fn check_backedge_jit(vm: &mut Vm, proto_idx: usize, osr_pc: usize) -> bool {
     if !vm.jit_enabled
-        || vm.jit_blacklist.contains(&proto_idx)
+        || vm.jit_should_skip(proto_idx)
         || proto_idx >= vm.jit_backedge_counts.len()
     {
         return false;
     }
-    // If already have a normal JIT entry, no need for back-edge counting
-    if vm.jit_functions.contains_key(&proto_idx) {
+    // If this OSR entry already failed, don't waste time recompiling
+    if vm.jit_osr_blacklist.contains(&(proto_idx, osr_pc)) {
         return false;
     }
     vm.jit_backedge_counts[proto_idx] += 1;
@@ -2201,8 +2201,7 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                         if child_proto_idx < vm.jit_call_counts.len() {
                             vm.jit_call_counts[child_proto_idx] += 1;
                             if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
-                                && !vm.jit_functions.contains_key(&child_proto_idx)
-                                && !vm.jit_blacklist.contains(&child_proto_idx)
+                                && !vm.jit_should_skip(child_proto_idx)
                             {
                                 if let Some(cb) = vm.jit_compile_callback {
                                     vm.call_stack[ci_idx].pc = pc;
@@ -2211,8 +2210,8 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                             }
                         }
 
-                        // Execute JIT code if available
-                        if let Some(&jit_fn) = vm.jit_functions.get(&child_proto_idx) {
+                        // Execute JIT code if available — use lightweight shadow stack
+                        if let Some(jit_fn) = vm.jit_get_fn(child_proto_idx) {
                             vm.ensure_stack(new_base, max_stack + 1);
 
                             // Nil-fill extra params
@@ -2220,29 +2219,27 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 vm.stack[new_base + i] = TValue::nil();
                             }
 
-                            // Push a CallInfo so runtime helpers can find the closure
-                            let mut ci = CallInfo::new(new_base, child_proto_idx);
-                            ci.num_results = num_results;
-                            ci.closure_idx = Some(closure_idx);
-                            ci.func_stack_idx = func_stack_pos;
-                            ci.ftransfer = 1;
-                            ci.ntransfer = num_params as u16;
-                            ci.saved_hook_line = vm.hook_last_line;
-                            vm.call_stack.push(ci);
+                            // Push lightweight JitCallInfo instead of full CallInfo
+                            let jit_ci = JitCallInfo {
+                                base: new_base,
+                                func_stack_idx: func_stack_pos,
+                                proto_idx: child_proto_idx,
+                                closure_idx_raw: closure_idx.0,
+                                num_results: num_results,
+                            };
+                            vm.jit_call_stack.push(jit_ci);
                             vm.call_stack[ci_idx].pc = pc;
 
                             let result = unsafe { jit_fn(vm as *mut Vm, new_base) };
 
                             if result >= 0 {
-                                // JIT succeeded — place results directly at func_stack_pos
                                 let nresults_actual = result as usize;
-                                // Close upvalues for JIT frame
-                                vm.close_upvalues(new_base);
-                                // Pop JIT frame
-                                vm.call_stack.pop();
+                                if !vm.open_upvals.is_empty() {
+                                    vm.close_upvalues(new_base);
+                                }
+                                vm.jit_call_stack.pop();
                                 // Place results without Vec allocation
                                 if num_results < 0 {
-                                    // Multi-return: copy results to func_stack_pos
                                     for i in 0..nresults_actual {
                                         vm.stack[func_stack_pos + i] = vm.stack[new_base + i];
                                     }
@@ -2259,16 +2256,9 @@ pub fn execute_from(vm: &mut Vm, entry_depth: usize) -> Result<Vec<TValue>, LuaE
                                 }
                                 continue;
                             } else {
-                                // SIDE_EXIT — pop the JIT CallInfo, fall through to interpreter
-                                vm.call_stack.pop();
-                                let count = vm.jit_side_exit_counts
-                                    .entry(child_proto_idx)
-                                    .or_insert(0);
-                                *count += 1;
-                                if *count >= 3 {
-                                    vm.jit_functions.remove(&child_proto_idx);
-                                    vm.jit_blacklist.insert(child_proto_idx);
-                                }
+                                // SIDE_EXIT — pop the JIT shadow frame, fall through to interpreter
+                                vm.jit_call_stack.pop();
+                                vm.jit_record_side_exit(child_proto_idx);
                             }
                         }
                     }
@@ -4453,6 +4443,7 @@ fn do_coroutine_resume(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaE
         let mut caller = crate::vm::LuaThread {
             stack: Vec::new(),
             call_stack: Vec::new(),
+            jit_call_stack: Vec::new(),
             stack_top: 0,
             open_upvals: Vec::new(),
             status: CoroutineStatus::Normal,
@@ -5024,8 +5015,7 @@ fn call_function_inner(
             if child_proto_idx < vm.jit_call_counts.len() {
                 vm.jit_call_counts[child_proto_idx] += 1;
                 if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
-                    && !vm.jit_functions.contains_key(&child_proto_idx)
-                    && !vm.jit_blacklist.contains(&child_proto_idx)
+                    && !vm.jit_should_skip(child_proto_idx)
                 {
                     if let Some(cb) = vm.jit_compile_callback {
                         cb(vm, child_proto_idx);
@@ -5033,7 +5023,7 @@ fn call_function_inner(
                 }
             }
 
-            if let Some(&jit_fn) = vm.jit_functions.get(&child_proto_idx) {
+            if let Some(jit_fn) = vm.jit_get_fn(child_proto_idx) {
                 vm.ensure_stack(new_base, max_stack + 1);
 
                 for i in args.len()..num_params {
@@ -5042,41 +5032,35 @@ fn call_function_inner(
 
                 let saved_top = vm.stack_top;
 
-                // Push CallInfo so runtime helpers can find the closure
-                let mut ci = CallInfo::new(new_base, child_proto_idx);
-                ci.num_results = -1;
-                ci.closure_idx = Some(closure_idx);
-                ci.func_stack_idx = func_pos;
-                ci.ftransfer = 1;
-                ci.ntransfer = num_params as u16;
-                ci.saved_hook_line = vm.hook_last_line;
-                vm.call_stack.push(ci);
+                // Push lightweight JitCallInfo instead of full CallInfo
+                let jit_ci = JitCallInfo {
+                    base: new_base,
+                    func_stack_idx: func_pos,
+                    proto_idx: child_proto_idx,
+                    closure_idx_raw: closure_idx.0,
+                    num_results: -1,
+                };
+                vm.jit_call_stack.push(jit_ci);
 
                 let result = unsafe { jit_fn(vm as *mut Vm, new_base) };
 
                 if result >= 0 {
                     let nresults_actual = result as usize;
-                    // Copy results to a stack-local buffer to avoid overlap issues
-                    let mut results_buf = [TValue::nil(); 16];
-                    let n = nresults_actual.min(16);
-                    for i in 0..n {
-                        results_buf[i] = vm.stack[new_base + i];
+                    if !vm.open_upvals.is_empty() {
+                        vm.close_upvalues(new_base);
                     }
-                    vm.close_upvalues(new_base);
-                    vm.call_stack.pop();
+                    vm.jit_call_stack.pop();
                     vm.stack_top = saved_top;
-                    return Ok(results_buf[..n].to_vec());
-                } else {
-                    // SIDE_EXIT — pop JIT frame, fall through to interpreter
-                    vm.call_stack.pop();
-                    let count = vm.jit_side_exit_counts
-                        .entry(child_proto_idx)
-                        .or_insert(0);
-                    *count += 1;
-                    if *count >= 3 {
-                        vm.jit_functions.remove(&child_proto_idx);
-                        vm.jit_blacklist.insert(child_proto_idx);
+                    // Direct copy — no overlap since func_pos < new_base
+                    let mut results = Vec::with_capacity(nresults_actual);
+                    for i in 0..nresults_actual {
+                        results.push(vm.stack[new_base + i]);
                     }
+                    return Ok(results);
+                } else {
+                    // SIDE_EXIT — pop JIT shadow frame, fall through to interpreter
+                    vm.jit_call_stack.pop();
+                    vm.jit_record_side_exit(child_proto_idx);
                 }
             }
         }
@@ -7738,6 +7722,7 @@ fn do_coro_close(vm: &mut Vm, args: &[TValue]) -> Result<Vec<TValue>, LuaError> 
         let mut caller = crate::vm::LuaThread {
             stack: Vec::new(),
             call_stack: Vec::new(),
+            jit_call_stack: Vec::new(),
             stack_top: 0,
             open_upvals: Vec::new(),
             status: CoroutineStatus::Normal,

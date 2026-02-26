@@ -29,8 +29,13 @@ done
 # JIT benchmark list
 JIT_BENCHMARKS=(
     jit_sum_loop
-    jit_heavy_arith
     jit_float_arith
+    jit_heavy_arith
+    jit_backedge
+    jit_osr
+    jit_generic_for
+    jit_table_ops
+    jit_float_forloop
 )
 
 # Color output
