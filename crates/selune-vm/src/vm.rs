@@ -75,6 +75,19 @@ pub struct SelfIcEntry {
     pub cached_jit_fn_ptr: u64,
 }
 
+/// Inline cache entry for GetField/SetField (field access by string key).
+/// Caches the IndexMap entry index for a specific (table, shape) pair,
+/// enabling O(1) indexed access instead of hash lookup.
+#[repr(C)]
+pub struct FieldIcEntry {
+    /// GcIdx.0 of the cached table (0 = IC empty/unpopulated).
+    pub cached_table_idx: u64,
+    /// shape_version of the table when IC was populated.
+    pub cached_shape_version: u64,
+    /// Index into IndexMap's entries array for the cached field.
+    pub cached_field_index: u64,
+}
+
 /// Per-table metadata for JIT inline caches. #[repr(C)] for predictable layout
 /// accessible from JIT-generated code via pointer arithmetic.
 /// Parallel to gc.tables — index i corresponds to table GcIdx(i).
@@ -326,6 +339,9 @@ pub struct Vm {
     /// Keyed by (proto_idx, pc) → Box<SelfIcEntry>. Boxed for stable pointer identity
     /// (the JIT bakes the IC entry pointer as a constant).
     pub jit_self_ic: HashMap<(usize, usize), Box<SelfIcEntry>>,
+    /// Inline cache entries for GetField/SetField string-keyed access.
+    /// Keyed by (proto_idx, pc) → Box<FieldIcEntry>. Boxed for stable pointer identity.
+    pub jit_field_ic: HashMap<(usize, usize), Box<FieldIcEntry>>,
     /// Per-proto tiny method classification. Parallel to `protos`.
     /// Populated at proto store time by `analyze_tiny_method()`.
     pub tiny_methods: Vec<TinyMethodKind>,
@@ -471,6 +487,7 @@ impl Vm {
             jit_osr_compile_callback: None,
             builtin_natives: HashMap::new(),
             jit_self_ic: HashMap::new(),
+            jit_field_ic: HashMap::new(),
             tiny_methods: Vec::new(),
             table_meta: Vec::new(),
         }
@@ -541,6 +558,22 @@ impl Vm {
                 })
             });
         &mut **entry as *mut SelfIcEntry
+    }
+
+    /// Get or create a field IC entry for a GetField/SetField site, returning a raw pointer.
+    /// The Box ensures the pointer is stable across HashMap resizes.
+    pub fn jit_get_or_create_field_ic(&mut self, proto_idx: usize, pc: usize) -> *mut FieldIcEntry {
+        let entry = self
+            .jit_field_ic
+            .entry((proto_idx, pc))
+            .or_insert_with(|| {
+                Box::new(FieldIcEntry {
+                    cached_table_idx: 0,
+                    cached_shape_version: 0,
+                    cached_field_index: 0,
+                })
+            });
+        &mut **entry as *mut FieldIcEntry
     }
 
     /// Record a side-exit for a proto. After 3 exits, blacklists the proto.
