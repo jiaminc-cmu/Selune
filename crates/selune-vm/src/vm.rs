@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::callinfo::CallInfo;
+use crate::callinfo::{CallInfo, JitCallInfo};
 use crate::dispatch;
 use crate::error::LuaError;
 use crate::metamethod::MetamethodNames;
@@ -18,11 +18,23 @@ use selune_core::value::TValue;
 /// Signature: (vm_ptr, base) -> result_count or -1 (side-exit)
 pub type JitFn = unsafe extern "C" fn(*mut Vm, usize) -> i64;
 
+/// Per-proto JIT compilation state. Replaces separate HashMap/HashSet with a single Vec lookup.
+#[derive(Clone, Copy, Debug)]
+pub enum JitProtoState {
+    /// Not yet compiled (or never attempted).
+    None,
+    /// Successfully compiled to native code.
+    Compiled(JitFn),
+    /// Blacklisted: too many side-exits, will not be recompiled.
+    Blacklisted,
+}
+
 /// Per-coroutine state (stack, call stack, upvalues).
 #[derive(Clone)]
 pub struct LuaThread {
     pub stack: Vec<TValue>,
     pub call_stack: Vec<CallInfo>,
+    pub jit_call_stack: Vec<JitCallInfo>,
     pub stack_top: usize,
     pub open_upvals: Vec<(usize, GcIdx<UpVal>)>,
     pub status: CoroutineStatus,
@@ -68,6 +80,8 @@ pub struct Vm {
     pub stack: Vec<TValue>,
     /// Call stack (frames) — belongs to the running thread.
     pub call_stack: Vec<CallInfo>,
+    /// Lightweight JIT call stack (shadow stack) — used for JIT-to-JIT calls only.
+    pub jit_call_stack: Vec<JitCallInfo>,
     /// GC heap.
     pub gc: GcHeap,
     /// String interner (shared with compiler output).
@@ -219,27 +233,27 @@ pub struct Vm {
     pub redirect_natives: Vec<bool>,
 
     // --- JIT fields ---
-    /// JIT-compiled function cache: proto_idx → native function pointer.
-    pub jit_functions: HashMap<usize, JitFn>,
+    /// Per-proto JIT state: None / Compiled(fn) / Blacklisted. Indexed by proto_idx for O(1) lookup.
+    pub jit_proto_state: Vec<JitProtoState>,
     /// Per-proto call counter for tier-up decisions.
     pub jit_call_counts: Vec<u32>,
-    /// Per-proto side-exit counter. After too many side-exits, stop trying JIT.
-    pub jit_side_exit_counts: HashMap<usize, u32>,
+    /// Per-proto side-exit counter. After too many side-exits, the proto is blacklisted.
+    pub jit_side_exit_counts: Vec<u32>,
     /// Threshold: compile to JIT after this many calls.
     pub jit_threshold: u32,
     /// Whether JIT is enabled.
     pub jit_enabled: bool,
     /// Optional JIT compilation callback. Called when a proto reaches the tier-up threshold.
-    /// The callback should attempt compilation and store the result in vm.jit_functions.
+    /// The callback should attempt compilation and store the result via vm.jit_register().
     pub jit_compile_callback: Option<fn(&mut Vm, usize)>,
     /// Per-proto back-edge counter for detecting hot loops.
     pub jit_backedge_counts: Vec<u32>,
     /// Threshold: trigger JIT compilation after this many back-edge hits.
     pub jit_backedge_threshold: u32,
-    /// Protos that have been blacklisted from JIT (failed too many times).
-    pub jit_blacklist: HashSet<usize>,
     /// OSR-compiled functions: (proto_idx, entry_pc) → native function pointer.
     pub jit_osr_functions: HashMap<(usize, usize), JitFn>,
+    /// OSR entries that have failed (side-exited) and should not be recompiled.
+    pub jit_osr_blacklist: HashSet<(usize, usize)>,
     /// Optional OSR compilation callback. Called when a back-edge triggers OSR.
     pub jit_osr_compile_callback: Option<fn(&mut Vm, usize, usize)>,
 }
@@ -290,7 +304,8 @@ impl Vm {
         let stack = vec![TValue::nil(); 1024];
         Vm {
             stack,
-            call_stack: Vec::new(),
+            call_stack: Vec::with_capacity(32),
+            jit_call_stack: Vec::with_capacity(32),
             gc: GcHeap::new(),
             strings: StringInterner::new(),
             stack_top: 0,
@@ -365,16 +380,16 @@ impl Vm {
             in_gc: false,
             needs_close_return_resume: false,
             redirect_natives: Vec::new(),
-            jit_functions: HashMap::new(),
+            jit_proto_state: Vec::new(),
             jit_call_counts: Vec::new(),
-            jit_side_exit_counts: HashMap::new(),
+            jit_side_exit_counts: Vec::new(),
             jit_threshold: 1000,
             jit_enabled: false,
             jit_compile_callback: None,
             jit_backedge_counts: Vec::new(),
             jit_backedge_threshold: 10_000,
-            jit_blacklist: HashSet::new(),
             jit_osr_functions: HashMap::new(),
+            jit_osr_blacklist: HashSet::new(),
             jit_osr_compile_callback: None,
         }
     }
@@ -393,6 +408,63 @@ impl Vm {
     pub fn is_redirect_native(&self, idx: GcIdx<NativeFunction>) -> bool {
         let i = idx.0 as usize;
         i < self.redirect_natives.len() && self.redirect_natives[i]
+    }
+
+    // --- JIT helper methods ---
+
+    /// Get the JIT function pointer for a proto, if compiled. O(1) Vec lookup.
+    #[inline]
+    pub fn jit_get_fn(&self, proto_idx: usize) -> Option<JitFn> {
+        match self.jit_proto_state.get(proto_idx) {
+            Some(JitProtoState::Compiled(f)) => Some(*f),
+            _ => Option::None,
+        }
+    }
+
+    /// Check if a proto should be skipped for JIT compilation (already compiled or blacklisted).
+    #[inline]
+    pub fn jit_should_skip(&self, proto_idx: usize) -> bool {
+        matches!(
+            self.jit_proto_state.get(proto_idx),
+            Some(JitProtoState::Compiled(_)) | Some(JitProtoState::Blacklisted)
+        )
+    }
+
+    /// Register a JIT-compiled function for a proto. Defensively resizes if needed.
+    #[inline]
+    pub fn jit_register(&mut self, proto_idx: usize, jit_fn: JitFn) {
+        if proto_idx >= self.jit_proto_state.len() {
+            self.jit_proto_state
+                .resize(proto_idx + 1, JitProtoState::None);
+        }
+        self.jit_proto_state[proto_idx] = JitProtoState::Compiled(jit_fn);
+    }
+
+    /// Record a side-exit for a proto. After 3 exits, blacklists the proto.
+    #[inline]
+    pub fn jit_record_side_exit(&mut self, proto_idx: usize) {
+        if proto_idx >= self.jit_side_exit_counts.len() {
+            self.jit_side_exit_counts.resize(proto_idx + 1, 0);
+        }
+        self.jit_side_exit_counts[proto_idx] += 1;
+        if self.jit_side_exit_counts[proto_idx] >= 3 {
+            if proto_idx < self.jit_proto_state.len() {
+                self.jit_proto_state[proto_idx] = JitProtoState::Blacklisted;
+            }
+        }
+    }
+
+    /// Get the closure_idx of the innermost call frame.
+    /// Checks jit_call_stack first (JIT frames are always innermost when active).
+    #[inline]
+    pub fn current_closure_idx(&self) -> Option<GcIdx<selune_core::gc::LuaClosure>> {
+        if let Some(jf) = self.jit_call_stack.last() {
+            Some(GcIdx(jf.closure_idx_raw, std::marker::PhantomData))
+        } else if let Some(ci) = self.call_stack.last() {
+            ci.closure_idx
+        } else {
+            None
+        }
     }
 
     /// Mark all redirect natives in the bitset. Called once after all stdlib registration.
@@ -641,8 +713,10 @@ impl Vm {
     fn store_proto_tree(&mut self, proto: &Proto) -> usize {
         let idx = self.protos.len();
         self.protos.push(proto.clone());
-        // Keep jit_call_counts and jit_backedge_counts in sync with protos
+        // Keep JIT vectors in sync with protos
+        self.jit_proto_state.push(JitProtoState::None);
         self.jit_call_counts.push(0);
+        self.jit_side_exit_counts.push(0);
         self.jit_backedge_counts.push(0);
         // Recursively flatten child protos into vm.protos and record flat indices
         let num_children = self.protos[idx].protos.len();
@@ -932,6 +1006,7 @@ impl Vm {
         let mut thread = LuaThread {
             stack: vec![TValue::nil(); 256],
             call_stack: Vec::new(),
+            jit_call_stack: Vec::new(),
             stack_top: 0,
             open_upvals: Vec::new(),
             status: CoroutineStatus::Suspended,
@@ -989,6 +1064,7 @@ impl Vm {
     pub fn save_running_state_swap(&mut self, thread: &mut LuaThread) {
         std::mem::swap(&mut self.stack, &mut thread.stack);
         std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
+        std::mem::swap(&mut self.jit_call_stack, &mut thread.jit_call_stack);
         std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
         thread.stack_top = self.stack_top;
         thread.hook_func = self.hook_func;
@@ -1006,6 +1082,7 @@ impl Vm {
     pub fn restore_running_state_swap(&mut self, thread: &mut LuaThread) {
         std::mem::swap(&mut self.stack, &mut thread.stack);
         std::mem::swap(&mut self.call_stack, &mut thread.call_stack);
+        std::mem::swap(&mut self.jit_call_stack, &mut thread.jit_call_stack);
         std::mem::swap(&mut self.open_upvals, &mut thread.open_upvals);
         self.stack_top = thread.stack_top;
         self.hook_func = thread.hook_func;
@@ -1023,6 +1100,10 @@ impl Vm {
         std::mem::swap(
             &mut self.call_stack,
             &mut self.coroutines[coro_id].call_stack,
+        );
+        std::mem::swap(
+            &mut self.jit_call_stack,
+            &mut self.coroutines[coro_id].jit_call_stack,
         );
         std::mem::swap(
             &mut self.open_upvals,
@@ -1045,6 +1126,10 @@ impl Vm {
         std::mem::swap(
             &mut self.call_stack,
             &mut self.coroutines[coro_id].call_stack,
+        );
+        std::mem::swap(
+            &mut self.jit_call_stack,
+            &mut self.coroutines[coro_id].jit_call_stack,
         );
         std::mem::swap(
             &mut self.open_upvals,

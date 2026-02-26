@@ -1,8 +1,10 @@
 use selune_compiler::proto::Constant;
 use selune_core::value::TValue;
 use selune_vm::arith;
+use selune_vm::callinfo::{CallInfo, JitCallInfo};
 use selune_vm::dispatch::{
-    call_function, close_tbc_variables, constant_to_tvalue, table_index, table_newindex,
+    call_function, close_tbc_variables, constant_to_tvalue, execute_from, table_index,
+    table_newindex,
 };
 use selune_vm::vm::Vm;
 
@@ -99,8 +101,7 @@ pub unsafe extern "C" fn jit_rt_get_stack_slot(
 #[no_mangle]
 pub unsafe extern "C" fn jit_rt_get_upval(vm_ptr: *mut Vm, upval_idx: u64) -> u64 {
     let vm = &mut *vm_ptr;
-    let ci = vm.call_stack.last().expect("jit_rt_get_upval: no call frame");
-    let closure_idx = ci.closure_idx.expect("jit_rt_get_upval: no closure");
+    let closure_idx = vm.current_closure_idx().expect("jit_rt_get_upval: no closure");
     let uv_idx = vm.gc.get_closure(closure_idx).upvalues[upval_idx as usize];
     vm.get_upval_value(uv_idx).raw_bits()
 }
@@ -114,8 +115,7 @@ pub unsafe extern "C" fn jit_rt_get_upval(vm_ptr: *mut Vm, upval_idx: u64) -> u6
 #[no_mangle]
 pub unsafe extern "C" fn jit_rt_set_upval(vm_ptr: *mut Vm, upval_idx: u64, val_bits: u64) {
     let vm = &mut *vm_ptr;
-    let ci = vm.call_stack.last().expect("jit_rt_set_upval: no call frame");
-    let closure_idx = ci.closure_idx.expect("jit_rt_set_upval: no closure");
+    let closure_idx = vm.current_closure_idx().expect("jit_rt_set_upval: no closure");
     let uv_idx = vm.gc.get_closure(closure_idx).upvalues[upval_idx as usize];
     let val = TValue::from_raw_bits(val_bits);
     vm.set_upval_value(uv_idx, val);
@@ -136,8 +136,7 @@ pub unsafe extern "C" fn jit_rt_get_tab_up(
     const_c: u64,
 ) -> u64 {
     let vm = &mut *vm_ptr;
-    let ci = vm.call_stack.last().expect("jit_rt_get_tab_up: no call frame");
-    let closure_idx = ci.closure_idx.expect("jit_rt_get_tab_up: no closure");
+    let closure_idx = vm.current_closure_idx().expect("jit_rt_get_tab_up: no closure");
     let uv_idx = vm.gc.get_closure(closure_idx).upvalues[upval_b as usize];
     let table_val = vm.get_upval_value(uv_idx);
 
@@ -173,8 +172,7 @@ pub unsafe extern "C" fn jit_rt_set_tab_up(
     k_flag: u64,
 ) -> i64 {
     let vm = &mut *vm_ptr;
-    let ci = vm.call_stack.last().expect("jit_rt_set_tab_up: no call frame");
-    let closure_idx = ci.closure_idx.expect("jit_rt_set_tab_up: no closure");
+    let closure_idx = vm.current_closure_idx().expect("jit_rt_set_tab_up: no closure");
     let uv_idx = vm.gc.get_closure(closure_idx).upvalues[upval_a as usize];
     let table_val = vm.get_upval_value(uv_idx);
 
@@ -274,6 +272,301 @@ pub unsafe extern "C" fn jit_rt_call(
     }
 }
 
+/// Fast call: invokes the function at stack[base + func_off] with
+/// `nargs` arguments already on the stack at stack[base + func_off + 1 ..].
+///
+/// Optimizations over `jit_rt_call`:
+/// - **No Vec allocation for args**: reads args directly from the stack.
+/// - **JIT-to-JIT fast path**: if callee has JIT code, calls it directly
+///   with zero heap allocation (push CallInfo, call jit_fn, pop CallInfo).
+/// - **Interpreter fast path**: for non-JIT Lua closures, pushes CallInfo
+///   and calls `execute_from` directly (skips `call_function` indirection).
+/// - Falls back to `call_function` only for native functions and `__call`.
+///
+/// Returns number of results, or SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_call_fast(
+    vm_ptr: *mut Vm,
+    base: u64,
+    func_off: u64,
+    nargs: u64,
+    nresults: i64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let func_idx = base as usize + func_off as usize;
+    let func_val = vm.stack[func_idx];
+    let nargs = nargs as usize;
+    let arg_end = func_idx + 1 + nargs;
+
+    // Save/restore stack_top (critical — call_function and execute_from use it)
+    let saved_stack_top = vm.stack_top;
+    if vm.stack_top < arg_end {
+        vm.stack_top = arg_end;
+    }
+
+    if let Some(closure_idx) = func_val.as_closure_idx() {
+        // Lua closure call — fast path
+        let closure = vm.gc.get_closure(closure_idx);
+        let child_proto_idx = closure.proto_idx;
+        let child_proto = &vm.protos[child_proto_idx];
+        let num_params = child_proto.num_params as usize;
+        let is_vararg = child_proto.is_vararg;
+        let max_stack = child_proto.max_stack_size as usize;
+
+        if vm.call_stack.len() + vm.jit_call_stack.len() >= vm.max_call_depth {
+            vm.stack_top = saved_stack_top;
+            return SIDE_EXIT;
+        }
+
+        let new_base = func_idx + 1;
+
+        // Ensure stack space
+        let needed = new_base + max_stack + num_params + 1;
+        if needed > vm.stack.len() {
+            vm.stack.resize(needed, TValue::nil());
+        }
+
+        // Pad with nil if fewer args than params
+        for i in nargs..num_params {
+            vm.stack[new_base + i] = TValue::nil();
+        }
+
+        // --- JIT-to-JIT fast path (non-vararg only) ---
+        if !is_vararg && vm.jit_enabled {
+            // Check for already-compiled JIT function first (skip counter overhead)
+            if let Some(jit_fn) = vm.jit_get_fn(child_proto_idx) {
+                // Lightweight JIT-to-JIT call using shadow stack (~32 bytes vs ~120 bytes CallInfo)
+                let jit_ci = JitCallInfo {
+                    base: new_base,
+                    func_stack_idx: func_idx,
+                    proto_idx: child_proto_idx,
+                    closure_idx_raw: closure_idx.0,
+                    num_results: nresults as i32,
+                };
+                vm.jit_call_stack.push(jit_ci);
+
+                let result = jit_fn(vm as *mut Vm, new_base);
+
+                if result >= 0 {
+                    // Close upvalues only if any are open
+                    if !vm.open_upvals.is_empty() {
+                        vm.close_upvalues(new_base);
+                    }
+                    vm.jit_call_stack.pop();
+                    vm.stack_top = saved_stack_top;
+
+                    // Specialized result placement (most common cases first)
+                    if nresults == 1 {
+                        // Single result — most common for expressions like f(x) + g(x)
+                        vm.stack[func_idx] = if result > 0 { vm.stack[new_base] } else { TValue::nil() };
+                        return 1;
+                    } else if nresults == 0 {
+                        // Zero results — call for side effects only
+                        return 0;
+                    } else {
+                        // Multi-result
+                        let nresults_actual = result as usize;
+                        let wanted = if nresults < 0 {
+                            nresults_actual as i64
+                        } else {
+                            nresults
+                        };
+                        let n = (wanted as usize).min(nresults_actual);
+                        for i in 0..n {
+                            vm.stack[func_idx + i] = vm.stack[new_base + i];
+                        }
+                        for i in n..wanted as usize {
+                            vm.stack[func_idx + i] = TValue::nil();
+                        }
+                        return wanted;
+                    }
+                } else {
+                    // SIDE_EXIT from callee
+                    vm.jit_call_stack.pop();
+                    vm.jit_record_side_exit(child_proto_idx);
+                    // Fall through to interpreter path below
+                }
+            } else {
+                // Not yet compiled — increment call count, maybe trigger compilation
+                if child_proto_idx < vm.jit_call_counts.len() {
+                    vm.jit_call_counts[child_proto_idx] += 1;
+                    if vm.jit_call_counts[child_proto_idx] == vm.jit_threshold
+                        && !vm.jit_should_skip(child_proto_idx)
+                    {
+                        if let Some(cb) = vm.jit_compile_callback {
+                            cb(vm, child_proto_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Interpreter fallback for Lua closures ---
+        // Push CallInfo and call execute_from directly (skip call_function indirection)
+        if is_vararg {
+            // Vararg setup: move args to vararg area
+            let actual_base = new_base + nargs;
+            let needed_va = actual_base + max_stack + 1;
+            if needed_va > vm.stack.len() {
+                vm.stack.resize(needed_va, TValue::nil());
+            }
+            for i in 0..num_params.min(nargs) {
+                vm.stack[actual_base + i] = vm.stack[new_base + i];
+            }
+            for i in nargs..num_params {
+                vm.stack[actual_base + i] = TValue::nil();
+            }
+            vm.stack_top = actual_base + max_stack;
+
+            let entry_depth = vm.call_stack.len() + 1;
+            let mut ci = CallInfo::new(actual_base, child_proto_idx);
+            ci.num_results = -1;
+            ci.closure_idx = Some(closure_idx);
+            ci.func_stack_idx = func_idx;
+            ci.vararg_base = Some(new_base);
+            ci.ftransfer = 1;
+            ci.ntransfer = num_params as u16;
+            ci.saved_hook_line = vm.hook_last_line;
+            vm.call_stack.push(ci);
+
+            match execute_from(vm, entry_depth) {
+                Ok(results) => {
+                    vm.call_stack.truncate(entry_depth - 1);
+                    vm.stack_top = saved_stack_top;
+                    let wanted = if nresults < 0 {
+                        results.len() as i64
+                    } else {
+                        nresults
+                    };
+                    for i in 0..wanted as usize {
+                        let val = results.get(i).copied().unwrap_or(TValue::nil());
+                        vm.stack[func_idx + i] = val;
+                    }
+                    return wanted;
+                }
+                Err(_) => {
+                    vm.call_stack.truncate(entry_depth - 1);
+                    vm.stack_top = saved_stack_top;
+                    return SIDE_EXIT;
+                }
+            }
+        } else {
+            // Non-vararg, non-JIT: use execute_from directly
+            vm.stack_top = new_base + max_stack;
+
+            let entry_depth = vm.call_stack.len() + 1;
+            let mut ci = CallInfo::new(new_base, child_proto_idx);
+            ci.num_results = -1;
+            ci.closure_idx = Some(closure_idx);
+            ci.func_stack_idx = func_idx;
+            ci.ftransfer = 1;
+            ci.ntransfer = num_params as u16;
+            ci.saved_hook_line = vm.hook_last_line;
+            vm.call_stack.push(ci);
+
+            match execute_from(vm, entry_depth) {
+                Ok(results) => {
+                    vm.call_stack.truncate(entry_depth - 1);
+                    vm.stack_top = saved_stack_top;
+                    let wanted = if nresults < 0 {
+                        results.len() as i64
+                    } else {
+                        nresults
+                    };
+                    for i in 0..wanted as usize {
+                        let val = results.get(i).copied().unwrap_or(TValue::nil());
+                        vm.stack[func_idx + i] = val;
+                    }
+                    return wanted;
+                }
+                Err(_) => {
+                    vm.call_stack.truncate(entry_depth - 1);
+                    vm.stack_top = saved_stack_top;
+                    return SIDE_EXIT;
+                }
+            }
+        }
+    }
+
+    // Non-closure (native function or __call metamethod) — fall back to call_function
+    // Collect args into a slice from the stack
+    let args: Vec<TValue> = (0..nargs)
+        .map(|i| {
+            let idx = func_idx + 1 + i;
+            if idx < vm.stack.len() {
+                vm.stack[idx]
+            } else {
+                TValue::nil()
+            }
+        })
+        .collect();
+
+    match call_function(vm, func_val, &args) {
+        Ok(results) => {
+            vm.stack_top = saved_stack_top;
+            let wanted = if nresults < 0 {
+                results.len() as i64
+            } else {
+                nresults
+            };
+            for i in 0..wanted as usize {
+                let val = results.get(i).copied().unwrap_or(TValue::nil());
+                if func_idx + i >= vm.stack.len() {
+                    vm.stack.resize(func_idx + i + 1, TValue::nil());
+                }
+                vm.stack[func_idx + i] = val;
+            }
+            wanted
+        }
+        Err(_) => {
+            vm.stack_top = saved_stack_top;
+            SIDE_EXIT
+        }
+    }
+}
+
+/// TailCall handler: calls function at stack[base + func_off] and places
+/// results at stack[base + 0..] (the JIT return convention position).
+///
+/// This is like `jit_rt_call_fast` but places results at R[0] instead of R[A],
+/// which is what TailCall needs since the JIT caller will return these results.
+///
+/// Returns number of results, or SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_tailcall(
+    vm_ptr: *mut Vm,
+    base: u64,
+    func_off: u64,
+    nargs: u64,
+    nresults: i64,
+) -> i64 {
+    // Use call_fast to do the actual call — results go to stack[func_idx]
+    let result = jit_rt_call_fast(vm_ptr, base, func_off, nargs, nresults);
+    if result < 0 {
+        return SIDE_EXIT;
+    }
+
+    let vm = &mut *vm_ptr;
+    let func_idx = base as usize + func_off as usize;
+    let base = base as usize;
+
+    // Move results from stack[func_idx..] to stack[base..]
+    if func_idx != base {
+        let count = result as usize;
+        for i in 0..count {
+            vm.stack[base + i] = vm.stack[func_idx + i];
+        }
+    }
+
+    result
+}
+
 /// Self: R[A+1] = R[B]; R[A] = table_index(R[B], key)
 /// `key_bits` is the raw TValue of the key (constant or register value).
 ///
@@ -310,6 +603,91 @@ pub unsafe extern "C" fn jit_rt_self(
                 vm.stack.resize(idx_a + 1, TValue::nil());
             }
             vm.stack[idx_a] = result;
+            0
+        }
+        Err(_) => SIDE_EXIT,
+    }
+}
+
+/// Fast Self: R[A+1] = R[B]; R[A] = lookup(R[B], key)
+///
+/// Mirrors the interpreter's Self_ fast path (dispatch.rs Self_ handler):
+/// 1. Raw lookup in object table (string key fast path)
+/// 2. If nil + has metatable → check `__index`
+/// 3. If `__index` is a table → raw lookup in that table
+/// 4. Only fall back to full `table_index()` for deep chains or function `__index`
+///
+/// Returns 0 on success, SIDE_EXIT on error.
+///
+/// # Safety
+/// - `vm_ptr` must be a valid pointer to a live `Vm`.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_self_fast(
+    vm_ptr: *mut Vm,
+    base: u64,
+    a: u64,
+    b: u64,
+    key_bits: u64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let base = base as usize;
+    let a = a as usize;
+    let b = b as usize;
+
+    let table_val = vm.stack[base + b];
+    // R[A+1] = R[B] (self/receiver)
+    vm.stack[base + a + 1] = table_val;
+
+    let key = TValue::from_raw_bits(key_bits);
+
+    // Fast path: table with string key
+    if let Some(table_idx) = table_val.as_table_idx() {
+        let key_sid = key.as_string_id();
+
+        // Step 1: Raw lookup in the object table
+        let raw_result = if let Some(sid) = key_sid {
+            vm.gc.get_table(table_idx).raw_get_str(sid)
+        } else {
+            vm.gc.table_raw_get(table_idx, key)
+        };
+
+        if !raw_result.is_nil() {
+            vm.stack[base + a] = raw_result;
+            return 0;
+        }
+
+        // Step 2: Check metatable.__index
+        let table = vm.gc.get_table(table_idx);
+        if let Some(mt_idx) = table.metatable {
+            let mm_index_name = vm.mm_names.as_ref().unwrap().index;
+            let mm_val = vm.gc.get_table(mt_idx).raw_get_str(mm_index_name);
+
+            if let Some(idx_table_idx) = mm_val.as_table_idx() {
+                // Step 3: __index is a table → direct lookup
+                let idx_result = if let Some(sid) = key_sid {
+                    vm.gc.get_table(idx_table_idx).raw_get_str(sid)
+                } else {
+                    vm.gc.table_raw_get(idx_table_idx, key)
+                };
+
+                if !idx_result.is_nil() {
+                    vm.stack[base + a] = idx_result;
+                    return 0;
+                }
+                // Fall through to full table_index for deeper chains
+            }
+            // __index is a function or deeper chain → fall through
+        } else {
+            // No metatable, raw miss → nil
+            vm.stack[base + a] = TValue::nil();
+            return 0;
+        }
+    }
+
+    // Slow path: full metamethod dispatch
+    match table_index(vm, table_val, key) {
+        Ok(result) => {
+            vm.stack[base + a] = result;
             0
         }
         Err(_) => SIDE_EXIT,
@@ -792,6 +1170,10 @@ pub unsafe extern "C" fn jit_rt_tbc(
     // Non-nil/non-false values must have a __close metamethod
     let mm_name = vm.mm_names.as_ref().unwrap().close;
     if selune_vm::metamethod::get_metamethod(val, mm_name, &vm.gc).is_some() {
+        // If the innermost frame is a JIT shadow frame, side-exit — JitCallInfo has no tbc_slots.
+        if !vm.jit_call_stack.is_empty() {
+            return SIDE_EXIT;
+        }
         // Register the TBC slot in the current CallInfo
         let ci_idx = vm.call_stack.len() - 1;
         let tbc_slots = vm.call_stack[ci_idx]
@@ -835,8 +1217,7 @@ pub unsafe extern "C" fn jit_rt_closure(
         upval_descs.push((desc.in_stack, desc.index));
     }
 
-    let ci_idx = vm.call_stack.len() - 1;
-    let closure_idx_opt = vm.call_stack[ci_idx].closure_idx;
+    let closure_idx_opt = vm.current_closure_idx();
 
     let mut upvals = Vec::with_capacity(upval_count);
     for i in 0..upval_count {
@@ -1000,3 +1381,4 @@ pub unsafe extern "C" fn jit_rt_forloop_float(vm_ptr: *mut Vm, base: u64, a: u64
     vm.stack[base + a + 3] = TValue::from_float(next);
     1 // continue
 }
+

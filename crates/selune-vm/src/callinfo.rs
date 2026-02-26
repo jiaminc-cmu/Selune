@@ -1,8 +1,25 @@
 //! Call frame information for the VM.
 
 use selune_core::gc::{GcIdx, LuaClosure};
-
 use selune_core::value::TValue;
+
+/// Lightweight call frame for JIT-to-JIT calls (~32 bytes).
+/// Only contains the fields needed for the JIT fast path — avoids
+/// initializing the 10+ fields in CallInfo that JIT doesn't need
+/// (vararg_base, tbc_slots, call_status, tail_count, hooks, etc.).
+#[derive(Clone, Debug)]
+pub struct JitCallInfo {
+    /// Stack base for registers in this frame.
+    pub base: usize,
+    /// Stack position where the function value lives (for result placement).
+    pub func_stack_idx: usize,
+    /// Index into vm.protos[].
+    pub proto_idx: usize,
+    /// Raw GcIdx value for the closure (avoids Option overhead).
+    pub closure_idx_raw: u32,
+    /// Expected number of results (-1 = multi-return).
+    pub num_results: i32,
+}
 
 /// Data for CloseReturnYield status (boxed since it's rare).
 #[derive(Clone, Debug, PartialEq)]
