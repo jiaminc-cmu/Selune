@@ -203,6 +203,10 @@ impl JitCompiler {
             "jit_rt_box_integer",
             runtime::jit_rt_box_integer as *const u8,
         );
+        builder.symbol(
+            "jit_rt_arith_unknown",
+            runtime::jit_rt_arith_unknown as *const u8,
+        );
 
         // Register libm wrappers for inlined math builtins
         builder.symbol("jit_libm_sin", jit_libm_sin as *const u8);
@@ -845,6 +849,21 @@ impl JitCompiler {
             &box_integer_sig,
         )?;
 
+        // jit_rt_arith_unknown(vm_ptr, raw_b, raw_c, op_code) -> i64
+        // Handles Add/Sub/Mul when both operands have Unknown type.
+        // Returns NaN-boxed result (int or float), or SIDE_EXIT on non-number.
+        let mut arith_unknown_sig = Signature::new(call_conv);
+        arith_unknown_sig.params.push(AbiParam::new(types::I64)); // vm_ptr
+        arith_unknown_sig.params.push(AbiParam::new(types::I64)); // raw_b
+        arith_unknown_sig.params.push(AbiParam::new(types::I64)); // raw_c
+        arith_unknown_sig.params.push(AbiParam::new(types::I64)); // op_code
+        arith_unknown_sig.returns.push(AbiParam::new(types::I64));
+        let arith_unknown_id = self.module.declare_function(
+            "jit_rt_arith_unknown",
+            Linkage::Import,
+            &arith_unknown_sig,
+        )?;
+
         // jit_rt_ensure_stack(vm_ptr, min_len)
         let mut ensure_stack_sig = Signature::new(call_conv);
         ensure_stack_sig.params.push(AbiParam::new(types::I64));
@@ -922,6 +941,9 @@ impl JitCompiler {
             let forprep_float_ref = self.module.declare_func_in_func(forprep_float_id, builder.func);
             let forloop_float_ref = self.module.declare_func_in_func(forloop_float_id, builder.func);
             let box_integer_ref = self.module.declare_func_in_func(box_integer_id, builder.func);
+            let arith_unknown_ref =
+                self.module
+                    .declare_func_in_func(arith_unknown_id, builder.func);
             let ensure_stack_ref =
                 self.module
                     .declare_func_in_func(ensure_stack_id, builder.func);
@@ -1022,6 +1044,7 @@ impl JitCompiler {
                 forprep_float_ref,
                 forloop_float_ref,
                 box_integer_ref,
+                arith_unknown_ref,
                 stack_base_var,
                 slot_cache: SlotCache::new(),
                 side_exit_block,
@@ -1334,6 +1357,7 @@ struct BytecodeEmitter<'a, 'b> {
     forprep_float_ref: FuncRef,
     forloop_float_ref: FuncRef,
     box_integer_ref: FuncRef,
+    arith_unknown_ref: FuncRef,
     /// Cranelift Variable for stack_base pointer. Using a Variable instead
     /// of a raw Value avoids SSA domination issues across blocks — Cranelift
     /// automatically inserts block parameters where needed.
@@ -1827,8 +1851,11 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
         nresults: i64,
         candidates: &[(BuiltinId, u64)],
     ) {
-        // Flush cache before branching — all paths need consistent stack state
-        self.flush_and_invalidate_cache();
+        // Flush cache before branching — all paths need consistent stack state.
+        // Keep type hints: the inline path only writes the result slot R[A],
+        // so type knowledge about other slots remains valid. This avoids
+        // expensive Unknown-type branches for slots accessed after the call.
+        self.flush_and_invalidate_cache_keep_hints();
 
         // Load the function value from stack (not cache — already flushed)
         let func_val = self.emit_get_slot(a);
@@ -2390,8 +2417,20 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     let type_b = self.get_slot_type(b);
                     let type_c = self.get_slot_type(c);
 
-                    if type_b == SlotType::Float || type_c == SlotType::Float {
-                        // Float path — fadd/fsub/fmul can't produce NaN from non-NaN inputs
+                    if type_b == SlotType::Integer && type_c == SlotType::Integer {
+                        // Both operands are known integers — use integer arithmetic
+                        let ib = self.cached_get_integer(b);
+                        let ic = self.cached_get_integer(c);
+                        let result = match op {
+                            OpCode::Add => self.builder.ins().iadd(ib, ic),
+                            OpCode::Sub => self.builder.ins().isub(ib, ic),
+                            OpCode::Mul => self.builder.ins().imul(ib, ic),
+                            _ => unreachable!(),
+                        };
+                        let boxed = self.emit_box_integer_safe(result);
+                        self.cached_set_integer(a, result, boxed);
+                    } else if type_b == SlotType::Float || type_c == SlotType::Float {
+                        // At least one operand is known Float — use float path
                         let fb = self.get_as_float(b, type_b);
                         let fc = self.get_as_float(c, type_c);
                         let fresult = match op {
@@ -2403,17 +2442,36 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         let boxed = self.emit_box_float_fast(fresult);
                         self.cached_set_float(a, fresult, boxed);
                     } else {
-                        // Integer path (existing behavior)
-                        let ib = self.cached_get_integer(b);
-                        let ic = self.cached_get_integer(c);
-                        let result = match op {
-                            OpCode::Add => self.builder.ins().iadd(ib, ic),
-                            OpCode::Sub => self.builder.ins().isub(ib, ic),
-                            OpCode::Mul => self.builder.ins().imul(ib, ic),
+                        // At least one operand is Unknown (and neither is known Float).
+                        // Call runtime helper that tries integer first, then float.
+                        // This preserves integer semantics for int+int while not
+                        // side-exiting when Unknown-typed slots contain floats.
+                        self.flush_and_invalidate_cache();
+                        let raw_b = self.emit_get_slot(b);
+                        let raw_c = self.emit_get_slot(c);
+                        let op_code = match op {
+                            OpCode::Add => 0i64,
+                            OpCode::Sub => 1i64,
+                            OpCode::Mul => 2i64,
                             _ => unreachable!(),
                         };
-                        let boxed = self.emit_box_integer_safe(result);
-                        self.cached_set_integer(a, result, boxed);
+                        let op_val = self.builder.ins().iconst(types::I64, op_code);
+                        let call = self.builder.ins().call(
+                            self.arith_unknown_ref,
+                            &[self.vm_ptr, raw_b, raw_c, op_val],
+                        );
+                        let result = self.builder.inst_results(call)[0];
+                        // Side-exit if runtime returned SIDE_EXIT (non-number operand)
+                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                        let not_exit = self.builder.ins().icmp(
+                            IntCC::NotEqual,
+                            result,
+                            exit_val,
+                        );
+                        self.emit_guard_with_flush(not_exit);
+                        // Reload stack base (runtime helper may allocate via GC-box integer)
+                        self.reload_stack_base();
+                        self.emit_set_slot(a, result);
                     }
 
                     // Skip the following MMBin instruction

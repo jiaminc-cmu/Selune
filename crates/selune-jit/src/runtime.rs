@@ -1977,6 +1977,53 @@ pub unsafe extern "C" fn jit_rt_box_integer(vm_ptr: *mut Vm, int_val: i64) -> i6
     tv.raw_bits() as i64
 }
 
+/// Arithmetic helper for Unknown+Unknown operands.
+/// Checks if both values are integers → integer arithmetic (preserving integer semantics).
+/// If either is float → float arithmetic.
+/// Returns SIDE_EXIT if either value is not a number (non-number metamethod case).
+/// `op_code`: 0=Add, 1=Sub, 2=Mul
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_arith_unknown(
+    vm_ptr: *mut Vm,
+    raw_b: i64,
+    raw_c: i64,
+    op_code: i64,
+) -> i64 {
+    let vm = &mut *vm_ptr;
+    let b = TValue::from_raw_bits(raw_b as u64);
+    let c = TValue::from_raw_bits(raw_c as u64);
+
+    // Try integer path first (preserves integer semantics)
+    if let (Some(ib), Some(ic)) = (b.as_integer(), c.as_integer()) {
+        let result: i64 = match op_code {
+            0 => ib.wrapping_add(ic),
+            1 => ib.wrapping_sub(ic),
+            2 => ib.wrapping_mul(ic),
+            _ => return SIDE_EXIT,
+        };
+        let tv = TValue::from_full_integer(result, &mut vm.gc);
+        return tv.raw_bits() as i64;
+    }
+
+    // Float path
+    let fb = match b.as_number(&vm.gc) {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let fc = match c.as_number(&vm.gc) {
+        Some(f) => f,
+        None => return SIDE_EXIT,
+    };
+    let result = match op_code {
+        0 => fb + fc,
+        1 => fb - fc,
+        2 => fb * fc,
+        _ => return SIDE_EXIT,
+    };
+    let tv = TValue::from_float(result);
+    tv.raw_bits() as i64
+}
+
 /// Reads init/limit/step from R[A], R[A+1], R[A+2].
 /// Writes float values to R[A], R[A+1], R[A+2], R[A+3].
 #[no_mangle]
