@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Read;
 
 use selune_compiler::compiler;
+use selune_compiler::opcode::OpCode;
 use selune_jit::JitCompiler;
 use selune_vm::vm::Vm;
 
@@ -173,14 +175,34 @@ thread_local! {
     static JIT_COMPILER: RefCell<Option<JitCompiler>> = RefCell::new(None);
 }
 
+/// Scan a proto for Self_ sites with constant keys and allocate IC entries on Vm.
+/// Returns a map of pc → IC entry pointer (as u64) for use by the JIT compiler.
+fn allocate_self_ic_entries(vm: &mut Vm, proto_idx: usize) -> HashMap<usize, u64> {
+    // Collect Self_ PCs first to avoid borrow conflict
+    let self_pcs: Vec<usize> = vm.protos[proto_idx]
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.opcode() == OpCode::Self_ && inst.k())
+        .map(|(pc, _)| pc)
+        .collect();
+    let mut ic_ptrs = HashMap::new();
+    for pc in self_pcs {
+        let ptr = vm.jit_get_or_create_self_ic(proto_idx, pc);
+        ic_ptrs.insert(pc, ptr as u64);
+    }
+    ic_ptrs
+}
+
 fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
+    let self_ic_ptrs = allocate_self_ic_entries(vm, proto_idx);
     JIT_COMPILER.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
             *opt = JitCompiler::new().ok();
         }
         if let Some(jit) = opt.as_mut() {
-            match jit.compile_proto(&vm.protos[proto_idx], &mut vm.gc, proto_idx) {
+            match jit.compile_proto_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, &vm.builtin_natives, &vm.strings, &self_ic_ptrs) {
                 Ok(jit_fn) => {
                     vm.jit_register(proto_idx, jit_fn);
                 }
@@ -191,13 +213,14 @@ fn jit_compile_hook(vm: &mut Vm, proto_idx: usize) {
 }
 
 fn jit_compile_osr_hook(vm: &mut Vm, proto_idx: usize, entry_pc: usize) {
+    let self_ic_ptrs = allocate_self_ic_entries(vm, proto_idx);
     JIT_COMPILER.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
             *opt = JitCompiler::new().ok();
         }
         if let Some(jit) = opt.as_mut() {
-            match jit.compile_proto_osr(&vm.protos[proto_idx], &mut vm.gc, proto_idx, entry_pc) {
+            match jit.compile_proto_osr_with_builtins(&vm.protos[proto_idx], &mut vm.gc, proto_idx, entry_pc, &vm.builtin_natives, &vm.strings, &self_ic_ptrs) {
                 Ok(jit_fn) => {
                     vm.jit_osr_functions.insert((proto_idx, entry_pc), jit_fn);
                 }
