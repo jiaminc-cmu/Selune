@@ -10,7 +10,7 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 
 use selune_compiler::opcode::OpCode;
 use selune_compiler::proto::{Constant, Proto};
-use selune_core::gc::GcHeap;
+use selune_core::gc::{self, GcHeap};
 use selune_core::string::StringInterner;
 use selune_core::table::Table;
 use selune_core::value::{self, TValue};
@@ -167,6 +167,14 @@ impl JitCompiler {
         builder.symbol(
             "jit_rt_set_field_ic",
             runtime::jit_rt_set_field_ic as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_field_ic_indexed_get",
+            runtime::jit_rt_field_ic_indexed_get as *const u8,
+        );
+        builder.symbol(
+            "jit_rt_field_ic_indexed_set",
+            runtime::jit_rt_field_ic_indexed_set as *const u8,
         );
         builder.symbol("jit_rt_geti", runtime::jit_rt_geti as *const u8);
         builder.symbol("jit_rt_seti", runtime::jit_rt_seti as *const u8);
@@ -704,6 +712,29 @@ impl JitCompiler {
             .module
             .declare_function("jit_rt_set_field_ic", Linkage::Import, &set_field_ic_sig)?;
 
+        // jit_rt_field_ic_indexed_get(table_ptr, field_index) -> u64
+        let mut field_ic_get_sig = Signature::new(call_conv);
+        field_ic_get_sig.params.push(AbiParam::new(types::I64));
+        field_ic_get_sig.params.push(AbiParam::new(types::I64));
+        field_ic_get_sig.returns.push(AbiParam::new(types::I64));
+        let field_ic_get_id = self.module.declare_function(
+            "jit_rt_field_ic_indexed_get",
+            Linkage::Import,
+            &field_ic_get_sig,
+        )?;
+
+        // jit_rt_field_ic_indexed_set(table_ptr, field_index, val_bits) -> i64
+        let mut field_ic_set_sig = Signature::new(call_conv);
+        field_ic_set_sig.params.push(AbiParam::new(types::I64));
+        field_ic_set_sig.params.push(AbiParam::new(types::I64));
+        field_ic_set_sig.params.push(AbiParam::new(types::I64));
+        field_ic_set_sig.returns.push(AbiParam::new(types::I64));
+        let field_ic_set_id = self.module.declare_function(
+            "jit_rt_field_ic_indexed_set",
+            Linkage::Import,
+            &field_ic_set_sig,
+        )?;
+
         // jit_rt_geti(vm_ptr, table_bits, index) -> u64
         let mut geti_sig = Signature::new(call_conv);
         geti_sig.params.push(AbiParam::new(types::I64));
@@ -927,6 +958,8 @@ impl JitCompiler {
             let set_field_str_ref = self.module.declare_func_in_func(set_field_str_id, builder.func);
             let get_field_ic_ref = self.module.declare_func_in_func(get_field_ic_id, builder.func);
             let set_field_ic_ref = self.module.declare_func_in_func(set_field_ic_id, builder.func);
+            let _field_ic_get_ref = self.module.declare_func_in_func(field_ic_get_id, builder.func);
+            let _field_ic_set_ref = self.module.declare_func_in_func(field_ic_set_id, builder.func);
             let geti_ref = self.module.declare_func_in_func(geti_id, builder.func);
             let seti_ref = self.module.declare_func_in_func(seti_id, builder.func);
             let len_ref = self.module.declare_func_in_func(len_id, builder.func);
@@ -3689,49 +3722,61 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     // Use fast string-keyed helper when key is a string constant
                     if let Constant::String(sid) = &self.proto.constants[b] {
                         let sid_val = self.builder.ins().iconst(types::I64, sid.0 as i64);
-                        // Use IC-accelerated helper if IC pointer available
-                        let result = if let Some(&ic_ptr) = self.field_ic_ptrs.get(&pc) {
+
+                        if let Some(&ic_ptr) = self.field_ic_ptrs.get(&pc) {
+                            // Field IC path: single combined call (IC check + fallback)
                             let ic_val = self.builder.ins().iconst(types::I64, ic_ptr as i64);
                             let call = self.builder.ins().call(
                                 self.set_field_ic_ref,
                                 &[self.vm_ptr, table_val, sid_val, val, ic_val],
                             );
-                            self.builder.inst_results(call)[0]
+                            let result = self.builder.inst_results(call)[0];
+                            // Check for SIDE_EXIT first
+                            let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                            let is_exit = self.builder.ins().icmp(IntCC::Equal, result, exit_val);
+                            let check_reload = self.builder.create_block();
+                            self.builder.ins().brif(is_exit, self.side_exit_block, &[], check_reload, &[]);
+                            self.builder.switch_to_block(check_reload);
+                            self.builder.seal_block(check_reload);
+                            // Conditional reload: 0 = no-alloc (skip reload), != 0 = reload
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let needs_reload = self.builder.ins().icmp(IntCC::NotEqual, result, zero);
+                            let reload_block = self.builder.create_block();
+                            let cont = self.builder.create_block();
+                            self.builder.ins().brif(needs_reload, reload_block, &[], cont, &[]);
+                            self.builder.switch_to_block(reload_block);
+                            self.builder.seal_block(reload_block);
+                            self.reload_stack_base();
+                            self.builder.ins().jump(cont, &[]);
+                            self.builder.switch_to_block(cont);
+                            self.builder.seal_block(cont);
                         } else {
+                            // No IC: use existing set_field_str logic
                             let call = self.builder.ins().call(
                                 self.set_field_str_ref,
                                 &[self.vm_ptr, table_val, sid_val, val],
                             );
-                            self.builder.inst_results(call)[0]
-                        };
-                        // Check for SIDE_EXIT first
-                        let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
-                        let is_exit =
-                            self.builder
-                                .ins()
-                                .icmp(IntCC::Equal, result, exit_val);
-                        let check_reload = self.builder.create_block();
-                        self.builder
-                            .ins()
-                            .brif(is_exit, self.side_exit_block, &[], check_reload, &[]);
-                        self.builder.switch_to_block(check_reload);
-                        self.builder.seal_block(check_reload);
-                        // Conditional reload: 0 = no-alloc (skip reload), != 0 = reload
-                        let zero = self.builder.ins().iconst(types::I64, 0);
-                        let needs_reload = self.builder.ins().icmp(
-                            IntCC::NotEqual, result, zero,
-                        );
-                        let reload_block = self.builder.create_block();
-                        let cont = self.builder.create_block();
-                        self.builder
-                            .ins()
-                            .brif(needs_reload, reload_block, &[], cont, &[]);
-                        self.builder.switch_to_block(reload_block);
-                        self.builder.seal_block(reload_block);
-                        self.reload_stack_base();
-                        self.builder.ins().jump(cont, &[]);
-                        self.builder.switch_to_block(cont);
-                        self.builder.seal_block(cont);
+                            let result = self.builder.inst_results(call)[0];
+                            // Check for SIDE_EXIT first
+                            let exit_val = self.builder.ins().iconst(types::I64, SIDE_EXIT);
+                            let is_exit = self.builder.ins().icmp(IntCC::Equal, result, exit_val);
+                            let check_reload = self.builder.create_block();
+                            self.builder.ins().brif(is_exit, self.side_exit_block, &[], check_reload, &[]);
+                            self.builder.switch_to_block(check_reload);
+                            self.builder.seal_block(check_reload);
+                            // Conditional reload: 0 = no-alloc (skip reload), != 0 = reload
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            let needs_reload = self.builder.ins().icmp(IntCC::NotEqual, result, zero);
+                            let reload_block = self.builder.create_block();
+                            let cont = self.builder.create_block();
+                            self.builder.ins().brif(needs_reload, reload_block, &[], cont, &[]);
+                            self.builder.switch_to_block(reload_block);
+                            self.builder.seal_block(reload_block);
+                            self.reload_stack_base();
+                            self.builder.ins().jump(cont, &[]);
+                            self.builder.switch_to_block(cont);
+                            self.builder.seal_block(cont);
+                        }
                     } else {
                         let key_raw = self
                             .constant_to_raw_bits(&self.proto.constants[b]);
@@ -3765,7 +3810,8 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                     self.flush_and_invalidate_cache();
 
                     if c >= 1 {
-                        // Inline fast path: get_table_ptr -> check no metatable -> bounds check -> load
+                        // Inline fast path: type guard -> get_table_ptr -> check no metatable -> bounds check -> load
+                        let get_ptr_block = self.builder.create_block();
                         let check_mt_block = self.builder.create_block();
                         let bounds_check_block = self.builder.create_block();
                         let fast_load_block = self.builder.create_block();
@@ -3773,10 +3819,23 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
                         let cont_block = self.builder.create_block();
                         self.builder.append_block_param(cont_block, types::I64);
 
+                        // Step 0: Table type guard — check (val & !GC_INDEX_MASK) == (QNAN | TAG_GC)
+                        // Since GC_SUB_TABLE = 0, this specifically matches table values.
+                        let tag_mask = self.builder.ins().iconst(types::I64, !(gc::GC_INDEX_MASK) as i64);
+                        let val_tag = self.builder.ins().band(table_val, tag_mask);
+                        let expected_tag = self.builder.ins().iconst(types::I64, (value::QNAN | 0x0004_0000_0000_0000u64) as i64); // QNAN | TAG_GC
+                        let is_table = self.builder.ins().icmp(IntCC::Equal, val_tag, expected_tag);
+                        self.builder.ins().brif(is_table, get_ptr_block, &[], slow_block, &[]);
+
+                        // --- get_ptr_block: extract GcIdx and get table pointer ---
+                        self.builder.switch_to_block(get_ptr_block);
+                        let gc_index_mask = self.builder.ins().iconst(types::I64, gc::GC_INDEX_MASK as i64);
+                        let table_idx = self.builder.ins().band(table_val, gc_index_mask);
+
                         // Step 1: Get raw table pointer (small extern call, no alloc)
                         let call = self.builder.ins().call(
                             self.get_table_ptr_ref,
-                            &[self.vm_ptr, table_val],
+                            &[self.vm_ptr, table_idx],
                         );
                         let table_ptr = self.builder.inst_results(call)[0];
 
@@ -3824,6 +3883,7 @@ impl<'a, 'b> BytecodeEmitter<'a, 'b> {
 
                         // --- cont_block: merge results ---
                         self.builder.switch_to_block(cont_block);
+                        self.builder.seal_block(get_ptr_block);
                         self.builder.seal_block(check_mt_block);
                         self.builder.seal_block(bounds_check_block);
                         self.builder.seal_block(fast_load_block);

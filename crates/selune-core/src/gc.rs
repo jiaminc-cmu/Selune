@@ -256,6 +256,10 @@ pub struct GcHeap {
     boxed_int_free: Vec<u32>,
     pub tables: Vec<Option<Table>>,
     table_free: Vec<u32>,
+    /// Shadow array of raw table pointers, parallel to `tables`.
+    /// `tables_ptrs[i]` is a `*const Table` as usize (0 if None/freed).
+    /// JIT code reads this via `tables_ptrs_data` for O(1) inline table pointer lookup.
+    pub tables_ptrs: Vec<usize>,
     pub closures: Vec<Option<LuaClosure>>,
     closure_free: Vec<u32>,
     pub natives: Vec<Option<NativeFunction>>,
@@ -285,6 +289,7 @@ impl GcHeap {
             boxed_int_free: Vec::new(),
             tables: Vec::new(),
             table_free: Vec::new(),
+            tables_ptrs: Vec::new(),
             closures: Vec::new(),
             closure_free: Vec::new(),
             natives: Vec::new(),
@@ -326,11 +331,36 @@ impl GcHeap {
         let table = Table::new(array_hint, hash_hint);
         if let Some(idx) = self.table_free.pop() {
             self.tables[idx as usize] = Some(table);
+            let ptr = self.tables[idx as usize].as_ref().unwrap() as *const _ as usize;
+            self.tables_ptrs[idx as usize] = ptr;
             GcIdx(idx, PhantomData)
         } else {
             let idx = self.tables.len() as u32;
+            let old_cap = self.tables.capacity();
             self.tables.push(Some(table));
+            if self.tables.capacity() != old_cap {
+                // Vec reallocated — all existing pointers are stale, rebuild all
+                self.rebuild_tables_ptrs();
+            } else {
+                // No reallocation — just append the new pointer
+                let ptr = self.tables[idx as usize].as_ref().unwrap() as *const _ as usize;
+                self.tables_ptrs.push(ptr);
+            }
             GcIdx(idx, PhantomData)
+        }
+    }
+
+    /// Rebuild the entire tables_ptrs shadow array from gc.tables.
+    /// Must be called after any operation that may move Option<Table> elements in memory
+    /// (e.g., Vec reallocation).
+    pub fn rebuild_tables_ptrs(&mut self) {
+        self.tables_ptrs.clear();
+        self.tables_ptrs.reserve(self.tables.len());
+        for slot in &self.tables {
+            match slot {
+                Some(table) => self.tables_ptrs.push(table as *const _ as usize),
+                None => self.tables_ptrs.push(0),
+            }
         }
     }
 
@@ -951,6 +981,9 @@ impl GcHeap {
                 && !self.gc_state.table_marks[i]
             {
                 self.tables[i] = None;
+                if i < self.tables_ptrs.len() {
+                    self.tables_ptrs[i] = 0;
+                }
                 self.table_free.push(i as u32);
                 freed += 64; // approximate
             }
