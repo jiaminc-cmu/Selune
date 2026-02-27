@@ -597,6 +597,8 @@ impl Vm {
         std::mem::offset_of!(Vm, stack_data_ptr) as i32
     }
 
+
+
     /// Get the closure_idx of the innermost call frame.
     /// Checks jit_call_stack first (JIT frames are always innermost when active).
     #[inline]

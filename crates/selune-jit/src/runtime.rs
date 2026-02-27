@@ -43,10 +43,9 @@ pub unsafe extern "C" fn jit_rt_get_stack_len(vm_ptr: *mut Vm) -> u64 {
 pub unsafe extern "C" fn jit_rt_get_table_ptr(vm_ptr: *mut Vm, table_idx: u64) -> u64 {
     let vm = &*vm_ptr;
     let idx = table_idx as usize;
-    if idx < vm.gc.tables.len() {
-        if let Some(ref table) = vm.gc.tables[idx] {
-            return table as *const _ as u64;
-        }
+    // Fast path: use shadow pointer array (avoids Option<Table> pattern matching)
+    if idx < vm.gc.tables_ptrs.len() {
+        return *vm.gc.tables_ptrs.get_unchecked(idx) as u64;
     }
     0
 }
@@ -1422,6 +1421,53 @@ pub unsafe extern "C" fn jit_rt_set_field_ic(
     }
     // IC miss: fall back to existing set_field_str logic
     jit_rt_set_field_str(vm_ptr, table_bits, string_id, val_bits)
+}
+
+// ---------------------------------------------------------------------------
+// Ultra-thin Field IC helpers (no VM, no alloc, no reload needed)
+// ---------------------------------------------------------------------------
+
+/// Indexed hash get: O(1) access by IndexMap entry index.
+/// Returns the TValue raw bits at the given index, or nil if index is out of bounds.
+/// Ultra-thin: no VM access, no allocation, no side effects.
+///
+/// # Safety
+/// - `table_ptr` must be a valid pointer to a live `Table`.
+/// - `field_index` should be a valid index from a previous IC population.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_field_ic_indexed_get(
+    table_ptr: u64,
+    field_index: u64,
+) -> u64 {
+    let table = &*(table_ptr as *const selune_core::table::Table);
+    if let Some((_, &val)) = table.hash_get_index(field_index as usize) {
+        val.raw_bits()
+    } else {
+        TValue::nil().raw_bits()
+    }
+}
+
+/// Indexed hash set: O(1) overwrite by IndexMap entry index.
+/// Returns 0 on success. Caller must increment table.version.
+/// Ultra-thin: no VM access, no allocation, no side effects.
+///
+/// # Safety
+/// - `table_ptr` must be a valid pointer to a live `Table`.
+/// - `field_index` should be a valid index from a previous IC population.
+#[no_mangle]
+pub unsafe extern "C" fn jit_rt_field_ic_indexed_set(
+    table_ptr: u64,
+    field_index: u64,
+    val_bits: u64,
+) -> i64 {
+    let table = &mut *(table_ptr as *mut selune_core::table::Table);
+    if let Some((_, v)) = table.hash_get_index_mut(field_index as usize) {
+        *v = TValue::from_raw_bits(val_bits);
+        table.version = table.version.wrapping_add(1);
+        0 // success, no alloc
+    } else {
+        1 // miss — shouldn't happen but return non-zero for safety
+    }
 }
 
 // ---------------------------------------------------------------------------
